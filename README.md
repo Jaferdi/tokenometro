@@ -106,10 +106,12 @@ To remove it: `python3 ~/.local/share/tokenometro/install.py --uninstall` (remov
 
 ## Privacy
 
-- It only reads `~/.claude/projects/**/*.jsonl` (and, if present, the last reading of the sub-meter plugin).
+- It only reads `~/.claude/projects/**/*.jsonl`, `~/.config/claude/projects` if it exists, or the folders in `CLAUDE_CONFIG_DIR` (comma-separated). Inside WSL it also reads the Windows one (`C:\Users\<you>\.claude`) when a single Windows user has it. Plus, if present, the last reading of the sub-meter plugin.
 - It listens on `127.0.0.1`: the dashboard is not reachable from outside your machine.
 - Your data never leaves your machine: everything stays in `~/.local/share/tokenometro/usage.db` (SQLite).
-- Its only request to the internet: once a day it asks GitHub which release is the latest (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`), sending nothing of yours. GitHub sees your IP, as with any visit. Turn it off with `TOKENOMETRO_UPDATE_CHECK=0`.
+- Its requests to the internet, both to GitHub and sending nothing of yours (GitHub sees your IP, as with any visit):
+  - once a day it asks which release is the latest (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`). Turn it off with `TOKENOMETRO_UPDATE_CHECK=0`;
+  - only if you use a model that `prices.json` does not know, once a day it downloads [LiteLLM's public price list](https://github.com/BerriAI/litellm) and keeps the price of just those models, instead of valuing them at `_default`. Your `prices.json` always wins and the dashboard tells you which prices came from there. Turn it off with `TOKENOMETRO_PRICE_REFRESH=0`.
 - "Biggest calls" masks anything that looks like a secret, but the dashboard does show parts of your commands and paths: check before sharing screenshots.
 
 ## What "$ eq." means
@@ -186,7 +188,7 @@ Price per million tokens in dollars (official API rates) for current and previou
 "_currency": {"default": "USD", "eur_per_usd": 0.91, "date": "2026-11-19"}
 ```
 
-Update the rate by hand: Tokenometro never goes online. If your `prices.json` comes from an earlier version without this block, the dashboard only offers dollars; copy it from the repo.
+Update the rate by hand: Tokenometro does not fetch exchange rates. If your `prices.json` comes from an earlier version without this block, the dashboard only offers dollars; copy it from the repo.
 
 ### Environment variables
 
@@ -198,6 +200,7 @@ Update the rate by hand: Tokenometro never goes online. If your `prices.json` co
 | `TOKENOMETRO_CURRENCY` | Default `EUR` or `USD` | the one in `prices.json` |
 | `TOKENOMETRO_LANG` | Default `en` or `es` | `en` |
 | `TOKENOMETRO_UPDATE_CHECK` | `0` to never check GitHub for a new version | `1` |
+| `TOKENOMETRO_PRICE_REFRESH` | `0` to never take a missing model's price from LiteLLM | `1` |
 | `TOKENOMETRO_NO_START` | `1` so the installer doesn't start it | |
 
 The old `CLAUDE_TOKENS_*` names still work.
@@ -212,7 +215,7 @@ python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur E
 python3 ~/.local/share/tokenometro/tracker.py digest 2026-11-17   # weekly summary of the week holding that day
 ```
 
-`report` takes `[YYYY-MM]` (this month by default), `--by session|client`, `--client NAME` and `--cur USD|EUR`. The same CSV is in the dashboard, in the *By client* card. `digest` prints the Markdown summary of a week (Monday to Sunday; last week by default). The server also writes last week's one by itself, once, as `~/.claude/reports/tokenometro-week-YYYY-Www.md` (`tokenometro-semana-…` in Spanish).
+`report` takes `[YYYY-MM]` (this month by default), `--by session|client`, `--client NAME`, `--cur USD|EUR` and `--json` (the same rows as JSON, for scripts). The same CSV is in the dashboard, in the *By client* card. `digest` prints the Markdown summary of a week (Monday to Sunday; last week by default), or JSON with `--json`. The server also writes last week's one by itself, once, as `~/.claude/reports/tokenometro-week-YYYY-Www.md` (`tokenometro-semana-…` in Spanish).
 
 Restart the server (it only stops it if it is Tokenometro):
 

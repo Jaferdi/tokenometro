@@ -16,7 +16,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,8 +48,8 @@ def load_tracker(tmp, clients=None):
             json.dump(clients, f)
     old = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
     os.environ["HOME"] = os.environ["USERPROFILE"] = home  # Windows reads ~ from USERPROFILE
-    for k in [k for k in os.environ if k.startswith(("TOKENOMETRO_", "CLAUDE_TOKENS_"))]:
-        del os.environ[k]
+    for k in [k for k in os.environ if k.startswith(("TOKENOMETRO_", "CLAUDE_TOKENS_")) or k in ("CLAUDE_CONFIG_DIR", "WSL_DISTRO_NAME", "WSL_INTEROP")]:
+        del os.environ[k]  # a developer's own WSL must not add their Windows logs to the tests
     try:
         spec = importlib.util.spec_from_file_location(f"tracker_{abs(hash(tmp))}", os.path.join(app, "tracker.py"))
         mod = importlib.util.module_from_spec(spec)
@@ -202,6 +202,64 @@ def shape(sid, mcp=None, deferred=0, system=8_000):
     tools += [dict(tool(f"mcp__later__t{i}", 50), defer_loading=True) for i in range(deferred)]
     return json.dumps({"type": "api-request-shape", "sessionId": sid, "timestamp": now_ts(),
                        "shape": {"system": [{"type": "text", "text": "s" * system}], "tools": tools}})
+
+
+class ClaudeConfigDirTest(Base):
+    def tearDown(self):
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        super().tearDown()
+
+    def test_defaults_include_dot_config_claude(self):
+        newer = os.path.join(self.home, ".config", "claude")
+        os.makedirs(os.path.join(newer, "projects"))
+        self.assertEqual(self.t._claude_dirs(), [newer, os.path.join(self.home, ".claude")])
+
+    def test_env_list_replaces_defaults_and_skips_empty_folders(self):
+        a, b, empty = (os.path.join(self.tmp, x) for x in ("a", "b", "empty"))
+        for d in (a, b):
+            os.makedirs(os.path.join(d, "projects"))
+        os.makedirs(empty)
+        os.environ["CLAUDE_CONFIG_DIR"] = f"{a}, {empty} ,{b}"
+        self.assertEqual(self.t._claude_dirs(), [a, b])
+
+    def wsl_root(self, *users):
+        root = os.path.join(self.tmp, "mnt")
+        for u in users:
+            os.makedirs(os.path.join(root, "c", "Users", u, ".claude", "projects"), exist_ok=True)
+        os.makedirs(os.path.join(root, "c", "Users", "Public"), exist_ok=True)
+        return root
+
+    def test_wsl_also_reads_the_windows_folder(self):
+        root = self.wsl_root("ana")
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        try:
+            self.assertEqual(self.t._windows_dirs_from_wsl(root), [os.path.join(root, "c", "Users", "ana", ".claude")])
+        finally:
+            os.environ.pop("WSL_DISTRO_NAME")
+
+    def test_wsl_skips_windows_when_several_users_have_claude_or_not_in_wsl(self):
+        root = self.wsl_root("ana", "luis")
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        try:
+            self.assertEqual(self.t._windows_dirs_from_wsl(root), [])
+        finally:
+            os.environ.pop("WSL_DISTRO_NAME")
+        self.assertEqual(self.t._windows_dirs_from_wsl(self.wsl_root("ana")), [])  # not WSL: never looks
+
+    def test_ingest_reads_every_folder(self):
+        other = os.path.join(self.tmp, "other", "projects", "-work-other")
+        os.makedirs(other)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        self.write("s.jsonl", [record("s1", ts, "m1", "claude-opus-5-5")])
+        with open(os.path.join(other, "o.jsonl"), "w") as f:
+            f.write(record("s2", ts, "m2", "claude-opus-5-5") + "\n")
+        self.t.PROJECTS_DIRS = [os.path.join(self.home, ".claude", "projects"), os.path.dirname(other)]
+        self.t.ingest()
+        con = self.t.connect()
+        try:
+            self.assertEqual(con.execute("SELECT COUNT(DISTINCT session) FROM msgs").fetchone()[0], 2)
+        finally:
+            con.close()
 
 
 class BranchAndFixedCostTest(Base):
@@ -471,14 +529,17 @@ class FunnelTest(Base):
         self.assertTrue(all(x["stage"] in ("shown", "study", "dismissed") and isinstance(x["missing"], list) for x in recs))
 
 
-def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=(), h1=False):
+def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=(), h1=False, miss=None):
     """One main-conversation request: `ctx` tokens of context, `cw` of them written to the cache (for 1 hour if h1),
     the rest read."""
     d = json.loads(record(sid, now_ts(minutes_ago), mid, model=model, inp=10, cr=max(ctx - cw - 10, 0)))
     d["message"]["usage"]["cache_creation_input_tokens"] = cw
     if h1:
         d["message"]["usage"]["cache_creation"] = {"ephemeral_1h_input_tokens": cw, "ephemeral_5m_input_tokens": 0}
-    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
+    tools = [t if isinstance(t, tuple) else (t, {}) for t in tools]  # "Bash" or ("Read", {"file_path": "a.py"})
+    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": inp} for i, (n, inp) in enumerate(tools)]
+    if miss:
+        d["message"]["diagnostics"] = {"cache_miss_reason": {"type": miss}}
     return json.dumps(d)
 
 
@@ -548,6 +609,65 @@ class NewDetectorsTest(Base):
         r = self.rec("cache-miss")
         self.assertEqual(r["metric"], 1)
         self.assertIn("model", r["evidence"])
+
+    def test_the_reason_logged_by_claude_code_wins_over_the_guess(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 100_000, 2_000), req("s1", "a2", 29, 101_000, 100_000, miss="tools_changed")])
+        r = self.rec("cache-miss")
+        self.assertEqual(r["metric"], 1)
+        self.assertIn("MCP", r["evidence"])
+        self.assertIn("Claude Code", r["confidence"])
+        con = self.t.connect()
+        self.assertEqual(con.execute("SELECT miss FROM msgs WHERE id='a2'").fetchone()[0], "tools_changed")
+        con.close()
+
+    def test_cache_dropped_by_the_server_is_left_out_of_the_impact(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 100_000, 2_000), req("s1", "a2", 29, 101_000, 100_000, miss="previous_message_not_found")])
+        self.assertIsNone(self.rec("cache-miss"))
+
+    def test_cache_dropped_by_the_server_is_mentioned_but_not_counted(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 100_000, 2_000), req("s1", "a2", 29, 101_000, 100_000, miss="previous_message_not_found"),
+                               req("s2", "b1", 30, 100_000, 2_000), req("s2", "b2", 29, 101_000, 100_000, miss="system_changed")])
+        r = self.rec("cache-miss")
+        self.assertEqual(r["metric"], 1)
+        self.assertIn("server had already dropped", r["evidence"])
+
+    def test_unavailable_reason_falls_back_to_the_guess(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 200_000, 2_000),
+                               req("s1", "a2", 29, 205_000, 200_000, model="claude-sonnet-5-5", miss="unavailable")])
+        r = self.rec("cache-miss")
+        self.assertIn("model", r["evidence"])
+        self.assertIn("medium", r["confidence"])
+
+    def reads(self, plan, sid="s1"):
+        """plan: list of (tool, path, chars) per turn, or None for a turn without tools; then 10 quiet turns."""
+        rows, ctx = [], 50_000
+        for i, step in enumerate(plan):
+            ctx = step[3] if step and len(step) > 3 else ctx + 1_000
+            if step:
+                rows += [req(sid, f"{sid}_{i}", 60 - i, ctx, 1_000, tools=((step[0], {"file_path": step[1]}),)),
+                         result(f"{sid}_{i}_0", step[2])]
+            else:
+                rows.append(req(sid, f"{sid}_{i}", 60 - i, ctx, 1_000))
+        rows += [req(sid, f"{sid}_q{i}", 40 - i, ctx + 1_000 * i, 1_000) for i in range(10)]
+        return rows
+
+    def test_reading_the_same_file_again_is_priced(self):
+        self.write("a.jsonl", self.reads([("Read", "/w/a.py", 40_000)] * 4))
+        r = self.rec("reread")
+        self.assertEqual(r["metric"], 3)
+        self.assertGreater(r["impact"], 0)
+        self.assertEqual(r["sample"], {"sessions": 1, "days": 1})
+        self.assertIn("a.py ×4", r["evidence"])
+
+    def test_rereads_after_an_edit_a_compaction_of_images_or_small_are_fine(self):
+        self.write("a.jsonl", self.reads([("Read", "/w/a.py", 40_000), ("Edit", "/w/a.py", 100), ("Read", "/w/a.py", 40_000),
+                                          ("Read", "/w/b.py", 40_000, 800_000), ("Read", "/w/b.py", 40_000, 50_000)]
+                                         + [("Read", "/w/shot.png", 6_000)] * 5 + [("Read", "/w/c.py", 1_000)] * 5))
+        self.assertIsNone(self.rec("reread"))
+
+    def test_different_files_are_not_rereads(self):
+        self.write("a.jsonl", self.reads([("Read", f"/w/{i}.py", 40_000) for i in range(6)]))
+        self.assertIsNone(self.rec("reread"))
 
     def test_huge_tool_outputs_are_priced_by_the_turns_that_carry_them(self):
         self.write("a.jsonl", [req("s1", "a1", 30, 50_000, 1_000, tools=("Bash", "Read")), result("a1_0", 80_000), result("a1_1", 80_000)]
@@ -657,6 +777,86 @@ class UpdateTest(Base):
         finally:
             self.t.urllib.request.urlopen = real
             os.environ.pop("TOKENOMETRO_UPDATE_CHECK", None)
+
+
+class PriceRefreshTest(Base):
+    LITELLM = {
+        "claude-future-9": {"litellm_provider": "anthropic", "input_cost_per_token": 1e-05, "output_cost_per_token": 5e-05,
+                            "cache_read_input_token_cost": 1e-06, "cache_creation_input_token_cost": 1.25e-05},
+        "claude-opus-5-5": {"litellm_provider": "anthropic", "input_cost_per_token": 9e-05, "output_cost_per_token": 9e-04},
+        "claude-x' OR 1=1 --": {"litellm_provider": "anthropic", "input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06},
+        "claude-bad": {"litellm_provider": "anthropic", "input_cost_per_token": "free", "output_cost_per_token": 1e-06},
+        "gpt-9": {"litellm_provider": "openai", "input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06},
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        test = self
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n):
+                return json.dumps(test.LITELLM).encode()
+
+        def fake(req, timeout):
+            self.calls.append(req.full_url)
+            if self.fail:
+                raise OSError("offline")
+            return Resp()
+        self.fail = False
+        self.real = self.t.urllib.request.urlopen
+        self.t.urllib.request.urlopen = fake
+
+    def tearDown(self):
+        self.t.urllib.request.urlopen = self.real
+        os.environ.pop("TOKENOMETRO_PRICE_REFRESH", None)
+        super().tearDown()
+
+    def use(self, *models):
+        self.write("s.jsonl", [record("s1", now_ts(), f"m{i}", m) for i, m in enumerate(models)])
+        self.t.ingest()
+
+    def test_a_model_we_do_not_know_takes_litellm_price_and_ours_win(self):
+        self.use("claude-opus-5-5", "claude-future-9-20270101")
+        self.t.refresh_prices()
+        p = self.t.load_prices()
+        self.assertEqual(p["claude-future-9"], {"input": 10.0, "output": 50.0, "cache_read": 1.0,
+                                                "cache_write_5m": 12.5, "cache_write_1h": 20.0})  # 1h: 2x input
+        self.assertEqual(p["_sources"], {"claude-future-9": "litellm"})
+        self.assertNotEqual(p["claude-opus-5-5"]["input"], 90.0)
+        r = self.t.data(7, self.t.ALL)
+        self.assertEqual(r["unpriced"], [])
+        self.assertEqual(r["litellm"], ["claude-future-9-20270101"])
+
+    def test_unsafe_names_and_values_are_dropped(self):
+        table = self.t._from_litellm(self.LITELLM)
+        self.assertEqual(set(table), {"claude-future-9", "claude-opus-5-5"})
+
+    def test_asks_once_a_day_only_when_needed_and_can_be_turned_off(self):
+        self.use("claude-opus-5-5")
+        self.t.refresh_prices(force=True)
+        self.assertEqual(self.calls, [])  # every model has a price
+        self.use("claude-opus-5-5", "claude-future-9")
+        os.environ["TOKENOMETRO_PRICE_REFRESH"] = "0"
+        self.t.refresh_prices(force=True)
+        self.assertEqual(self.calls, [])
+        del os.environ["TOKENOMETRO_PRICE_REFRESH"]
+        self.t.refresh_prices(force=True)
+        self.t.refresh_prices()
+        self.assertEqual(self.calls, [self.t.LITELLM_URL])
+
+    def test_offline_changes_nothing(self):
+        self.use("claude-future-9")
+        self.fail = True
+        self.t.refresh_prices()
+        self.assertNotIn("claude-future-9", self.t.load_prices())
+        self.assertEqual([m["model"] for m in self.t.data(7, self.t.ALL)["unpriced"]], ["claude-future-9"])
 
 
 class CliTest(unittest.TestCase):
@@ -856,6 +1056,25 @@ class ReportTest(Base):
         by_client = list(csv.DictReader(io.StringIO(self.t.report(month, "client"))))
         self.assertEqual([r["client"] for r in by_client], ["acme"])
         self.assertEqual(self.t.report("1999-01", "session").count("\n"), 1)  # header only
+
+    def test_json_report_and_digest(self):
+        month = datetime.now().strftime("%Y-%m")
+        self.t.set_currency("EUR")
+        r = json.loads(self.t.report(month, "session", as_json=True))
+        self.assertEqual(r["month"], month)
+        self.assertEqual(len(r["rows"]), 1)
+        row = r["rows"][0]
+        self.assertEqual(row["client"], "acme")
+        self.assertGreater(row["cost_usd"], 0)
+        self.assertIn("cost_eur", row)
+        self.assertEqual(row["input_tokens"], 1_000_010)
+        self.assertEqual(json.loads(self.t.report("1999-01", "client", as_json=True))["rows"], [])
+        today = date.today()
+        d = json.loads(self.t.digest(today - timedelta(days=today.weekday()), as_json=True))
+        self.assertGreater(d["cost_usd"], 0)
+        self.assertEqual(d["sessions"], 1)
+        self.assertEqual(d["unpriced_models"], ["claude-future-9"])
+        self.assertEqual(d["top_sessions"][0]["session"], "11111111-1111-4111-a111-111111111111")
 
     def test_csv_cells_are_never_formulas(self):
         self.assertEqual(self.t._cell('=HYPERLINK("http://x")'), '\'=HYPERLINK("http://x")')

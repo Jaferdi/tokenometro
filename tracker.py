@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local Claude Code token tracker.
 
-Reads the transcripts in ~/.claude/projects (read-only, incremental) and serves a
+Reads the transcripts in ~/.claude/projects (or CLAUDE_CONFIG_DIR, ~/.config/claude; read-only, incremental) and serves a
 dashboard at http://127.0.0.1:7878. No dependencies: standard library only.
 
   python3 tracker.py serve      # periodic ingest + dashboard
@@ -25,7 +25,33 @@ from urllib.parse import parse_qs, urlparse
 
 HOME = os.path.expanduser("~")
 BASE = os.path.dirname(os.path.abspath(__file__))
-PROJECTS = os.path.join(HOME, ".claude", "projects")
+
+
+def _claude_dirs():
+    """Claude Code data folders, like Claude Code itself: CLAUDE_CONFIG_DIR (one folder or a comma-separated list)
+    replaces the defaults; otherwise ~/.config/claude (newer installs) and ~/.claude. Only folders with projects/
+    count, so an empty leftover folder does not hide the real one."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    dirs = [os.path.expanduser(p.strip()) for p in env.split(",") if p.strip()] or \
+        [os.path.join(HOME, ".config", "claude"), os.path.join(HOME, ".claude")] + _windows_dirs_from_wsl()
+    return [d for d in dirs if os.path.isdir(os.path.join(d, "projects"))] or dirs[-1:]
+
+
+def _windows_dirs_from_wsl(root="/mnt"):
+    """Inside WSL, Claude Code may also run on the Windows side (C:\\Users\\<you>\\.claude, seen as
+    /mnt/c/Users/<you>/.claude). Only taken when exactly one Windows user has it, so a shared PC never mixes
+    someone else's usage in; otherwise CLAUDE_CONFIG_DIR says which one."""
+    if not (os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
+        return []
+    found = glob.glob(os.path.join(root, "*", "Users", "*", ".claude", "projects"))
+    return [os.path.dirname(found[0])] if len(found) == 1 else []
+
+
+CLAUDE_DIRS = _claude_dirs()
+# settings.json, CLAUDE.md, plugins and skills live in the first folder that has a settings.json
+CLAUDE_HOME = next((d for d in CLAUDE_DIRS if os.path.isfile(os.path.join(d, "settings.json"))), CLAUDE_DIRS[0])
+PROJECTS_DIRS = [os.path.join(d, "projects") for d in CLAUDE_DIRS]
+PROJECTS = PROJECTS_DIRS[0]
 DB = os.path.join(BASE, "usage.db")
 PRICES = os.path.join(BASE, "prices.json")
 CONTROL = os.path.join(BASE, ".control")  # port, pid and the token that lets the installer stop this server
@@ -47,9 +73,11 @@ def _env(name, default):
 
 
 PORT = int(_env("PORT", "7878"))
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 REPO = "Jaferdi/tokenometro"
 UPDATE_FILE = os.path.join(BASE, "update.json")
+LITELLM_FILE = os.path.join(BASE, "prices.litellm.json")
+LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 
 def _small_json(path):
@@ -194,6 +222,10 @@ def connect():
         con.execute("ALTER TABLE msgs ADD COLUMN branch TEXT")
         con.execute("UPDATE files SET offset=0")  # read the history again to fill the branch and the request shapes
         con.commit()
+    if "miss" not in [r[1] for r in con.execute("PRAGMA table_info(msgs)")]:
+        con.execute("ALTER TABLE msgs ADD COLUMN miss TEXT")  # message.diagnostics.cache_miss_reason.type
+        con.execute("UPDATE files SET offset=0")  # read the history again to fill it
+        con.commit()
     con.execute("CREATE TABLE IF NOT EXISTS applied(id TEXT PRIMARY KEY, at TEXT, day TEXT, prev TEXT, backup TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS seen(key TEXT PRIMARY KEY, ts TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS dismissed(id TEXT PRIMARY KEY, day TEXT, impact REAL)")
@@ -317,10 +349,11 @@ def _handle(con, d, sub=False):
         mid = msg.get("id") or d.get("uuid")
         con.execute(
             "INSERT OR REPLACE INTO msgs(id, ts, day, hour, session, project, client, model, sidechain, agent,"
-            " inp, cw5, cw1h, cr, out, think, web, branch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " inp, cw5, cw1h, cr, out, think, web, branch, miss) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (mid, ts, day, hour, session, cwd, cl, model, side, d.get("agentId"),
              u.get("input_tokens") or 0, cw5, cw1h, u.get("cache_read_input_tokens") or 0,
-             u.get("output_tokens") or 0, think, web, d.get("gitBranch") or None),
+             u.get("output_tokens") or 0, think, web, d.get("gitBranch") or None,
+             ((msg.get("diagnostics") or {}).get("cache_miss_reason") or {}).get("type")),
         )
         for b in msg.get("content") or []:
             if isinstance(b, dict) and b.get("type") == "tool_use":
@@ -398,7 +431,7 @@ def ingest():
         con = connect()
         known = {p: (o, h) for p, o, h in con.execute("SELECT path, offset, head FROM files")}
         n_lines = 0
-        for root, _dirs, files in os.walk(PROJECTS):
+        for root, _dirs, files in (w for d in PROJECTS_DIRS for w in os.walk(d)):
             for fn in files:
                 if not fn.endswith(".jsonl"):
                     continue
@@ -427,7 +460,7 @@ def backfill():
     """Fill input_head on already-ingested calls (one-off, reads every transcript)."""
     con = connect()
     n = 0
-    for root, _dirs, files in os.walk(PROJECTS):
+    for root, _dirs, files in (w for d in PROJECTS_DIRS for w in os.walk(d)):
         for fn in files:
             if not fn.endswith(".jsonl"):
                 continue
@@ -453,7 +486,7 @@ def backfill():
 
 
 def agent_meta(session, agent):
-    for f in glob.glob(os.path.join(PROJECTS, "*", session or "?", "subagents", f"agent-{agent}.meta.json")):
+    for f in (f for d in PROJECTS_DIRS for f in glob.glob(os.path.join(d, "*", session or "?", "subagents", f"agent-{agent}.meta.json"))):
         try:
             return read_json(f)
         except Exception:
@@ -462,11 +495,92 @@ def agent_meta(session, agent):
 
 
 def load_prices():
+    """prices.json, plus LiteLLM's price for models it does not have (cached by refresh_prices). Ours always wins."""
     try:
         p = read_json(PRICES)
     except Exception:
         p = {}
+    if _env("PRICE_REFRESH", "1") != "0":
+        for k, v in _valid_prices(_small_json(LITELLM_FILE).get("models")).items():
+            if k not in p:
+                p[k] = v
+                p.setdefault("_sources", {})[k] = "litellm"
     return p
+
+
+_PRICE_FIELDS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+
+
+def _valid_prices(models):
+    """Only names and numbers that are safe to put in the cost SQL: these come from a downloaded file."""
+    out = {}
+    for k, v in (models or {}).items() if isinstance(models, dict) else ():
+        if isinstance(k, str) and re.fullmatch(r"claude-[a-z0-9-]{1,60}", k) and isinstance(v, dict) and all(
+                isinstance(v.get(f), (int, float)) and not isinstance(v.get(f), bool) and 0 <= v[f] < 10000 for f in _PRICE_FIELDS):
+            out[k] = {f: float(v[f]) for f in _PRICE_FIELDS}
+    return out
+
+
+def _from_litellm(raw):
+    """LiteLLM's Anthropic entries in our units (USD per million tokens). Missing cache prices follow Anthropic's rule:
+    read 0.1x, 5-minute write 1.25x and 1-hour write 2x of input."""
+    out = {}
+    for k, v in (raw or {}).items():
+        if not isinstance(v, dict) or v.get("litellm_provider") != "anthropic":
+            continue
+        try:
+            inp = float(v["input_cost_per_token"]) * 1e6
+            out[k] = {"input": inp, "output": float(v["output_cost_per_token"]) * 1e6,
+                      "cache_read": float(v.get("cache_read_input_token_cost", inp / 1e7)) * 1e6,
+                      "cache_write_5m": float(v.get("cache_creation_input_token_cost", inp * 1.25 / 1e6)) * 1e6,
+                      "cache_write_1h": float(v.get("cache_creation_input_token_cost_above_1hr", inp * 2 / 1e6)) * 1e6}
+            out[k] = {f: round(x, 6) for f, x in out[k].items()}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return _valid_prices(out)
+
+
+def refresh_prices(force=False):
+    """Once a day, and only if you use a model that prices.json does not know, take its price from LiteLLM's public
+    list (a plain download from GitHub, sending nothing of yours) instead of valuing it at _default. Only the
+    prices of those models are kept. TOKENOMETRO_PRICE_REFRESH=0 turns it off; without a network nothing changes."""
+    if _env("PRICE_REFRESH", "1") == "0":
+        return
+    c = _small_json(LITELLM_FILE)
+    if not force and time.time() - (c.get("checked") or 0) < 86400:
+        return
+    c["checked"] = time.time()
+    con = connect()
+    try:
+        used = [{"model": r[0]} for r in con.execute("SELECT DISTINCT model FROM msgs")]
+    finally:
+        con.close()
+    try:
+        ours = read_json(PRICES)
+    except Exception:
+        ours = {}
+    need = [m["model"] for m in unpriced(used, ours)]
+    if not need:
+        c["models"] = {}
+    else:
+        try:
+            req = urllib.request.Request(LITELLM_URL, headers={"User-Agent": f"tokenometro/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                table = _from_litellm(json.loads(r.read(64 << 20).decode("utf-8")))
+            picked = {}
+            for m in need:
+                best = max((k for k in table if k in m), key=len, default=None)
+                if best:
+                    picked[best] = table[best]
+            c.update(models=picked, fetched=date.today().isoformat())
+        except (OSError, ValueError):
+            pass
+    try:
+        with open(LITELLM_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(c, f)
+        os.replace(LITELLM_FILE + ".tmp", LITELLM_FILE)
+    except OSError:
+        pass
 
 
 def _currency_cfg():
@@ -570,8 +684,8 @@ def _cell(v):
     return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
 
 
-def report(month, by="session", client=ALL):
-    """CSV for one month (YYYY-MM), by session or by client, in USD and in the selected currency."""
+def report(month, by="session", client=ALL, as_json=False):
+    """CSV (or JSON) for one month (YYYY-MM), by session or by client, in USD and in the selected currency."""
     import csv
     import io
     con = connect()
@@ -599,6 +713,18 @@ def report(month, by="session", client=ALL):
         con.close()
     rate = _currency_cfg()[0]
     eur = currency()["code"] == "EUR" and rate > 0
+    if as_json:
+        for r in rows:
+            r["client"] = tr("others", "otros") if r["client"] == OTHERS else r["client"]
+            if "project" in r:
+                r["project"] = short_path(r["project"])
+            r["cost_usd"] = round(r.pop("cost") or 0, 4)
+            if eur:
+                r["cost_eur"] = round(r["cost_usd"] * rate, 4)
+            for k in ("input", "cache_write", "cache_read", "output"):
+                r[k + "_tokens"] = r.pop(k)
+        return json.dumps({"month": month, "by": by, "client": None if client == ALL else client, "rows": rows},
+                          ensure_ascii=False, indent=2) + "\n"
     out = io.StringIO()
     wr = csv.writer(out)
     wr.writerow(head + ["input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens", "cost_usd"]
@@ -794,7 +920,7 @@ def data(days, client, cut=CUT_DEFAULT):
     chain = main_chain(con, w, a, T)
     cfg = read_config()
     for rec in (cache_miss_rec(con, chain), tool_output_rec(con, w, a, chain, cfg), ttl_rec(con, chain, prices, cfg),
-                error_loops_rec(con, w, a, C), claude_md_rec(res["fixed"])):
+                error_loops_rec(con, w, a, C), claude_md_rec(res["fixed"]), reread_rec(con, w, a, chain)):
         if rec:
             res["recs"].append(rec)
 
@@ -820,6 +946,9 @@ def data(days, client, cut=CUT_DEFAULT):
     funnel(con, res["recs"], span, res["kpi_range"]["cost"] / span * 7)
     res["plan"] = plan_info(con, C, tot, res["live"])
     res["unpriced"] = unpriced(res["models"], prices)
+    src = prices.get("_sources") or {}
+    res["litellm"] = [m["model"] for m in unpriced(res["models"], {k: v for k, v in prices.items() if k not in src})
+                      if m not in res["unpriced"]]
     order = {"todo": 0, "warn": 1, "info": 2, "ok": 3}
     res["recs"].sort(key=lambda x: (order[x["status"]], -(x["impact"] or 0)))
     res["currency"] = currency()
@@ -918,7 +1047,7 @@ def fixed_cost(con, w, a, T, total):
         for k, v in json.loads(s["parts"] or "{}").items():
             parts[k] = parts.get(k, 0) + v / 4 / n
     if n:
-        g = claude_md_chars(os.path.join(HOME, ".claude", "CLAUDE.md")) / 4
+        g = claude_md_chars(os.path.join(CLAUDE_HOME, "CLAUDE.md")) / 4
         if g and r["base"] - sum(parts.values()) > g:
             parts["claude_md"] = g
     known = sum(parts.values())
@@ -988,10 +1117,15 @@ def main_chain(con, w, a, T):
     loss = f"({T['cw']} - {T['cr'].replace('cr*', '(cw5+cw1h)*')})"
     by = {}
     for r in q(con, f"""SELECT id, session, ts, day, model, inp+cw5+cw1h+cr ctx, cw5+cw1h cw, cw5, cw1h, cr, {loss} loss,
-            {T['cr'].replace('cr*', '1*')} crp FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a):
+            {T['cr'].replace('cr*', '1*')} crp, miss FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a):
         r["t"] = local(r["ts"])
         by.setdefault(r["session"], []).append(r)
     return by
+
+
+# message.diagnostics.cache_miss_reason.type → cause; "unavailable" (no reason given) falls back to the guess
+MISS_CAUSES = {"model_changed": "model", "system_changed": "config", "tools_changed": "config",
+               "messages_changed": "trim", "previous_message_not_found": "evicted"}
 
 
 def cache_miss_rec(con, chain):
@@ -999,20 +1133,28 @@ def cache_miss_rec(con, chain):
     prefix changed. Counted when the write is over 20K tokens and over half the context, the context didn't shrink
     by more than 40% (that is a compaction or /clear) nor grow by more than half (a first big read). The cost is the
     write minus what those tokens would have cost read from the cache. Causes: the model changed, the context was
-    trimmed (it shrank a little: old content cleared near the limit), or nothing visible in the logs."""
+    trimmed (it shrank a little: old content cleared near the limit), or nothing visible in the logs.
+    Recent Claude Code versions write the real reason (message.diagnostics.cache_miss_reason); when it is there it
+    wins over the guess, and a cache the server no longer had is reported apart, since nothing you do avoids it."""
     causes = {}
+    known = 0
     for rows in chain.values():
         for p, r in zip(rows, rows[1:]):
             if not (p["t"] and r["t"]) or (r["t"] - p["t"]).total_seconds() >= 300:
                 continue
             if r["cw"] <= 20000 or r["cw"] <= 0.5 * r["ctx"] or not (0.6 * p["ctx"] <= r["ctx"] <= 1.5 * p["ctx"]):
                 continue
-            k = "model" if r["model"] != p["model"] else "trim" if r["ctx"] < 0.95 * p["ctx"] else "other"
+            k = MISS_CAUSES.get(r.get("miss"))
+            if k:
+                known += 1
+            else:
+                k = "model" if r["model"] != p["model"] else "trim" if r["ctx"] < 0.95 * p["ctx"] else "other"
             c = causes.setdefault(k, {"n": 0, "cost": 0.0, "sessions": set(), "days": set()})
             c["n"] += 1
             c["cost"] += max(r["loss"] or 0, 0)
             c["sessions"].add(r["session"])
             c["days"].add(r["day"])
+    evicted = causes.pop("evicted", None)
     if not causes:
         return None
     total = sum(c["cost"] for c in causes.values())
@@ -1020,8 +1162,14 @@ def cache_miss_rec(con, chain):
     main = max(causes, key=lambda k: causes[k]["cost"])
     names = {"model": tr("model changed mid-session", "cambio de modelo a mitad de sesión"),
              "trim": tr("context trimmed near the limit", "contexto recortado cerca del límite"),
+             "config": tr("system prompt or tools changed (MCP, plugins, CLAUDE.md, an update…)",
+                          "cambió el prompt de sistema o las herramientas (MCP, plugins, CLAUDE.md, una actualización…)"),
              "other": tr("no visible cause (MCP or plugins changed, an update…)", "sin causa visible (cambio de MCP o plugins, una actualización…)")}
     parts = "; ".join(f"{names[k]}: {c['n']} ({money(c['cost'], 1)})" for k, c in sorted(causes.items(), key=lambda x: -x[1]["cost"]))
+    if evicted:
+        parts += tr(f". Not counted: {evicted['n']} the server had already dropped ({money(evicted['cost'], 1)}), nothing to change there",
+                    f". Sin contar: {evicted['n']} que el servidor ya había descartado ({money(evicted['cost'], 1)}), ahí no hay nada que cambiar")
+    exact = known and known >= 0.8 * (n + (evicted or {}).get("n", 0))
     action = {
         "model": tr("Pick the model when the session starts and keep it: every switch (/model, plan modes that change model) "
                     "starts the cache from zero for the whole conversation. If you need another model, open a new session.",
@@ -1031,6 +1179,10 @@ def cache_miss_rec(con, chain):
                    "written again, several times. Compact or /clear earlier (autoCompactWindow lower, e.g. 300000).",
                    "No dejes que las sesiones se acerquen al límite de contexto: entonces se borra contenido antiguo y la caché "
                    "entera se vuelve a escribir, varias veces. Compacta o haz /clear antes (autoCompactWindow más bajo, p. ej. 300000)."),
+        "config": tr("Avoid changing MCP servers, plugins, CLAUDE.md or settings in the middle of a long session, and start a new "
+                     "one after updating Claude Code: any change in the tools or the system prompt invalidates the cache.",
+                     "Evita cambiar servidores MCP, plugins, CLAUDE.md o ajustes en mitad de una sesión larga, y empieza una nueva "
+                     "después de actualizar Claude Code: cualquier cambio en las herramientas o el prompt de sistema invalida la caché."),
         "other": tr("Avoid changing MCP servers, plugins or settings in the middle of a long session, and start a new one after "
                     "updating Claude Code: any change in the tools or the system prompt invalidates the cache.",
                     "Evita cambiar servidores MCP, plugins o ajustes en mitad de una sesión larga, y empieza una nueva después "
@@ -1044,7 +1196,8 @@ def cache_miss_rec(con, chain):
         "status": "todo", "impact": total,
         "impact_note": tr("measured: each rewrite minus what those tokens cost read from the cache",
                           "medido: cada reescritura menos lo que esos tokens cuestan leídos de la caché"),
-        "confidence": tr("high for the amount, medium for the cause", "alta en el importe, media en la causa"),
+        "confidence": tr("high: Claude Code logs the cause", "alta: la causa la registra Claude Code") if exact else
+                      tr("high for the amount, medium for the cause", "alta en el importe, media en la causa"),
         "evidence": tr(f"{n} time(s) a request wrote the whole conversation to the cache again less than 5 minutes after the "
                        f"previous one, in {len(sessions)} session(s): {money(total, 1)}. By cause: {parts}.",
                        f"{n} vez(es) una petición volvió a escribir toda la conversación en la caché menos de 5 minutos después "
@@ -1121,6 +1274,78 @@ def tool_output_rec(con, w, a, chain, cfg):
                      "summary, never whole logs. Show me the diff before saving.",
                      "Añade a mi CLAUDE.md una regla corta: filtrar la salida de los comandos (tail, grep, --quiet) y que los "
                      "scripts impriman un resumen, nunca logs enteros. Enséñame el diff antes de guardar."),
+    }
+
+
+_NOT_TEXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".ipynb")
+
+
+def reread_rec(con, w, a, chain):
+    """The same file Read again in the same stretch of a conversation (no compaction, no edit of that file in
+    between): the second copy adds nothing new but is carried, like the first, on every later turn. Images and
+    PDFs are left out (screenshots are overwritten and re-read on purpose). Offset/limit are not stored, so two
+    different ranges of a file look the same: only the part up to the largest earlier read counts, and half of it."""
+    after, seg = {}, {}
+    for rows in chain.values():
+        nxt, part = len(rows), 0
+        for i in range(len(rows) - 1, -1, -1):
+            if i + 1 < len(rows) and rows[i + 1]["ctx"] < 0.6 * rows[i]["ctx"]:
+                nxt = i + 1
+            after[rows[i]["id"]] = (nxt - i - 1, rows[i]["crp"] or 0)
+        for i, r in enumerate(rows):
+            if i and r["ctx"] < 0.6 * rows[i - 1]["ctx"]:
+                part += 1
+            seg[r["id"]] = (part, i)
+    seen, by_file = {}, {}
+    n, tokens, cost, sessions, days = 0, 0.0, 0.0, set(), set()
+    calls = [r for r in q(con, f"""SELECT id, name, msg_id, session, day, input_head f, result_chars ch FROM tools
+            WHERE sidechain=0 AND name IN ('Read', 'Edit', 'Write', 'MultiEdit') AND COALESCE(input_head, '') != ''
+            AND {w}""", a) if r["msg_id"] in seg and not r["f"].lower().endswith(_NOT_TEXT)]
+    calls.sort(key=lambda r: (r["session"], seg[r["msg_id"]][1], r["id"]))
+    for r in calls:
+        key = (r["session"], seg[r["msg_id"]][0], r["f"])
+        if r["name"] != "Read":
+            seen.pop(key, None)  # the file changed: reading it again is how you see the change
+            continue
+        prev = seen.get(key, 0)
+        seen[key] = max(prev, r["ch"] or 0)
+        if not prev or (r["ch"] or 0) < 4000:
+            continue
+        turns, price = after.get(r["msg_id"], (0, 0))
+        tk = min(r["ch"], prev) / 4
+        n += 1
+        tokens += tk
+        cost += tk * turns * price * 0.5
+        sessions.add(r["session"])
+        days.add(r["day"])
+        by_file[r["f"]] = by_file.get(r["f"], 0) + 1
+    if n < 3:
+        return None
+    top = ", ".join(f"{os.path.basename(f)} ×{k + 1}" for f, k in sorted(by_file.items(), key=lambda x: -x[1])[:3])
+    return {
+        "id": "reread", "title": tr("The same file is read again in the same conversation", "Se vuelve a leer el mismo fichero en la misma conversación"),
+        "status": "todo", "impact": cost,
+        "impact_note": tr("estimate: repeated tokens (up to the largest earlier read) × later turns until a compaction × cache read price, halved",
+                          "estimación: tokens repetidos (hasta la mayor lectura anterior) × turnos siguientes hasta compactar × precio de lectura de caché, a la mitad"),
+        "confidence": tr("medium: the range read (offset/limit) is not logged", "media: el tramo leído (offset/limit) no queda registrado"),
+        "evidence": tr(f"{n} time(s) a file already in the context was read again, with no edit or compaction in between, "
+                       f"in {len(sessions)} session(s): ~{fmt_tok(tokens)} tokens carried twice, ~{money(cost, 2)}. Most repeated: {top}.",
+                       f"{n} vez/veces se volvió a leer un fichero que ya estaba en el contexto, sin edición ni compactación entre medias, "
+                       f"en {len(sessions)} sesión(es): ~{fmt_tok(tokens)} tokens acarreados dos veces, ~{money(cost, 2)}. Los más repetidos: {top}."),
+        "action": tr("Before opening a file already read in this conversation again, use what is already in the context; if you need "
+                     "another part, ask only for that range (offset/limit) or find it with Grep.",
+                     "Antes de volver a abrir un fichero ya leído en esta conversación, usa lo que ya está en el contexto; si necesitas "
+                     "otra parte, pide solo ese rango (offset/limit) o búscala con Grep."),
+        "verify": tr("This card's count and amount drop.", "El número y el importe de esta tarjeta bajan."),
+        "tradeoff": tr("After a long detour the model may need the file fresh; then reading it again is right.",
+                       "Tras un desvío largo el modelo puede necesitar el fichero fresco; entonces releerlo es lo correcto."),
+        "metric": n, "metric_label": tr("repeated reads", "relecturas"),
+        "sample": {"sessions": len(sessions), "days": len(days)},
+        "tools": [],
+        "prompt": tr("Add to my CLAUDE.md a short rule: don't read again a file already read in this conversation unless it "
+                     "changed; for another part use offset/limit or Grep. Show me the diff before saving.",
+                     "Añade a mi CLAUDE.md una regla corta: no volver a leer un fichero ya leído en esta conversación salvo que "
+                     "haya cambiado; para otra parte, offset/limit o Grep. Enséñame el diff antes de guardar."),
     }
 
 
@@ -1319,7 +1544,7 @@ def _dig(d, path, value=None, mode="get"):
 
 def change_settings(fn):
     """Edit ~/.claude/settings.json the safe way: a dated backup first, then write aside and swap."""
-    path = os.path.join(HOME, ".claude", "settings.json")
+    path = os.path.join(CLAUDE_HOME, "settings.json")
     s = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -1441,7 +1666,7 @@ def read_config():
            "opus_plugin_agents": [], "read_rule": False, "read_guard": False, "gap_hook": False,
            "statusline": False, "caveman": False, "cbm": False}
     try:
-        st = read_json(os.path.join(HOME, ".claude", "settings.json"))
+        st = read_json(os.path.join(CLAUDE_HOME, "settings.json"))
     except Exception:
         st = {}
     cfg["autoCompactWindow"] = st.get("autoCompactWindow")
@@ -1451,7 +1676,7 @@ def read_config():
     for key, on in (st.get("enabledPlugins") or {}).items():
         if on and "@" in key:
             name, mkt = key.split("@", 1)
-            vers = sorted(glob.glob(os.path.join(HOME, ".claude", "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
+            vers = sorted(glob.glob(os.path.join(CLAUDE_HOME, "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
             try:
                 hook_sets.append(read_json(os.path.join(vers[-1], "hooks", "hooks.json")).get("hooks") or {})
             except Exception:
@@ -1462,7 +1687,7 @@ def read_config():
     # A plugin (e.g. context-meter) can show the context without touching statusLine
     cfg["ctx_plugins"] = [k.split("@")[0] for k, on in (st.get("enabledPlugins") or {}).items()
                           if on and re.search(r"context[-_]?meter|status[-_]?line|ctx[-_]?bar", k.split("@")[0], re.I)]
-    cfg["caveman"] = os.path.isdir(os.path.join(HOME, ".claude", "skills", "caveman"))
+    cfg["caveman"] = os.path.isdir(os.path.join(CLAUDE_HOME, "skills", "caveman"))
     cfg["cbm"] = os.path.exists(os.path.join(HOME, ".local", "bin", "codebase-memory-mcp"))
     cfg["bashOutputMaxChars"] = st.get("bashOutputMaxChars")
     cfg["subagent_model"] = (st.get("env") or {}).get("CLAUDE_CODE_SUBAGENT_MODEL")
@@ -1471,7 +1696,7 @@ def read_config():
         if not on or "@" not in key:
             continue
         name, mkt = key.split("@", 1)
-        vers = sorted(glob.glob(os.path.join(HOME, ".claude", "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
+        vers = sorted(glob.glob(os.path.join(CLAUDE_HOME, "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
         for f in glob.glob(os.path.join(vers[-1], "agents", "*.md")) if vers else []:
             try:
                 head = read_head(f, 1500)
@@ -1481,7 +1706,7 @@ def read_config():
             if m and "opus" in m.group(1):
                 cfg["opus_plugin_agents"].append(f"{name}:{os.path.basename(f)[:-3]}")
     try:
-        cfg["read_rule"] = "offset" in read_head(os.path.join(HOME, ".claude", "CLAUDE.md"), -1)
+        cfg["read_rule"] = "offset" in read_head(os.path.join(CLAUDE_HOME, "CLAUDE.md"), -1)
     except OSError:
         pass
     return cfg
@@ -1585,7 +1810,7 @@ def model_fit(con, w, a, C):
     return out
 
 
-SUBMETER_GLOB = os.path.join(HOME, ".claude", "plugins", "store", "sub-meter_*.json")
+SUBMETER_GLOB = os.path.join(CLAUDE_HOME, "plugins", "store", "sub-meter_*.json")
 PLAN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plan.json")  # written by statusline.py
 
 
@@ -1658,7 +1883,7 @@ def plan_info(con, C, tot, live):
     return res
 
 
-REPORTS = os.path.join(HOME, ".claude", "reports")
+REPORTS = os.path.join(CLAUDE_HOME, "reports")
 
 
 def recs_file_path(day=None):
@@ -1703,8 +1928,8 @@ def digest_path(monday):
     return os.path.join(REPORTS, f"tokenometro-{name}-{y}-W{wk:02d}.md")
 
 
-def digest(monday):
-    """Weekly summary (Monday to Sunday) as Markdown: spend against the week before, where it went, what changed."""
+def digest(monday, as_json=False):
+    """Weekly summary (Monday to Sunday) as Markdown, or JSON: spend against the week before, where it went, what changed."""
     sun, prev = monday + timedelta(days=6), monday - timedelta(days=7)
     con = connect()
     try:
@@ -1724,6 +1949,20 @@ def digest(monday):
         models = q(con, f"SELECT model, SUM({C}) cost FROM msgs WHERE {w} GROUP BY model", a)
     finally:
         con.close()
+    changed = [(rid, v) for rid, v in st.items() if v.get("after") and v.get("after") != v.get("before")]
+    miss = unpriced(models, prices)
+    if as_json:
+        return json.dumps({
+            "week": monday.isocalendar()[1], "from": monday.isoformat(), "to": sun.isoformat(),
+            "cost_usd": round(now_["c"], 4), "sessions": now_["s"],
+            "previous_cost_usd": round(before["c"], 4), "previous_sessions": before["s"],
+            "top_sessions": [{"session": r["session"], "title": r["title"], "project": short_path(r["project"] or ""),
+                              "cost_usd": round(r["cost"] or 0, 4)} for r in top],
+            "branches": [{"branch": r["branch"], "task": r["task"], "repos": r["repos"], "cost_usd": round(r["cost"] or 0, 4)} for r in br],
+            "fixed_cost": {"tokens": fx["base"], "cost_usd": round(fx["cost"], 4), "share_pct": round(fx["share"], 1)} if fx["measured"] else None,
+            "recommendations_changed": [{"id": rid, "before": v.get("before"), "after": v["after"]} for rid, v in changed],
+            "unpriced_models": [m["model"] for m in miss],
+        }, ensure_ascii=False, indent=2) + "\n"
     diff = now_["c"] - before["c"]
     pct = f" ({'+' if diff >= 0 else ''}{100 * diff / before['c']:.0f}%)" if before["c"] else ""
     names = {"todo": tr("pending", "pendiente"), "warn": tr("applied, review", "aplicada, revisar"),
@@ -1742,11 +1981,9 @@ def digest(monday):
         L += [tr("## Fixed cost per session", "## Coste fijo por sesión"), "",
               tr(f"~{fmt_tok(fx['base'])} tokens before the conversation starts: {money(fx['cost'], 2)} ({fx['share']:.0f}% of the week).",
                  f"~{fmt_tok(fx['base'])} tokens antes de empezar la conversación: {money(fx['cost'], 2)} ({fx['share']:.0f}% de la semana)."), ""]
-    changed = [(rid, v) for rid, v in st.items() if v.get("after") and v.get("after") != v.get("before")]
     if changed:
         L += [tr("## Recommendations that changed", "## Recomendaciones que cambiaron"), ""]
         L += [f"- {rid}: {names.get(v.get('before'), '-')} → {names.get(v['after'], v['after'])}" for rid, v in changed] + [""]
-    miss = unpriced(models, prices)
     if miss:
         L += [tr("## Models without a price", "## Modelos sin precio"), ""]
         L += [tr(f"- {m['model']}: valued at _default; add it to prices.json.", f"- {m['model']}: valorado a _default; añádelo a prices.json.")
@@ -2530,7 +2767,7 @@ en:{title:'Tokenometro',leg_tip:'Show only this one',leg_tip_all:'Show them all 
  plan_src:'Your plan usage (from {src}, read at {at})',plan_ago:', {t} ago',five_h:'5 hours',week:'Week',
  eta:'At the current pace you reach 100 % on {eta}, before it resets.',noeta:'At the current pace you will not run out before it resets ({reset}).',resets:'resets in {t} ({at})',
  copied:'Copied',al_update:'v{n} available',al_update_tip:'You have {c} and {n} is out. To update: {h}',apply:'Apply',undo:'Undo',apply_hint:'Tokenometro can do it for you: sets {c} in ~/.claude/settings.json (a backup is saved first).',applied_on:'Applied from here on {d} ({c}).',applied_ba:'Before: {a} · after: {b} ({n} day(s)).',applied_wait:'The before/after appears from tomorrow.',undo_confirm:'Put back the previous value in ~/.claude/settings.json?',apply_failed:'Could not change settings.json',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
- al_unp:'{n} model(s) without a price',
+ al_unp:'{n} model(s) without a price',al_lit:'{n} price(s) from LiteLLM',al_lit_tip:'Not in prices.json, so their price comes from LiteLLM\'s public list: {m}. Add them to prices.json to fix it yourself.',
  al_unpriced:'Estimated prices for <code>{m}</code>: not in prices.json, so they are valued at the <code>_default</code> price. Add them to prices.json for exact figures.',
  csv_hint:'Monthly report to share or bill: tokens and cost per session or per client.',csv_sessions:'CSV by session',csv_clients:'CSV by client',month_label:'Month of the CSV report',
  load_err:'Could not refresh: is Tokenometro still running? Showing the last data received.',cut_label:'Cut-off date for before / after',
@@ -2560,7 +2797,7 @@ es:{title:'Tokenómetro',leg_tip:'Ver solo este',leg_tip_all:'Volver a ver todos
  plan_src:'Uso de tu plan (dato de {src}, leído a las {at})',plan_ago:', hace {t}',five_h:'5 horas',week:'Semana',
  eta:'Al ritmo actual llegarás al 100 % el {eta}, antes de que se reinicie.',noeta:'Al ritmo actual no lo agotarás antes de que se reinicie ({reset}).',resets:'se reinicia en {t} ({at})',
  copied:'Copiado',al_update:'v{n} disponible',al_update_tip:'Tienes la {c} y ya está la {n}. Para actualizar: {h}',apply:'Aplicar',undo:'Deshacer',apply_hint:'Tokenometro puede hacerlo por ti: pone {c} en ~/.claude/settings.json (antes guarda una copia).',applied_on:'Aplicada desde aquí el {d} ({c}).',applied_ba:'Antes: {a} · después: {b} ({n} día(s)).',applied_wait:'El antes/después sale a partir de mañana.',undo_confirm:'¿Volver a poner el valor anterior en ~/.claude/settings.json?',apply_failed:'No se pudo cambiar settings.json',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
- al_unp:'{n} modelo(s) sin precio',
+ al_unp:'{n} modelo(s) sin precio',al_lit:'{n} precio(s) de LiteLLM',al_lit_tip:'No están en prices.json y su precio sale de la lista pública de LiteLLM: {m}. Añádelos a prices.json para fijarlo tú.',
  al_unpriced:'Precios estimados para <code>{m}</code>: no están en prices.json y se valoran al precio de <code>_default</code>. Añádelos a prices.json para tener cifras exactas.',
  csv_hint:'Informe mensual para compartir o repercutir: tokens y coste por sesión o por cliente.',csv_sessions:'CSV por sesión',csv_clients:'CSV por cliente',month_label:'Mes del informe CSV',
  load_err:'No se pudo actualizar: ¿sigue en marcha Tokenometro? Se muestran los últimos datos recibidos.',cut_label:'Fecha de corte para antes / después',
@@ -2687,6 +2924,8 @@ async function openSession(x,tr,n){const nx=tr.nextElementSibling;if(nx&&nx.clas
 function alerts(r){const a=[];
  if(r.unpriced&&r.unpriced.length){const tip=t('al_unpriced',{m:r.unpriced.map(m=>m.model).join(', ')}).replace(/<[^>]+>/g,'');
   a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_unp',{n:r.unpriced.length})+'</span>')}
+ if(r.litellm&&r.litellm.length){const tip=t('al_lit_tip',{m:r.litellm.join(', ')});
+  a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_lit',{n:r.litellm.length})+'</span>')}
  if(r.update){const tip=t('al_update_tip',{c:r.update.current,n:r.update.latest,h:r.update.how});
   a.push('<a class="chip" href="'+esc(r.update.url)+'" target="_blank" rel="noopener" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_update',{n:esc(r.update.latest)})+'</a>')}
  const o=r.pace&&r.pace.odd;if(o){const d=o.day.slice(8,10)+'-'+o.day.slice(5,7),tip=t('odd_tip',{d:d,c:usd(o.cost),x:num(o.ratio,1),m:usd(o.median),s:o.title||(o.session||'').slice(0,8),sc:usd(o.session_cost)});
@@ -2907,8 +3146,8 @@ def _ver(v):
 
 
 def check_update(force=False):
-    """Once a day, ask GitHub which release is the latest. Only that request leaves your machine, with no data
-    of yours; TOKENOMETRO_UPDATE_CHECK=0 turns it off. Failures are remembered too, so it never insists."""
+    """Once a day, ask GitHub which release is the latest, with no data of yours (refresh_prices is the only
+    other request); TOKENOMETRO_UPDATE_CHECK=0 turns it off. Failures are remembered too, so it never insists."""
     if _env("UPDATE_CHECK", "1") == "0":
         return
     c = _small_json(UPDATE_FILE)
@@ -2964,6 +3203,10 @@ def loop():
             except Exception as e:
                 print("digest error:", e, file=sys.stderr)
             check_update()
+            try:
+                refresh_prices()
+            except Exception as e:
+                print("prices error:", e, file=sys.stderr)
         time.sleep(INGEST_EVERY)
 
 
@@ -3004,7 +3247,7 @@ def main():
                            f"{m['model']} no está en prices.json: se valora al precio de _default."))
         return
     if cmd == "report":
-        # tracker.py report [YYYY-MM] [--by client] [--client NAME] [--cur EUR]
+        # tracker.py report [YYYY-MM] [--by client] [--client NAME] [--cur EUR] [--json]
         args = sys.argv[2:]
         opt = lambda k, d: args[args.index(k) + 1] if k in args and args.index(k) + 1 < len(args) else d
         month = next((x for x in args if re.fullmatch(r"[0-9]{4}-[0-9]{2}", x)), datetime.now().strftime("%Y-%m"))
@@ -3012,16 +3255,16 @@ def main():
         set_currency(opt("--cur", "").upper())
         ingest()
         sys.stdout.flush()
-        sys.stdout.buffer.write(report(month, opt("--by", "session"), opt("--client", ALL)).encode("utf-8"))  # bytes: no \r\r\n on Windows
+        sys.stdout.buffer.write(report(month, opt("--by", "session"), opt("--client", ALL), "--json" in args).encode("utf-8"))  # bytes: no \r\r\n on Windows
         return
     if cmd == "digest":
-        # tracker.py digest [YYYY-MM-DD]: the week (Monday to Sunday) holding that day; last week by default
+        # tracker.py digest [YYYY-MM-DD] [--json]: the week (Monday to Sunday) holding that day; last week by default
         set_lang(LANG_DEFAULT)
         ingest()
         day = next((x for x in sys.argv[2:] if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", x)), None)
         d = date.fromisoformat(day) if day else date.today() - timedelta(days=7)
         sys.stdout.flush()
-        sys.stdout.buffer.write(digest(d - timedelta(days=d.weekday())).encode("utf-8"))
+        sys.stdout.buffer.write(digest(d - timedelta(days=d.weekday()), "--json" in sys.argv[2:]).encode("utf-8"))
         return
     if cmd == "backfill":
         t0 = time.time()

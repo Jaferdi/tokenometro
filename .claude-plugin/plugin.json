@@ -1,6 +1,6 @@
 {
   "name": "tokenometro",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Local dashboard for what your Claude Code sessions cost, where the tokens go and what to change to spend less. Starts with Claude Code on 127.0.0.1:7878; your data never leaves your machine.",
   "author": {
     "name": "Jaferdi"

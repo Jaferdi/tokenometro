@@ -4,7 +4,7 @@
   "default": "USD",
   "eur_per_usd": 0.91,
   "date": "2026-11-19",
-  "_note": "The dashboard lets you pick € or $. Update eur_per_usd by hand (Tokenometro never goes online). default: USD or EUR."
+  "_note": "The dashboard lets you pick € or $. Update eur_per_usd by hand (Tokenometro does not fetch exchange rates). default: USD or EUR."
  },
  "claude-fable-5-2": {
   "input": 8,

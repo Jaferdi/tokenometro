@@ -24,7 +24,9 @@ WIN = os.name == "nt"
 HOME = os.path.expanduser("~")
 DEST = start.data_dir()
 OLD = os.path.join(HOME, ".local", "share", "claude-tokens")  # folder used by earlier versions
-SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+# Claude Code reads its settings from CLAUDE_CONFIG_DIR when it is set (first folder if it is a list)
+SETTINGS = os.path.join(os.path.expanduser((os.environ.get("CLAUDE_CONFIG_DIR") or "").split(",")[0].strip()
+                                           or os.path.join(HOME, ".claude")), "settings.json")
 PORT = start.port_from(sys.argv[1:])
 FILES = ("tracker.py", "start.py", "start.sh", "statusline.py", "install.py", "install.sh", "clients.example.json")
 DOCS = ("README.md", "README.es.md", "LICENSE")
