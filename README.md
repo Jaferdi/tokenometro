@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>See what your Claude Code sessions cost, where the tokens go, and what to change to spend less.</b><br>
-  One Python file · no dependencies · nothing leaves your machine · English &amp; Spanish · light &amp; dark
+  One Python file · no dependencies · your data stays on your machine · English &amp; Spanish · light &amp; dark
 </p>
 
 <p align="center">
@@ -34,6 +34,9 @@ The demo runs in a temporary folder with invented data: it doesn't read your log
 | **Your plan** | % of the 5-hour window and of the week, when it resets, the estimated ceiling in $ or €, and whether you'll run out before it resets at your current pace. |
 | **Recommended improvements** | Cards built from *your* data and *your* `settings.json`: what to change, how much it weighs, how to check it worked, and a ready-to-paste prompt for Claude. |
 | **Sessions** | Cost per session split into input, output, cache reads and writes; the cheapest model that would have done the job; segments between compactions, subagents and the biggest tool calls. |
+| **By branch / task** | Cost per git branch. If the branch name carries a ticket (`feature/7067`, `fix/ABC-123`), all the repos you touched for it add up into one task; if not, you still get cost per branch. |
+| **Fixed cost per session** | What every session carries before you type anything: system prompt, built-in tools, each MCP server, your CLAUDE.md, memory and skills. How much it cost in the period, and a card when an MCP server is loaded everywhere but hardly used. |
+| **Weekly summary** | Every Monday a Markdown file in `~/.claude/reports/` with last week's spend against the week before, top sessions and tasks, fixed cost and recommendations that changed. |
 | **Reports** | A monthly CSV per session or per client, to share or to bill a client, from the dashboard or the command line. |
 | **Before / after** | Pick the date of a change (a new setting, a new habit) and compare cost per message, context and compactions on each side. |
 
@@ -85,6 +88,17 @@ python3 install.py --statusline  # also uses statusline.py to see plan usage %
 2. Adds a `SessionStart` hook to `~/.claude/settings.json` that starts the dashboard when you open Claude Code. It backs up the file first: `settings.json.bak-tokenometro-<date>`.
 3. Reads your history (the first run takes a while) and starts the server at http://127.0.0.1:7878.
 
+**With pipx**:
+
+```bash
+pipx install git+https://github.com/Jaferdi/tokenometro
+tokenometro install              # same as install.py; add --statusline for plan usage %
+```
+
+The `tokenometro` command also does `open`, `restart`, `report`, `digest`, `demo` and `uninstall` (`tokenometro help`).
+
+**Updates**: the dashboard shows *vX.Y available* next to the title when there is a new release, with the command for the way you installed it: `claude plugin update tokenometro@tokenometro`, `git pull && python3 install.py` or `pipx upgrade tokenometro && tokenometro install`. To hear about releases by email, *Watch → Custom → Releases* on GitHub.
+
 If you had the earlier version in `~/.local/share/claude-tokens`, it copies your data and settings and swaps the hook.
 
 To remove it: `python3 ~/.local/share/tokenometro/install.py --uninstall` (removes the hook and our statusLine; data stays until you delete the folder).
@@ -93,7 +107,8 @@ To remove it: `python3 ~/.local/share/tokenometro/install.py --uninstall` (remov
 
 - It only reads `~/.claude/projects/**/*.jsonl` (and, if present, the last reading of the sub-meter plugin).
 - It listens on `127.0.0.1`: the dashboard is not reachable from outside your machine.
-- It never goes online or sends anything. Everything stays in `~/.local/share/tokenometro/usage.db` (SQLite).
+- Your data never leaves your machine: everything stays in `~/.local/share/tokenometro/usage.db` (SQLite).
+- Its only request to the internet: once a day it asks GitHub which release is the latest (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`), sending nothing of yours. GitHub sees your IP, as with any visit. Turn it off with `TOKENOMETRO_UPDATE_CHECK=0`.
 - "Biggest calls" masks anything that looks like a secret, but the dashboard does show parts of your commands and paths: check before sharing screenshots.
 
 ## What "$ eq." means
@@ -109,6 +124,7 @@ Each card comes from a rule that crosses your data for the period with your actu
 - **Metric and history**: every hour a daily snapshot of all cards is saved (`recs_hist`). That feeds the squares for the last 14 days, "to do since…" or "good since…", and the trend versus 7 days ago. If a card changes while the dashboard is open, it flashes.
 - **Before / after**: some rules compare against the cut-off date. Until there are 7 days since the cut-off the card shows "Under observation", because with fewer days the kind of task weighs more than the change.
 - **With what**: existing tools or settings that are worth it to fix it.
+- **Apply**: when the fix is a single setting (`autoCompactWindow`, `CLAUDE_CODE_SUBAGENT_MODEL`), the card has an *Apply* button. It saves a dated backup of `~/.claude/settings.json`, changes only that key and, from the next day on, shows the card's metric before and after. *Undo* puts back the previous value, unless you changed it by hand since.
 - **Prompt**: the text to ask Claude to do it is saved to `~/.claude/reports/improvements-YYYY-MM-DD.md` (`mejoras-…` in Spanish) and copied with "Copy prompt".
 
 Current rules: oversized context and compactions, resuming sessions after long pauses (rewrites the cache), subagents running on Opus, reading huge files, showing context in the status line (only if you don't already have a statusLine or a plugin showing it), model output (only above 25% of cost) and cost-effective model.
@@ -138,6 +154,8 @@ Plan usage only exists on subscriptions (Pro, Max, Team…): the API has no 5-ho
    ```
    python3 "$HOME/.local/share/tokenometro/statusline.py" --tee | <your current command>
    ```
+
+On its own, `statusline.py` prints `5h 46%  week 20%`, and adds `· runs out 16:40` when, at the pace since the window opened, you would hit 100% before it resets (`TOKENOMETRO_LANG=es` prints it in Spanish).
 
 It uses whichever reading is newer. With neither, the dashboard only shows what was spent in the last 5 hours and 7 days.
 
@@ -177,6 +195,7 @@ Update the rate by hand: Tokenometro never goes online. If your `prices.json` co
 | `TOKENOMETRO_CUT` | "Before / after" cut-off date | the one in `clients.json` or 7 days ago |
 | `TOKENOMETRO_CURRENCY` | Default `EUR` or `USD` | the one in `prices.json` |
 | `TOKENOMETRO_LANG` | Default `en` or `es` | `en` |
+| `TOKENOMETRO_UPDATE_CHECK` | `0` to never check GitHub for a new version | `1` |
 | `TOKENOMETRO_NO_START` | `1` so the installer doesn't start it | |
 
 The old `CLAUDE_TOKENS_*` names still work.
@@ -188,9 +207,10 @@ python3 ~/.local/share/tokenometro/tracker.py            # server (what the hook
 python3 ~/.local/share/tokenometro/tracker.py ingest     # read new logs and print a summary
 python3 ~/.local/share/tokenometro/tracker.py backfill   # fill in tool data for old history (once)
 python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur EUR   # monthly CSV to stdout
+python3 ~/.local/share/tokenometro/tracker.py digest 2026-11-17   # weekly summary of the week holding that day
 ```
 
-`report` takes `[YYYY-MM]` (this month by default), `--by session|client`, `--client NAME` and `--cur USD|EUR`. The same CSV is in the dashboard, in the *By client* card.
+`report` takes `[YYYY-MM]` (this month by default), `--by session|client`, `--client NAME` and `--cur USD|EUR`. The same CSV is in the dashboard, in the *By client* card. `digest` prints the Markdown summary of a week (Monday to Sunday; last week by default). The server also writes last week's one by itself, once, as `~/.claude/reports/tokenometro-week-YYYY-Www.md` (`tokenometro-semana-…` in Spanish).
 
 Restart the server (it only stops it if it is Tokenometro):
 
@@ -216,6 +236,7 @@ python3 ~/.local/share/tokenometro/start.py --restart
 | `install.py` | Install, update and uninstall (`install.sh` calls it) |
 | `.claude-plugin/`, `hooks/` | Claude Code plugin |
 | `demo.py` | Try it with made-up data, without installing anything |
+| `cli.py`, `pyproject.toml` | The `tokenometro` command when installed with pipx |
 | `usage.db` | Data (rebuilt from the logs if you delete it) |
 | `plan.json` | Last plan reading from `statusline.py` |
 | `tracker.log` | Server log |

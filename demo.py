@@ -42,6 +42,11 @@ FILES = ["src/orders/service.ts", "src/payments/stripe.ts", "src/cart/totals.ts"
 COMMANDS = ["npm test", "npm run lint", "git status", "git diff --stat", "npm run build", "pytest -q",
             "docker compose up -d db", "npx tsc --noEmit"]
 DOC_EXT = (".md", ".json", ".yaml")
+BRANCHES = {
+    "code": ["feature/PAY-142-refunds", "feature/PAY-157-oauth", "fix/1287-cart-rounding", "feature/search-speed",
+             "main", "feature/PAY-160-rate-limit"],
+    "docs": ["docs/release-2.4", "main"],
+}
 
 
 def iso(t):
@@ -52,6 +57,19 @@ class Session:
     def __init__(self, rnd, sid, cwd, model, kind, start, turns):
         self.rnd, self.sid, self.cwd, self.model, self.kind = rnd, sid, cwd, model, kind
         self.t, self.turns, self.ctx, self.lines, self.n = start, turns, 18_000, [], 0
+        own = random.Random(sid)  # its own generator, so adding branches doesn't reshuffle the rest of the demo
+        self.branch = own.choice(BRANCHES[kind]) if BRANCHES.get(kind) else None
+        self.mcp = own.random() < 0.7  # most sessions load a docs MCP server they rarely use
+
+    def shape(self):
+        """The api-request-shape record Claude Code logs: system prompt and tool definitions, no conversation."""
+        tool = lambda n, size: {"name": n, "description": "x" * size, "input_schema": {"type": "object"}}
+        tools = [tool(n, 4_000) for n in ("Bash", "Read", "Edit", "Write", "Grep", "Glob", "Agent", "WebFetch")]
+        if self.mcp:
+            tools += [tool(f"mcp__docs-search__{n}", 3_500) for n in ("search", "fetch", "list", "outline")]
+        tools += [dict(tool(f"mcp__calendar__{n}", 50), defer_loading=True) for n in ("events", "create")]
+        return {"type": "api-request-shape", "sessionId": self.sid, "timestamp": iso(self.t), "version": "2.1.0",
+                "shapeHash": self.sid[:12], "shape": {"system": [{"type": "text", "text": "x" * 9_000}], "tools": tools}}
 
     def _id(self, p):
         self.n += 1
@@ -59,6 +77,8 @@ class Session:
 
     def _base(self, typ, **kw):
         d = {"type": typ, "sessionId": self.sid, "cwd": self.cwd, "timestamp": iso(self.t), "uuid": self._id("u")}
+        if self.branch:
+            d["gitBranch"] = self.branch
         d.update(kw)
         return d
 
@@ -83,7 +103,7 @@ class Session:
 
     def build(self, compact_at=300_000, pause_at=None, subagent=None, huge_read=False, title=None):
         r = self.rnd
-        out = [{"type": "custom-title", "sessionId": self.sid, "customTitle": title or r.choice(TITLES[self.kind])}]
+        out = [{"type": "custom-title", "sessionId": self.sid, "customTitle": title or r.choice(TITLES[self.kind])}, self.shape()]
         agents = []
         for turn in range(self.turns):
             if pause_at and turn == pause_at:

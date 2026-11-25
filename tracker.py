@@ -13,10 +13,12 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import sys
 import threading
 import time
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -45,6 +47,19 @@ def _env(name, default):
 
 
 PORT = int(_env("PORT", "7878"))
+VERSION = "0.3.0"
+REPO = "Jaferdi/tokenometro"
+UPDATE_FILE = os.path.join(BASE, "update.json")
+
+
+def _small_json(path):
+    """A small file of ours that may not exist yet or be half-written: never an error, an empty dict."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
 INGEST_EVERY = 60
 CTX_LIMIT = 300_000  # if autoCompactWindow is set in settings.json, the recommendations use that value
 LIVE_MIN = 20
@@ -167,7 +182,28 @@ def connect():
         con.execute("ALTER TABLE tools ADD COLUMN input_head TEXT")
     if "head" not in [r[1] for r in con.execute("PRAGMA table_info(files)")]:
         con.execute("ALTER TABLE files ADD COLUMN head BLOB")
+    con.execute("""CREATE TABLE IF NOT EXISTS shapes(session TEXT PRIMARY KEY, ts TEXT, system_chars INTEGER,
+        tools_chars INTEGER, deferred INTEGER, parts TEXT)""")
+    if "branch" not in [r[1] for r in con.execute("PRAGMA table_info(msgs)")]:
+        con.execute("ALTER TABLE msgs ADD COLUMN branch TEXT")
+        con.execute("UPDATE files SET offset=0")  # read the history again to fill the branch and the request shapes
+        con.commit()
+    con.execute("CREATE TABLE IF NOT EXISTS applied(id TEXT PRIMARY KEY, at TEXT, day TEXT, prev TEXT, backup TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS seen(key TEXT PRIMARY KEY, ts TEXT)")
     return con
+
+
+def seen_since(con, key, on):
+    """When a setting the user made by hand was first seen on, as a UTC timestamp like msgs.ts (None once it is
+    gone), to measure from then."""
+    if not on:
+        con.execute("DELETE FROM seen WHERE key=?", (key,))
+        con.commit()
+        return None
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    con.execute("INSERT OR IGNORE INTO seen(key, ts) VALUES (?, ?)", (key, now))
+    con.commit()
+    return con.execute("SELECT ts FROM seen WHERE key=?", (key,)).fetchone()[0]
 
 
 _SECRET = [
@@ -215,14 +251,38 @@ def _text_len(content):
 
 
 _FIRST_TYPE = re.compile(rb'\{\s*"type"\s*:\s*"([^"]+)"')
-_WANTED_TYPES = {b"assistant", b"user", b"system", b"custom-title"}
+_WANTED_TYPES = {b"assistant", b"user", b"system", b"custom-title", b"api-request-shape"}
 _WANTED_ANY = re.compile(rb'"type"\s*:\s*"(?:assistant|user)"|"compact_boundary"')
 
 
-def _handle(con, d):
+def shape_parts(shape):
+    """What a request carries before the conversation: system prompt and tool definitions, in characters.
+    Tools with defer_loading only travel as a name until they are searched for, so they barely count."""
+    parts, deferred = {}, 0
+    for tl in shape.get("tools") or []:
+        if not isinstance(tl, dict):
+            continue
+        if tl.get("defer_loading"):
+            deferred += 1
+            continue
+        name = tl.get("name") or ""
+        key = "mcp:" + name.split("__")[1] if name.startswith("mcp__") and name.count("__") >= 2 else "builtin"
+        parts[key] = parts.get(key, 0) + len(json.dumps(tl, ensure_ascii=False))
+    system = sum(len(s.get("text") or "") for s in shape.get("system") or [] if isinstance(s, dict))
+    return system, parts, deferred
+
+
+def _handle(con, d, sub=False):
     t = d.get("type")
     if t == "custom-title":
         con.execute("INSERT OR REPLACE INTO titles VALUES(?,?)", (d.get("sessionId"), d.get("customTitle")))
+        return
+    if t == "api-request-shape":
+        if sub or not d.get("sessionId"):
+            return  # subagents carry their own, smaller set; the session's fixed cost is the main one
+        system, parts, deferred = shape_parts(d.get("shape") or {})
+        con.execute("INSERT OR REPLACE INTO shapes VALUES(?,?,?,?,?,?)",
+                    (d["sessionId"], d.get("timestamp") or "", system, sum(parts.values()), deferred, json.dumps(parts)))
         return
     ts = d.get("timestamp") or ""
     lt = local(ts)
@@ -249,10 +309,11 @@ def _handle(con, d):
         web = (u.get("server_tool_use") or {}).get("web_search_requests") or 0
         mid = msg.get("id") or d.get("uuid")
         con.execute(
-            "INSERT OR REPLACE INTO msgs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO msgs(id, ts, day, hour, session, project, client, model, sidechain, agent,"
+            " inp, cw5, cw1h, cr, out, think, web, branch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (mid, ts, day, hour, session, cwd, cl, model, side, d.get("agentId"),
              u.get("input_tokens") or 0, cw5, cw1h, u.get("cache_read_input_tokens") or 0,
-             u.get("output_tokens") or 0, think, web),
+             u.get("output_tokens") or 0, think, web, d.get("gitBranch") or None),
         )
         for b in msg.get("content") or []:
             if isinstance(b, dict) and b.get("type") == "tool_use":
@@ -288,6 +349,7 @@ def _ingest_file(con, path, off, size, head):
     """Read complete lines from off, committing every BATCH_LINES so the write lock is never held for long.
     The offset only advances together with what was saved, so a database error just retries later."""
     n = 0
+    sub = os.sep + "subagents" + os.sep in path
     try:
         with open(path, "rb") as f:
             f.seek(off)
@@ -305,7 +367,7 @@ def _ingest_file(con, path, off, size, head):
                 elif not _WANTED_ANY.search(line):
                     continue
                 try:
-                    _handle(con, json.loads(line))
+                    _handle(con, json.loads(line), sub)
                     n += 1
                     pending += 1
                 except (ValueError, TypeError, AttributeError, KeyError):
@@ -519,13 +581,13 @@ def report(month, by="session", client=ALL):
                 FROM msgs m WHERE {w} GROUP BY m.client ORDER BY cost DESC""", [month] + a)
             head = ["client", "sessions", "messages"]
         else:
-            rows = q(con, f"""SELECT m.client, MIN(m.day) date, m.session, COALESCE(t.title,'') title, MIN(m.project) project,
+            rows = q(con, f"""SELECT m.client, MIN(m.day) date, m.session, COALESCE(t.title,'') title, MIN(m.project) project, COALESCE(MAX(m.branch),'') branch,
                 GROUP_CONCAT(DISTINCT m.model) models,
                 (SELECT COUNT(*) FROM prompts p WHERE p.session=m.session AND substr(p.day,1,7)=?) messages,
                 SUM(m.inp) input, SUM(m.cw5+m.cw1h) cache_write, SUM(m.cr) cache_read, SUM(m.out) output, SUM({C}) cost
                 FROM msgs m LEFT JOIN titles t ON t.session=m.session WHERE {w}
                 GROUP BY m.session ORDER BY m.client, date""", [month] + a)
-            head = ["client", "date", "session", "title", "project", "models", "messages"]
+            head = ["client", "date", "session", "title", "project", "branch", "models", "messages"]
     finally:
         con.close()
     rate = _currency_cfg()[0]
@@ -680,7 +742,12 @@ def data(days, client, cut=CUT_DEFAULT):
     res["today_hours"] = q(con, f"SELECT hour, SUM({C}) cost FROM msgs WHERE day=?{cw_} GROUP BY hour", [today] + ca_)
     res["limits"] = {"ctx": CTX_LIMIT, "cost_warn": COST_WARN, "live_min": LIVE_MIN}
 
+    res["branches"] = branches(con, w, a, C)
+    res["fixed"] = fixed_cost(con, w, a, T, res["kpi_range"]["cost"])
     res["recs"] = recommendations(con, w, a, res["compare"]["cut"], res["kpi_range"], C, T, ctx)
+    mcp = mcp_rec(con, w, a, res["fixed"])
+    if mcp:
+        res["recs"].append(mcp)
 
     ids = [x["session"] for x in res["sessions"]]
     if ids:
@@ -704,13 +771,267 @@ def data(days, client, cut=CUT_DEFAULT):
     order = {"todo": 0, "warn": 1, "info": 2, "ok": 3}
     res["recs"].sort(key=lambda x: (order[x["status"]], -(x["impact"] or 0)))
     res["currency"] = currency()
+    res["update"] = update_info()
     res["lang"] = lang()
     attach_history(con, res["recs"])
+    attach_applied(con, res["recs"])
     rf = recs_file_path()
     res["recs_file"] = "~" + rf[len(HOME):] if rf.startswith(HOME + os.sep) else rf
     con.close()
     res["insights"] = insights(res)
     return res
+
+
+_TASK = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]+-[0-9]+)(?![0-9])|(?<![0-9])([0-9]{3,})(?![0-9])")
+
+
+def task_of(branch):
+    """A ticket in the branch name (feature/7067, fix/ABC-123-login) is the task; otherwise there is none."""
+    m = _TASK.search(branch or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def branches(con, w, a, C):
+    """Cost by git branch: whoever works with tickets in branch names sees tasks; everyone else, branches.
+    Sessions outside a git repo have no branch and are left out (they still count everywhere else)."""
+    raw = q(con, f"""SELECT branch, project, client, SUM({C}) cost, GROUP_CONCAT(DISTINCT session) sids,
+        MIN(day) first, MAX(day) last FROM msgs WHERE branch IS NOT NULL AND branch NOT IN ('', 'HEAD') AND {w}
+        GROUP BY branch, project, client""", a)
+    # a ticket spans repos (front, back...) and is one line; other branches are grouped by name, listing their repos
+    out = {}
+    for r in raw:
+        task = task_of(r["branch"])
+        repo = os.path.basename((r["project"] or "").rstrip("/\\"))
+        g = out.setdefault(("t", task) if task else ("b", r["branch"]),
+                           {"branch": r["branch"], "task": task, "repos": set(), "clients": set(), "sids": set(),
+                            "branches": set(), "cost": 0.0, "first": r["first"], "last": r["last"]})
+        g["repos"].add(repo)
+        g["branches"].add(r["branch"])
+        if r["client"] and r["client"] != OTHERS:
+            g["clients"].add(r["client"])
+        g["sids"].update((r["sids"] or "").split(","))
+        g["cost"] += r["cost"] or 0
+        g["first"], g["last"] = min(g["first"], r["first"]), max(g["last"], r["last"])
+    rows = []
+    for g in out.values():
+        g["sessions"] = len(g.pop("sids"))
+        br = sorted(g.pop("branches"))
+        g["branch"] = br[0] if len(br) == 1 else ", ".join(br)
+        g["repos"], g["clients"] = sorted(g["repos"]), sorted(g["clients"])
+        rows.append(g)
+    return sorted(rows, key=lambda x: -x["cost"])[:200]
+
+
+def claude_md_chars(path, depth=0):
+    """Size of a CLAUDE.md plus the files it pulls in with @path lines (Claude Code inlines them)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return 0
+    n = len(text)
+    if depth < 3:
+        for m in re.finditer(r"(?m)^\s*@(\S+)\s*$", text):
+            p = os.path.expanduser(m.group(1))
+            n += claude_md_chars(p if os.path.isabs(p) else os.path.join(os.path.dirname(path), p), depth + 1)
+    return n
+
+
+def fixed_cost(con, w, a, T, total):
+    """What every session pays before you type anything: system prompt, tool definitions, MCP servers,
+    CLAUDE.md, memory and skills. It is measured as the context of the session's first reply, and every
+    later reply reads it again from the cache (cheap, but on every single turn)."""
+    # the smallest context a session ever had: its first reply, or the one right after a compaction;
+    # resumed sessions start with the whole conversation, so their first reply is not the fixed part
+    mins = sorted(x for (x,) in con.execute(f"""SELECT MIN(inp+cw5+cw1h+cr) FROM msgs
+        WHERE sidechain=0 AND (inp+cw5+cw1h+cr)>0 AND {w} GROUP BY session""", a))
+    med = mins[len(mins) // 2] if mins else 0  # caps the sessions that were only ever seen resumed
+    base = f"""SELECT session, MIN(MIN(inp+cw5+cw1h+cr), {int(med)}) base, MIN(model) model,
+        SUM(cw1h) > SUM(cw5) h1 FROM msgs
+        WHERE sidechain=0 AND (inp+cw5+cw1h+cr)>0 AND {w} GROUP BY session"""
+    reread = T["cr"].replace("cr*", "b.base*").replace("model", "msgs.model")
+    r = q(con, f"""SELECT COUNT(DISTINCT b.session) sessions, COALESCE(SUM({reread}),0) reread, COUNT(*) turns
+        FROM msgs JOIN ({base}) b ON b.session=msgs.session
+        WHERE msgs.sidechain=0 AND {w.replace('day', 'msgs.day').replace('client', 'msgs.client')}""", a + a)[0]
+    # written to the cache once per session; every later turn only reads it
+    write = T["cw"].replace("(cw5*", "(base*(1-h1)*").replace("cw1h*", "base*h1*")  # at the TTL the session used
+    one = q(con, f"SELECT COALESCE(SUM({write}),0) c, COALESCE(AVG(base),0) base FROM ({base})", a)[0]
+    wr, r["base"] = one["c"], one["base"]
+    cost = (r["reread"] or 0) + (wr or 0)
+    shapes = q(con, f"""SELECT s.system_chars, s.parts, s.deferred FROM shapes s
+        WHERE s.session IN (SELECT DISTINCT session FROM msgs WHERE {w})""", a)
+    parts, n = {}, len(shapes)
+    for s in shapes:
+        parts["system"] = parts.get("system", 0) + (s["system_chars"] or 0) / 4 / n
+        for k, v in json.loads(s["parts"] or "{}").items():
+            parts[k] = parts.get(k, 0) + v / 4 / n
+    if n:
+        g = claude_md_chars(os.path.join(HOME, ".claude", "CLAUDE.md")) / 4
+        if g and r["base"] - sum(parts.values()) > g:
+            parts["claude_md"] = g
+    known = sum(parts.values())
+    if n and r["base"] > known:
+        parts["rest"] = r["base"] - known  # CLAUDE.md, memory, skill list, git status and the first message
+    servers = {}
+    for s in shapes:
+        for k, v in json.loads(s["parts"] or "{}").items():
+            if k.startswith("mcp:"):
+                x = servers.setdefault(k[4:], {"chars": 0, "sessions": 0})
+                x["chars"] += v
+                x["sessions"] += 1
+    servers = {k: {"tokens": round(x["chars"] / 4 / x["sessions"]), "sessions": x["sessions"]} for k, x in servers.items()}
+    return {"sessions": r["sessions"], "base": round(r["base"] or 0), "turns": r["turns"], "cost": cost,
+            "share": 100 * cost / total if total else 0, "measured": n,
+            "deferred": round(sum(s["deferred"] or 0 for s in shapes) / n) if n else 0,
+            "parts": sorted(({"k": k, "tokens": round(v)} for k, v in parts.items()), key=lambda x: -x["tokens"]),
+            "servers": servers}
+
+
+def mcp_rec(con, w, a, fx):
+    """An MCP server whose tools are loaded in every session but almost never used costs its share of the
+    fixed cost on every turn. Only servers above 2K tokens, seen in 3+ sessions, used in under 1 in 5."""
+    if not fx["servers"] or not fx["base"]:
+        return None
+    worst = None
+    for srv, s in fx["servers"].items():
+        if s["tokens"] < 2000 or s["sessions"] < 3:
+            continue
+        used = q(con, f"""SELECT COUNT(DISTINCT session) n FROM tools WHERE name LIKE ? ESCAPE '\\' AND {w}""",
+                 [("mcp__" + srv + "__").replace("_", "\\_") + "%"] + a)[0]["n"]
+        if used * 5 >= s["sessions"]:
+            continue
+        cost = fx["cost"] * s["tokens"] / fx["base"] * s["sessions"] / max(fx["measured"], 1)
+        if not worst or cost > worst[3]:
+            worst = (srv, s, used, cost)
+    if not worst:
+        return None
+    srv, s, used, cost = worst
+    return {
+        "id": "mcp", "title": tr(f"The MCP server {srv} is loaded in every session and almost never used",
+                                 f"El servidor MCP {srv} se carga en cada sesión y casi no se usa"),
+        "status": "todo", "impact": cost,
+        "impact_note": tr("its share of the fixed cost of every session", "su parte del coste fijo de cada sesión"),
+        "confidence": tr("medium", "media"),
+        "evidence": tr(f"Its tool definitions take ~{fmt_tok(s['tokens'])} tokens in each request of {s['sessions']} session(s); "
+                       f"its tools were used in {used}. Every reply reads them again: ~{money(cost, 2)} in the period.",
+                       f"Sus definiciones ocupan ~{fmt_tok(s['tokens'])} tokens en cada petición de {s['sessions']} sesión(es); "
+                       f"sus herramientas se usaron en {used}. Cada respuesta las vuelve a leer: ~{money(cost, 2)} en el periodo."),
+        "action": tr(f"Disable {srv} where you don't need it (/mcp, or enable it per project), or turn on tool search "
+                     "so its tools load only when needed.",
+                     f"Desactiva {srv} donde no lo necesites (/mcp, o actívalo solo en su proyecto), o activa la búsqueda "
+                     "de herramientas para que se carguen solo al usarlas."),
+        "verify": tr("The fixed cost card shows that server smaller or gone.", "La tarjeta de coste fijo lo muestra más pequeño o ya no sale."),
+        "tradeoff": tr("When you do need it, you enable it again.", "Cuando lo necesites, hay que volver a activarlo."),
+        "metric": s["tokens"], "metric_label": tr("tokens per request", "tokens por petición"),
+        "tools": [{"n": "/mcp", "k": tr("command", "comando"), "why": tr("enable or disable servers", "activar o desactivar servidores"),
+                   "cost": tr("free", "gratis")}],
+        "prompt": tr(f"Check where the MCP server {srv} is configured (~/.claude.json, .mcp.json or a plugin) and propose how to "
+                     "enable it only in the projects that use it. Show me the diff before saving.",
+                     f"Mira dónde está configurado el servidor MCP {srv} (~/.claude.json, .mcp.json o un plugin) y propón cómo "
+                     "activarlo solo en los proyectos que lo usan. Enséñame el diff antes de guardar."),
+    }
+# Recommendations the dashboard can apply itself: always a fixed change decided here, never a value sent by the page
+APPLY = {
+    "ctx": {"autoCompactWindow": 300000},
+    "subagent-model": {"env.CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
+}
+_ABSENT = {"__tokenometro__": "absent"}
+
+
+def _dig(d, path, value=None, mode="get"):
+    keys = path.split(".")
+    for k in keys[:-1]:
+        if mode == "set" and not isinstance(d.get(k), dict):
+            d[k] = {}
+        d = d.get(k) if isinstance(d.get(k), dict) else {}
+    if mode == "get":
+        return d.get(keys[-1], _ABSENT)
+    if mode == "set":
+        d[keys[-1]] = value
+    else:
+        d.pop(keys[-1], None)
+
+
+def change_settings(fn):
+    """Edit ~/.claude/settings.json the safe way: a dated backup first, then write aside and swap."""
+    path = os.path.join(HOME, ".claude", "settings.json")
+    s = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            s = json.load(f)
+    if not isinstance(s, dict):
+        raise ValueError("settings.json is not a JSON object")
+    backup = ""
+    if os.path.exists(path):
+        backup = path + ".bak-tokenometro-" + datetime.now().strftime("%Y%m%d%H%M%S")
+        shutil.copy2(path, backup)
+    fn(s)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp-tokenometro"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(s, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+    return backup
+
+
+def apply_rec(rid):
+    if rid not in APPLY:
+        raise ValueError("this recommendation can't be applied from the dashboard")
+    with _lock:
+        con = connect()
+        try:
+            if con.execute("SELECT 1 FROM applied WHERE id=?", (rid,)).fetchone():
+                return
+            prev = {}
+
+            def fn(s):
+                for k, v in APPLY[rid].items():
+                    prev[k] = _dig(s, k)
+                    _dig(s, k, v, "set")
+            backup = change_settings(fn)
+            now = datetime.now()
+            con.execute("INSERT INTO applied VALUES(?,?,?,?,?)",
+                        (rid, now.isoformat(timespec="seconds"), now.strftime("%Y-%m-%d"), json.dumps(prev), backup))
+            con.commit()
+        finally:
+            con.close()
+
+
+def undo_rec(rid):
+    """Put back what was there before, key by key, only where the value is still the one we set:
+    anything you changed by hand afterwards is yours and stays."""
+    with _lock:
+        con = connect()
+        try:
+            row = con.execute("SELECT prev FROM applied WHERE id=?", (rid,)).fetchone()
+            if not row or rid not in APPLY:
+                raise ValueError("nothing to undo")
+            prev = json.loads(row[0])
+
+            def fn(s):
+                for k, v in APPLY[rid].items():
+                    if _dig(s, k) == v:
+                        _dig(s, k, mode="del") if prev.get(k) == _ABSENT else _dig(s, k, prev.get(k), "set")
+            change_settings(fn)
+            con.execute("DELETE FROM applied WHERE id=?", (rid,))
+            con.commit()
+        finally:
+            con.close()
+
+
+def attach_applied(con, recs):
+    """Mark what can be applied with one click and, for what was, compare its metric before and after that day."""
+    done = {r["id"]: r for r in q(con, "SELECT id, day FROM applied")}
+    for x in recs:
+        a = done.get(x["id"])
+        x["can_apply"] = x["id"] in APPLY and not a and x["status"] == "todo"
+        if x["id"] in APPLY:
+            x["change"] = ", ".join(f"{k.split('.')[-1]}: {json.dumps(v)}" for k, v in APPLY[x["id"]].items())
+        if a:
+            m = q(con, """SELECT AVG(CASE WHEN day < ? THEN metric END) before, AVG(CASE WHEN day >= ? THEN metric END) after,
+                SUM(day >= ?) days FROM recs_hist WHERE id=? AND day >= date(?, '-14 days')""",
+                  [a["day"], a["day"], a["day"], x["id"], a["day"]])[0]
+            x["applied"] = {"day": a["day"], "before": m["before"], "after": m["after"], "days": m["days"] or 0}
 
 
 def session_detail(sid):
@@ -1010,6 +1331,81 @@ def write_recs_file(recs, kpi):
     os.replace(tmp, recs_file_path())
 
 
+def digest_path(monday):
+    y, wk, _ = monday.isocalendar()
+    name = "semana" if LANG_DEFAULT == "es" else "week"
+    return os.path.join(REPORTS, f"tokenometro-{name}-{y}-W{wk:02d}.md")
+
+
+def digest(monday):
+    """Weekly summary (Monday to Sunday) as Markdown: spend against the week before, where it went, what changed."""
+    sun, prev = monday + timedelta(days=6), monday - timedelta(days=7)
+    con = connect()
+    try:
+        prices = load_prices()
+        C, T = cost_expr(prices), cost_terms(prices)
+        w, a = "day >= ? AND day <= ?", [monday.isoformat(), sun.isoformat()]
+        cost = lambda ww, aa: q(con, f"SELECT COALESCE(SUM({C}),0) c, COUNT(DISTINCT session) s FROM msgs WHERE {ww}", aa)[0]
+        now_, before = cost(w, a), cost(w, [prev.isoformat(), (monday - timedelta(days=1)).isoformat()])
+        top = q(con, f"""SELECT m.session, COALESCE(t.title,'') title,
+            (SELECT x.project FROM msgs x WHERE x.session=m.session ORDER BY x.ts LIMIT 1) project, SUM({C}) cost FROM msgs m
+            LEFT JOIN titles t ON t.session=m.session WHERE m.day >= ? AND m.day <= ? GROUP BY m.session ORDER BY cost DESC LIMIT 5""", a)
+        br = branches(con, w, a, C)[:5]
+        fx = fixed_cost(con, w, a, T, now_["c"])
+        st = {}
+        for d, rid, status in con.execute("SELECT day, id, status FROM recs_hist WHERE day <= ? ORDER BY day", [sun.isoformat()]):
+            st.setdefault(rid, {})["after" if d >= monday.isoformat() else "before"] = status
+        models = q(con, f"SELECT model, SUM({C}) cost FROM msgs WHERE {w} GROUP BY model", a)
+    finally:
+        con.close()
+    diff = now_["c"] - before["c"]
+    pct = f" ({'+' if diff >= 0 else ''}{100 * diff / before['c']:.0f}%)" if before["c"] else ""
+    names = {"todo": tr("pending", "pendiente"), "warn": tr("applied, review", "aplicada, revisar"),
+             "ok": tr("applied, working", "aplicada, funciona"), "info": tr("informational", "informativa")}
+    L = [tr(f"# Tokenometro · week {monday.isocalendar()[1]} ({monday} to {sun})",
+            f"# Tokenometro · semana {monday.isocalendar()[1]} (del {monday} al {sun})"), "",
+         tr(f"**{money(now_['c'], 2)} eq.** in {now_['s']} sessions; the week before, {money(before['c'], 2)}{pct}.",
+            f"**{money(now_['c'], 2)} eq.** en {now_['s']} sesiones; la semana anterior, {money(before['c'], 2)}{pct}."), ""]
+    if top:
+        L += [tr("## Costliest sessions", "## Sesiones más caras"), ""]
+        L += [f"- {money(r['cost'], 2)} · {r['title'] or r['session'][:8]} · {short_path(r['project'] or '')}" for r in top] + [""]
+    if br:
+        L += [tr("## By branch / task", "## Por rama / tarea"), ""]
+        L += [f"- {money(r['cost'], 2)} · {r['task'] or r['branch']} · {', '.join(r['repos'])}" for r in br] + [""]
+    if fx["measured"]:
+        L += [tr("## Fixed cost per session", "## Coste fijo por sesión"), "",
+              tr(f"~{fmt_tok(fx['base'])} tokens before the conversation starts: {money(fx['cost'], 2)} ({fx['share']:.0f}% of the week).",
+                 f"~{fmt_tok(fx['base'])} tokens antes de empezar la conversación: {money(fx['cost'], 2)} ({fx['share']:.0f}% de la semana)."), ""]
+    changed = [(rid, v) for rid, v in st.items() if v.get("after") and v.get("after") != v.get("before")]
+    if changed:
+        L += [tr("## Recommendations that changed", "## Recomendaciones que cambiaron"), ""]
+        L += [f"- {rid}: {names.get(v.get('before'), '-')} → {names.get(v['after'], v['after'])}" for rid, v in changed] + [""]
+    miss = unpriced(models, prices)
+    if miss:
+        L += [tr("## Models without a price", "## Modelos sin precio"), ""]
+        L += [tr(f"- {m['model']}: valued at _default; add it to prices.json.", f"- {m['model']}: valorado a _default; añádelo a prices.json.")
+              for m in miss] + [""]
+    L.append(tr(f"Dashboard: http://127.0.0.1:{PORT}", f"Panel: http://127.0.0.1:{PORT}"))
+    return "\n".join(L) + "\n"
+
+
+def write_digest(monday=None):
+    """Last week's summary, once: written on the first run after the week ends, never rewritten."""
+    if monday is None:
+        today = date.today()
+        monday = today - timedelta(days=today.weekday() + 7)
+    path = digest_path(monday)
+    if os.path.exists(path):
+        return path
+    set_lang(LANG_DEFAULT)
+    text = digest(monday)
+    os.makedirs(REPORTS, exist_ok=True)
+    with os.fdopen(os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+    return path
+
+
 def snapshot_recs():
     """Daily snapshot of the recommendations (7 days, all clients): what lets you see whether they improve."""
     set_lang(LANG_DEFAULT)
@@ -1110,48 +1506,90 @@ def recommendations(con, w, a, cut, k, C, T, ctx):
     })
 
     # 2) Long pauses: the cache expires and is rewritten in full
-    rows = con.execute(f"""SELECT session, ts, {T['cw']} FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a).fetchall()
-    gaps, gcost, prev = 0, 0.0, None
-    for sid, ts, cwc in rows:
-        t = local(ts)
-        if prev and prev[0] == sid and t and prev[1] and (t - prev[1]).total_seconds() > 3600:
-            gaps += 1
-            gcost += cwc or 0
-        prev = (sid, t)
-    if gaps:
+    def pauses(where, args):
+        rows = con.execute(f"""SELECT session, ts, {T['cw']} FROM msgs WHERE sidechain=0 AND {where} ORDER BY session, ts""",
+                           args).fetchall()
+        n, cost, prev = 0, 0.0, None
+        for sid, ts, cwc in rows:
+            t = local(ts)
+            if prev and prev[0] == sid and t and prev[1] and (t - prev[1]).total_seconds() > 3600:
+                n += 1
+                cost += cwc or 0
+            prev = (sid, t)
+        return n, cost
+
+    gaps, gcost = pauses(w, a)
+    hook_ts = seen_since(con, "gap_hook", cfg["gap_hook"])
+    if hook_ts:
+        # The hook doesn't stop pauses, it stops paying for them: what counts is the weekly cost of pauses after
+        # it compared with the four weeks before. Judged after a full week, so one bad day doesn't decide it.
+        on = local(hook_ts)
+        hook_day = on.strftime("%Y-%m-%d")
+        days_on = (datetime.now(timezone.utc) - on).total_seconds() / 86400
+        n_after, c_after = pauses("ts >= ?", [hook_ts])
+        first = local(con.execute("SELECT MIN(ts) FROM msgs WHERE sidechain=0").fetchone()[0] or hook_ts)
+        span = min(28.0, (on - first).total_seconds() / 86400)
+        frm = (on - timedelta(days=span)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        _, c_before = pauses("ts >= ? AND ts < ?", [frm, hook_ts]) if span >= 1 else (0, 0.0)
+        wk_after = c_after / max(days_on, 1) * 7
+        wk_before = c_before / span * 7 if span >= 1 else 0.0
+        good = wk_after <= max(wk_before * 0.5, 0.5)
+        ready = (on + timedelta(days=7)).strftime("%Y-%m-%d")
+        status = "ok" if days_on >= 7 and good else "warn"
+        if days_on < 7:
+            verdict = tr(f"It will count as working on {ready} if the weekly cost of pauses stays under half of before "
+                         f"(or under {money(0.5, 2)}).",
+                         f"Se dará por funcionando el {ready} si el coste semanal de las pausas queda por debajo de la mitad "
+                         f"que antes (o de {money(0.5, 2)}).")
+        elif good:
+            verdict = tr("Working: pauses now cost less than half of before.",
+                         "Funciona: las pausas cuestan ahora menos de la mitad que antes.")
+        else:
+            verdict = tr("Still high: when the warning shows, save the state and /clear instead of resending.",
+                         "Sigue alto: cuando salte el aviso, guarda el estado y haz /clear en vez de reenviar.")
+        evidence = tr(f"Hook on since {hook_day}. Since then, {n_after} pause(s) over 1 h cost {money(c_after, 1)} "
+                      f"({money(wk_after, 1)}/week; before, {money(wk_before, 1)}/week). {verdict}",
+                      f"Hook puesto desde el {hook_day}. Desde entonces, {n_after} pausa(s) de más de 1 h costaron "
+                      f"{money(c_after, 1)} ({money(wk_after, 1)}/semana; antes, {money(wk_before, 1)}/semana). {verdict}")
+        metric, label, impact = n_after, tr("pauses since the hook", "pausas desde el hook"), c_after
+    else:
+        status, metric, label, impact = "todo", gaps, tr("pauses over 1 h", "pausas de más de 1 h"), gcost
+        evidence = tr(f"{gaps} time(s) you resumed a session after more than 1 h idle. The cache had expired, so the first reply had to "
+                      f"save the whole conversation again: {money(gcost, 1)}.",
+                      f"{gaps} vez(es) retomaste una sesión tras más de 1 h parada. La caché había caducado, así que la primera respuesta "
+                      f"tuvo que guardar otra vez toda la conversación: {money(gcost, 1)}.")
+    if gaps or hook_ts:
         recs.append({
             "id": "gaps", "title": tr("Pauses over 1 h make the cache expire", "Las pausas de más de 1 h hacen caducar la caché"),
-            "status": "todo", "impact": gcost,
+            "status": status, "impact": impact,
             "impact_note": tr("measured: cache write of the first turn after each pause",
                               "medido: escritura de caché del primer turno tras cada pausa"),
             "confidence": tr("high", "alta"),
-            "evidence": tr(f"{gaps} time(s) you resumed a session after more than 1 h idle. The cache had expired, so the first reply had to "
-                           f"save the whole conversation again: {money(gcost, 1)}.",
-                           f"{gaps} vez(es) retomaste una sesión tras más de 1 h parada. La caché había caducado, así que la primera respuesta "
-                           f"tuvo que guardar otra vez toda la conversación: {money(gcost, 1)}."),
+            "evidence": evidence,
             "action": tr("Before leaving (lunch, meeting, end of day): /compact, or save the state to memory and /clear when you come back. "
                          "Resuming a huge session the next day is the most expensive case.",
                          "Antes de irte (comida, reunión, fin del día): /compact, o guarda el estado en memoria y al volver /clear. "
                          "Retomar una sesión enorme al día siguiente es lo más caro."),
-            "verify": tr("This card's number of pauses and amount go down in the following weeks.",
-                         "Esta tarjeta baja de número de pausas y de importe en las semanas siguientes."),
+            "verify": tr("A week after adding the hook, the weekly cost of pauses is under half of the four weeks before.",
+                         "Una semana después de poner el hook, el coste semanal de las pausas queda en menos de la mitad que en las "
+                         "cuatro semanas anteriores."),
             "tradeoff": tr("None to speak of; /clear requires leaving the state written down.",
                            "Ninguna relevante; /clear exige dejar el estado apuntado."),
-            "metric": gaps, "metric_label": tr("pauses over 1 h", "pausas de más de 1 h"),
-            "tools": [] if cfg["gap_hook"] else [{"n": "Hook UserPromptSubmit", "k": "hook",
+            "metric": metric, "metric_label": label,
+            "tools": [] if hook_ts else [{"n": "Hook UserPromptSubmit", "k": "hook",
                       "why": tr("warns you when you return from a long pause, before you pay for the cache rewrite",
                                 "te avisa al volver de una pausa larga, antes de pagar la reescritura de la caché"),
                       "cost": tr("0 tokens: runs locally", "0 tokens: corre en local")}],
-            "prompt": "" if cfg["gap_hook"] else tr(
+            "prompt": "" if hook_ts else tr(
                 "With the update-config skill, create a UserPromptSubmit hook in ~/.claude/settings.json (script in "
                 "~/.claude/hooks/, only bash or standard-library python3). It must read transcript_path from the input "
-                "JSON, check the timestamp of the last message and, if more than 60 minutes have passed and the transcript "
+                "JSON, check the timestamp of the last assistant reply (the current prompt may already be written) and, if more than 60 minutes have passed and the transcript "
                 "is over 1 MB, block the message ONCE per session (exit 2, marker in a temp file) with: "
                 "\"The cache has expired. Save the state and /clear, or resend the message to continue\". On any "
                 "error, exit 0 with no output. Test it with a sample JSON before enabling it and show me the diff.",
                 "Con la skill update-config, crea un hook UserPromptSubmit en ~/.claude/settings.json (script en "
                 "~/.claude/hooks/, solo bash o python3 de la biblioteca estándar). Debe leer transcript_path del JSON de "
-                "entrada, mirar la marca de tiempo del último mensaje y, si han pasado más de 60 minutos y el transcript "
+                "entrada, mirar la marca de tiempo de la última respuesta del asistente (el prompt actual puede estar ya escrito) y, si han pasado más de 60 minutos y el transcript "
                 "pesa más de 1 MB, bloquear el mensaje UNA sola vez por sesión (exit 2, marca en un fichero temporal) con: "
                 "«La caché ha caducado. Guarda el estado y haz /clear, o reenvía el mensaje para seguir». En cualquier "
                 "error, exit 0 sin salida. Pruébalo con un JSON de ejemplo antes de activarlo y enséñame el diff."),
@@ -1199,6 +1637,37 @@ def recommendations(con, w, a, cut, k, C, T, ctx):
                          + ", ".join(cfg["opus_plugin_agents"][:6]) + ". En cada copia cambia en el frontmatter model: opus por "
                          "model: sonnet y añade el sufijo -sonnet al name. No toques la caché del plugin. Después añade una "
                          "línea a ~/.claude/CLAUDE.md para que se usen las copias -sonnet salvo que pida Opus, y dime cómo invocarlas."),
+        })
+
+    # 3b) No default model for subagents: they inherit the main one, often Opus
+    mine = con.execute("SELECT day FROM applied WHERE id='subagent-model'").fetchone()
+    if (not cfg["subagent_model"] and by_type) or mine:
+        since = mine[0] if mine else cut
+        after = q(con, f"""SELECT COALESCE(SUM({C}),0) c FROM msgs WHERE sidechain=1 AND model LIKE '%opus%' AND day >= ? AND {w}""",
+                  [since] + a)[0]["c"] if mine else sum(by_type.values())
+        recs.append({
+            "id": "subagent-model", "title": tr("Subagents run on the main model (Opus) by default",
+                                                "Los subagentes usan por defecto el modelo principal (Opus)"),
+            "status": ("ok" if after < 0.5 else "warn") if mine else "todo", "impact": after * 0.5,
+            "impact_note": tr("Sonnet costs half of Opus (prices.json)", "Sonnet cuesta la mitad que Opus (prices.json)"),
+            "confidence": tr("medium", "media"),
+            "evidence": tr(f"Since {since}, subagents on Opus cost {money(after, 2)}. Without CLAUDE_CODE_SUBAGENT_MODEL each subagent "
+                           "uses the model of the session that launched it, even for searching or reading files.",
+                           f"Desde el {since}, los subagentes con Opus costaron {money(after, 2)}. Sin CLAUDE_CODE_SUBAGENT_MODEL cada subagente "
+                           "usa el modelo de la sesión que lo lanza, aunque solo sea para buscar o leer ficheros."),
+            "action": tr('Set "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} in ~/.claude/settings.json; an agent that needs Opus can still ask for it.',
+                         'Pon "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} en ~/.claude/settings.json; un agente que necesite Opus puede seguir pidiéndolo.'),
+            "verify": tr("«Costliest subagents» shows Sonnet and this card's amount drops.",
+                         "«Subagentes más caros» muestra Sonnet y el importe de esta tarjeta baja."),
+            "tradeoff": tr("Subagents doing reviews or hard research may do a bit worse.",
+                           "Los subagentes que revisan código o investigan algo difícil pueden hacerlo algo peor."),
+            "metric": round(after, 2), "metric_money": True,
+            "metric_label": tr(f"{sym()} of subagents on Opus", f"{sym()} de subagentes con Opus"),
+            "tools": [],
+            "prompt": tr('With the update-config skill, add "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} to ~/.claude/settings.json '
+                         "without touching any other key. Show me the diff before saving.",
+                         'Con la skill update-config, añade "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} a ~/.claude/settings.json '
+                         "sin tocar ninguna otra clave. Enséñame el diff antes de guardar."),
         })
 
     # 4) Large and repeated reads of the same file
@@ -1469,6 +1938,11 @@ h2{font:600 16px/1.25 var(--fd);margin:0 0 12px;letter-spacing:.01em;display:fle
 .track .mark::after{content:attr(data-l);position:absolute;top:-16px;left:50%;transform:translateX(-50%);font-size:10px;color:var(--mut);white-space:nowrap}
 .gm{font-size:12px;color:var(--mut)}.gm .w{color:var(--f);font-weight:600}
 .empty{color:var(--mut);margin:6px 0}
+.fxbar{display:flex;height:12px;border-radius:6px;overflow:hidden;margin:10px 0 12px;background:var(--line)}
+.fxbar i{display:block;height:100%}
+.fxl{display:grid;grid-template-columns:auto 1fr auto;gap:4px 10px;font-size:13px;align-items:center}
+.fxl i{width:10px;height:10px;border-radius:3px;display:inline-block}.fxl .n{text-align:right;font-variant-numeric:tabular-nums}
+.tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:8px;border:1px solid var(--line);color:var(--mut);margin-left:4px}
 
 /* KPI strip */
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0}
@@ -1512,7 +1986,8 @@ th.s:focus-visible,tr.click:focus-visible{outline:2px solid var(--c);outline-off
 .rec .hist i.h-todo{background:var(--f)}.rec .hist i.h-warn{background:var(--a)}.rec .hist i.h-ok{background:var(--b)}.rec .hist i.h-info{background:var(--c)}
 .rec dd.tools{display:flex;flex-direction:column;gap:3px}.rec dd.tools b{font-weight:600}.rec dd.tools em{font-style:normal;color:var(--mut);font-size:12px}
 .rec div.pr{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:6px 10px;display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px;color:var(--mut)}
-.rec div.pr code{font-size:11.5px;color:var(--fg,inherit);overflow-wrap:anywhere}.rec div.pr .cp{flex:none}
+.rec div.pr code{font-size:11.5px;color:var(--fg,inherit);overflow-wrap:anywhere}.rec div.pr .cp,.rec div.pr .ap{flex:none}
+.rec div.ap-row{border-color:var(--a);color:var(--fg,inherit)}
 .pager{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:8px;font-size:12px;color:var(--mut)}
 .pager button{font:600 14px/1 var(--fb);width:28px;height:26px;border:1px solid var(--line);background:var(--card);color:inherit;border-radius:8px;cursor:pointer}
 .pager button:disabled{opacity:.35;cursor:default}.pager button:not(:disabled):hover{border-color:var(--a)}
@@ -1524,8 +1999,8 @@ th.s:focus-visible,tr.click:focus-visible{outline:2px solid var(--c);outline-off
 .rec details.pr{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:6px 10px}
 .rec details.pr summary{margin:0;display:flex;justify-content:space-between;align-items:center;gap:10px;color:var(--fg,inherit)}
 .rec details.pr pre{white-space:pre-wrap;font:12px/1.55 var(--fb);margin:8px 0 2px;color:var(--mut)}
-.rec .cp{font:600 12px var(--fb);border:1px solid var(--line);background:var(--card);color:inherit;border-radius:8px;padding:3px 10px;cursor:pointer}
-.rec .cp:hover{border-color:var(--a)}.rec .cp.ok{border-color:var(--b);color:var(--b)}
+.rec .cp,.rec .ap{font:600 12px var(--fb);border:1px solid var(--line);background:var(--card);color:inherit;border-radius:8px;padding:3px 10px;cursor:pointer}
+.rec .cp:hover,.rec .ap:hover{border-color:var(--a)}.rec .ap:not([data-u]){background:var(--a);border-color:var(--a);color:var(--card)}.rec .ap:disabled{opacity:.5;cursor:wait}.rec .cp.ok{border-color:var(--b);color:var(--b)}
 .rec.chg{animation:chg 2.4s var(--ease)}@keyframes chg{0%,30%{box-shadow:0 0 0 2px var(--a)}100%{box-shadow:0 0 0 0 transparent}}
 .rec details summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:8px}.rec details[open] dl{animation:fade .3s var(--ease)}
 @keyframes fade{from{opacity:0;transform:translateY(-3px)}}
@@ -1568,6 +2043,10 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 <section class="card"><h2 data-i18n="by_model"></h2><div id="models"></div></section>
 <section class="card"><h2 data-i18n="by_client"></h2><div id="clients"></div>
 <div class="csv"><span class="mut" data-i18n="csv_hint"></span><span class="csvc"><input type="month" id="month" data-i18n-aria="month_label"><a class="btn" id="csv_s" data-i18n="csv_sessions"></a><a class="btn" id="csv_c" data-i18n="csv_clients"></a></span></div></section>
+<section class="card"><h2><span data-i18n="by_branch"></span> <span class="badge" data-i18n="branch_badge"></span></h2><div id="branches"></div>
+<p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="branch_note"></p></section>
+<section class="card"><h2 data-i18n="fixed_title"></h2><div id="fixed"></div>
+<p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="fixed_note"></p></section>
 <section class="card wide"><h2><span data-i18n="costliest_sessions"></span> <span class="badge" data-i18n="sess_badge"></span></h2><div class="leg" id="sleg"></div><div id="sessions"></div></section>
 <section class="card wide"><h2 data-i18n="costliest_agents"></h2><div id="agents"></div></section>
 </main>
@@ -1580,14 +2059,14 @@ en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',
  eq_usd:'"$ eq." means equivalent cost: what these tokens would cost at the public API prices (prices.json).',eq_eur:'"€ eq." means equivalent cost: what these tokens would cost at the public API prices (prices.json, in dollars), converted to euros at {rate} €/$',
  recs_title:'Recommended improvements',recs_badge:'based on your data and your settings.json',recs_legend:'Orange: pending · yellow: applied but no clear effect · green: applied and noticeable · blue: informational. The impact is for the selected period.',
  daily_title:'Equivalent cost per day and token type',before_after:'Before / after',ba_note:'Same number of days on each side of the date. It follows the client filter, not the period one. Use it to see whether a change you made (e.g. a new setting) moved the numbers.',
- by_model:'By model',by_client:'By client',costliest_sessions:'Costliest sessions',sess_badge:'click a row for details · click a header to sort',costliest_agents:'Costliest subagents',
+ by_branch:'By branch / task',branch_badge:'from git',branch:'Branch',task:'Task',last_day:'Last',branch_note:'Sessions grouped by the git branch they ran on. If the branch name has a ticket (feature/7067, fix/ABC-123) it shows as the task. Sessions outside a git repo are not listed.',no_branches:'No sessions inside a git repository in this period.',fixed_title:'Fixed cost per session',fx_head:'Every reply carries ~{n} tokens before your conversation even starts. In this period that cost {c} ({p}% of the total) across {s} sessions.',fx_system:'System prompt',fx_builtin:'Built-in tools',fx_claude_md:'Your global CLAUDE.md',fx_rest:'Project CLAUDE.md, memory, skills and first message',fx_mcp:'MCP server {n}',fx_deferred:'{n} more tools load on demand (tool search) and barely count.',fx_none:'Not measured yet: it appears after a new session in this period.',fixed_note:'Measured from the smallest context each session had and the request shape Claude Code logs. It is cached, so each turn pays the cache-read price for it, plus one cache write per session.',by_model:'By model',by_client:'By client',costliest_sessions:'Costliest sessions',sess_badge:'click a row for details · click a header to sort',costliest_agents:'Costliest subagents',
  no_data:'No data',sort:'Sort',prev:'Previous',next:'Next',of:'of',last5:'in the last 5 h',of_plan:'of the plan',w5:'5 h',wk:'week',
  live_empty:'No session has activity right now. As soon as Claude answers, it shows up here.',ctx_aria:'Context',accumulated:'spent in this session',messages:'messages',compactions:'compactions',compaction:'compaction',subagents_lc:'subagents',
  over_compact:'over {n} tokens: good time to /compact (summarise) or /clear',plan_nolecture:'no plan reading: only what was spent',last5h:'Last 5 hours',last7d:'Last 7 days',
  plan_nopct:'{n} tokens. The plan % only exists with a subscription (with the API there is no 5 h or weekly limit) and Claude Code only gives it to the statusLine and plugins: enable statusline.py (see README) or the sub-meter plugin and the % and the estimated cap will show up here.',
  plan_src:'Your plan usage (from {src}, read at {at})',plan_ago:', {t} ago',five_h:'5 hours',week:'Week',
  eta:'At the current pace you reach 100 % on {eta}, before it resets.',noeta:'At the current pace you will not run out before it resets ({reset}).',resets:'resets in {t} ({at})',
- copied:'Copied',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
+ copied:'Copied',al_update:'v{n} available',al_update_tip:'You have {c} and {n} is out. To update: {h}',apply:'Apply',undo:'Undo',apply_hint:'Tokenometro can do it for you: sets {c} in ~/.claude/settings.json (a backup is saved first).',applied_on:'Applied from here on {d} ({c}).',applied_ba:'Before: {a} · after: {b} ({n} day(s)).',applied_wait:'The before/after appears from tomorrow.',undo_confirm:'Put back the previous value in ~/.claude/settings.json?',apply_failed:'Could not change settings.json',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
  al_unp:'{n} model(s) without a price',
  al_unpriced:'Estimated prices for <code>{m}</code>: not in prices.json, so they are valued at the <code>_default</code> price. Add them to prices.json for exact figures.',
  csv_hint:'Monthly report to share or bill: tokens and cost per session or per client.',csv_sessions:'CSV by session',csv_clients:'CSV by client',month_label:'Month of the CSV report',
@@ -1610,14 +2089,14 @@ es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días
  eq_usd:'«$ eq.» es el coste equivalente: lo que costarían estos tokens a los precios públicos de la API (prices.json).',eq_eur:'«€ eq.» es el coste equivalente: lo que costarían estos tokens a los precios públicos de la API (prices.json, en dólares), pasado a euros a {rate} €/$',
  recs_title:'Mejoras recomendadas',recs_badge:'según tus datos y tu settings.json',recs_legend:'Naranja: pendiente · amarillo: aplicada pero sin efecto claro · verde: aplicada y se nota · azul: informativa. El impacto es del periodo elegido.',
  daily_title:'Coste equivalente por día y tipo de token',before_after:'Antes / después del',ba_note:'Mismo número de días a cada lado de la fecha. Respeta el filtro de cliente, no el de periodo. Sirve para ver si un cambio que hiciste (p. ej. un ajuste nuevo) movió las cifras.',
- by_model:'Por modelo',by_client:'Por cliente',costliest_sessions:'Sesiones más caras',sess_badge:'pincha una fila para el detalle · pincha una cabecera para ordenar',costliest_agents:'Subagentes más caros',
+ by_branch:'Por rama / tarea',branch_badge:'de git',branch:'Rama',task:'Tarea',last_day:'Último',branch_note:'Sesiones agrupadas por la rama de git en la que se trabajó. Si el nombre lleva un ticket (feature/7067, fix/ABC-123) sale como tarea. Las sesiones fuera de un repo git no aparecen.',no_branches:'No hay sesiones dentro de un repositorio git en este periodo.',fixed_title:'Coste fijo por sesión',fx_head:'Cada respuesta lleva ~{n} tokens antes incluso de empezar la conversación. En este periodo eso costó {c} ({p}% del total) en {s} sesiones.',fx_system:'Prompt de sistema',fx_builtin:'Herramientas integradas',fx_claude_md:'Tu CLAUDE.md global',fx_rest:'CLAUDE.md del proyecto, memoria, skills y primer mensaje',fx_mcp:'Servidor MCP {n}',fx_deferred:'Otras {n} herramientas se cargan bajo demanda (búsqueda de herramientas) y apenas cuentan.',fx_none:'Aún sin medir: aparece tras una sesión nueva en este periodo.',fixed_note:'Medido con el contexto más pequeño de cada sesión y la forma de la petición que registra Claude Code. Va en caché: cada turno lo paga a precio de lectura de caché, más una escritura de caché por sesión.',by_model:'Por modelo',by_client:'Por cliente',costliest_sessions:'Sesiones más caras',sess_badge:'pincha una fila para el detalle · pincha una cabecera para ordenar',costliest_agents:'Subagentes más caros',
  no_data:'Sin datos',sort:'Ordenar',prev:'Anterior',next:'Siguiente',of:'de',last5:'en las últimas 5 h',of_plan:'del plan',w5:'5 h',wk:'semana',
  live_empty:'No hay ninguna sesión con actividad ahora. En cuanto Claude responda, aparece aquí.',ctx_aria:'Contexto',accumulated:'gastado en esta sesión',messages:'mensajes',compactions:'compactaciones',compaction:'compactación',subagents_lc:'subagentes',
  over_compact:'pasa de {n} tokens: buen momento para /compact (resumir) o /clear',plan_nolecture:'sin lectura del plan: solo lo gastado',last5h:'Últimas 5 horas',last7d:'Últimos 7 días',
  plan_nopct:'{n} tokens. El % del plan solo existe con suscripción (con API no hay límite de 5 h ni semanal) y Claude Code solo se lo da a la statusLine y a los plugins: activa statusline.py (ver README) o el plugin sub-meter y aquí saldrá el % y el techo estimado.',
  plan_src:'Uso de tu plan (dato de {src}, leído a las {at})',plan_ago:', hace {t}',five_h:'5 horas',week:'Semana',
  eta:'Al ritmo actual llegarás al 100 % el {eta}, antes de que se reinicie.',noeta:'Al ritmo actual no lo agotarás antes de que se reinicie ({reset}).',resets:'se reinicia en {t} ({at})',
- copied:'Copiado',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
+ copied:'Copiado',al_update:'v{n} disponible',al_update_tip:'Tienes la {c} y ya está la {n}. Para actualizar: {h}',apply:'Aplicar',undo:'Deshacer',apply_hint:'Tokenometro puede hacerlo por ti: pone {c} en ~/.claude/settings.json (antes guarda una copia).',applied_on:'Aplicada desde aquí el {d} ({c}).',applied_ba:'Antes: {a} · después: {b} ({n} día(s)).',applied_wait:'El antes/después sale a partir de mañana.',undo_confirm:'¿Volver a poner el valor anterior en ~/.claude/settings.json?',apply_failed:'No se pudo cambiar settings.json',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
  al_unp:'{n} modelo(s) sin precio',
  al_unpriced:'Precios estimados para <code>{m}</code>: no están en prices.json y se valoran al precio de <code>_default</code>. Añádelos a prices.json para tener cifras exactas.',
  csv_hint:'Informe mensual para compartir o repercutir: tokens y coste por sesión o por cliente.',csv_sessions:'CSV por sesión',csv_clients:'CSV por cliente',month_label:'Mes del informe CSV',
@@ -1655,6 +2134,14 @@ function table(rows,cols){if(!rows.length)return '<p class="mut">'+t('no_data')+
  const max=Math.max(...rows.map(r=>cols[1].v(r)||0),1);
  return '<table><tr>'+cols.map(c=>'<th>'+c.h+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map((c,i)=>'<td>'+(i==1&&c.bar!==false?'<div style="display:flex;gap:6px;align-items:center;justify-content:flex-end">'+c.f(c.v(r))+'<div class="bar" style="width:'+Math.max(2,44*(c.v(r)||0)/max)+'px"></div></div>':c.f(c.v(r),r))+'</td>').join('')+'</tr>').join('')+'</table>'}
 const onKey=e=>e.onkeydown=ev=>{if(ev.key=='Enter'||ev.key==' '){ev.preventDefault();e.click()}};
+function fixed(el,f){if(!f.measured){el.innerHTML='<p class="empty">'+t('fx_none')+'</p>';return}
+ const C=['--a','--b','--c','--d','--e'],tot=f.parts.reduce((s,p)=>s+p.tokens,0)||1;
+ const N={system:t('fx_system'),builtin:t('fx_builtin'),claude_md:t('fx_claude_md'),rest:t('fx_rest')};
+ const nm=k=>k.startsWith('mcp:')?t('fx_mcp',{n:esc(k.slice(4))}):(N[k]||esc(k));
+ el.innerHTML='<p style="margin:4px 0 0">'+t('fx_head',{n:tok(f.base),c:usd(f.cost),p:f.share.toFixed(0),s:f.sessions})+'</p>'
+  +'<div class="fxbar">'+f.parts.map((p,i)=>'<i style="width:'+(100*p.tokens/tot)+'%;background:'+css(C[i%C.length])+'" title="'+nm(p.k)+'"></i>').join('')+'</div>'
+  +'<div class="fxl">'+f.parts.map((p,i)=>'<i style="background:'+css(C[i%C.length])+'"></i><span>'+nm(p.k)+'</span><span class="n">~'+tok(p.tokens)+'</span>').join('')+'</div>'
+  +(f.deferred?'<p class="mut" style="font-size:12px;margin:8px 0 0">'+t('fx_deferred',{n:f.deferred})+'</p>':'')}
 function tbl(el,rows,cols,opt){opt=opt||{};el._st=el._st||{k:null,d:-1};const PS=opt.page||8;el._pg=el._pg||0;
  const draw=()=>{let rs=rows.slice();const st=el._st;if(st.k!=null){const c=cols[st.k],f=c.s||c.v;rs.sort((a,b)=>{const x=f(a),y=f(b);return (typeof x=='string'?String(x).localeCompare(y):(x||0)-(y||0))*st.d})}
   const np=Math.max(1,Math.ceil(rs.length/PS));if(el._pg>=np)el._pg=np-1;const off=el._pg*PS,vis=rs.slice(off,off+PS);
@@ -1694,6 +2181,12 @@ function plan(p){const c=$('plancard');c.hidden=!p;if(!p)return;
   return '<div class="pl'+lv+'"><div class="gh"><b>'+n+'</b><span class="p">'+t('resets',{t:hm(Math.max(0,w.reset_min)),at:w.reset})+'</span><span class="v">'+w.pct.toFixed(0)+' %</span></div>'+
    '<div class="track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+w.pct+'" aria-label="'+n+'"><i class="fill" style="--w:'+Math.min(100,w.pct)+'%"></i></div>'+
    '<div class="gm">'+cap+'</div></div>'}).join('')}
+const PTOK='__PAGETOKEN__';
+document.addEventListener('click',async e=>{const b=e.target.closest('.ap');if(!b)return;e.preventDefault();e.stopPropagation();
+ if(b.dataset.u&&!confirm(t('undo_confirm')))return;
+ b.disabled=true;let res;try{res=await fetch(b.dataset.u?'/api/undo':'/api/apply',{method:'POST',headers:{'Content-Type':'application/json','X-Tokenometro-Page':PTOK},body:JSON.stringify({id:b.dataset.id})});res=await res.json()}catch(_){res={ok:false}}
+ if(!res.ok){b.disabled=false;alert(t('apply_failed')+(res.error?': '+res.error:''));return}
+ load()});
 document.addEventListener('click',async e=>{const b=e.target.closest('.cp');if(!b)return;e.preventDefault();e.stopPropagation();
  const x=(RECS[+b.dataset.i]||{}).prompt||'';try{await navigator.clipboard.writeText(x)}catch(_){const a=document.createElement('textarea');a.value=x;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}
  const o=b.textContent;b.textContent=t('copied');b.classList.add('ok');setTimeout(()=>{b.textContent=o;b.classList.remove('ok')},1600)});
@@ -1722,14 +2215,19 @@ async function openSession(x,tr,n){const nx=tr.nextElementSibling;if(nx&&nx.clas
 function alerts(r){const a=[];
  if(r.unpriced&&r.unpriced.length){const tip=t('al_unpriced',{m:r.unpriced.map(m=>m.model).join(', ')}).replace(/<[^>]+>/g,'');
   a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_unp',{n:r.unpriced.length})+'</span>')}
+ if(r.update){const tip=t('al_update_tip',{c:r.update.current,n:r.update.latest,h:r.update.how});
+  a.push('<a class="chip" href="'+esc(r.update.url)+'" target="_blank" rel="noopener" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_update',{n:esc(r.update.latest)})+'</a>')}
  $('alerts').innerHTML=a.join('')}
 function csvLinks(){const d=new Date(),m=$('month').value||d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'),c=$('client').value;
  const u=by=>'/api/report.csv?month='+m+'&by='+by+'&client='+encodeURIComponent(c)+'&cur='+CUR.code+'&lang='+LANG;$('csv_s').href=u('session');$('csv_c').href=u('client')}
 let SEQ=0;
 async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r;
  // only the newest request draws: a slow older answer must not overwrite a newer one
- try{const res=await fetch('/api/data?days='+d+'&client='+encodeURIComponent(c)+'&cut='+encodeURIComponent($('cut').value||'')+'&cur='+CURSEL+'&lang='+LANGSEL);if(!res.ok)throw new Error(res.status);r=await res.json()}
+ // a server that stopped or restarted mid-request must not leave "Updating..." on screen forever
+ const ac=new AbortController(),tm=setTimeout(()=>ac.abort(),60000);
+ try{const res=await fetch('/api/data?days='+d+'&client='+encodeURIComponent(c)+'&cut='+encodeURIComponent($('cut').value||'')+'&cur='+CURSEL+'&lang='+LANGSEL,{signal:ac.signal});if(!res.ok)throw new Error(res.status);r=await res.json()}
  catch(e){if(my===SEQ)$('gen').textContent=t('load_err');return}
+ finally{clearTimeout(tm)}
  if(my!==SEQ)return;
  if(!LANGSEL&&r.lang&&r.lang!=LANG){LANG=r.lang;applyI18n()}
  CUR=r.currency||CUR;$('cur').value=CUR.code;$('eqn').textContent=CUR.code=='EUR'?t('eq_eur',{rate:num(CUR.eur_rate,2)})+(CUR.eur_date?' ('+CUR.eur_date+')':'')+'.':t('eq_usd');$('cur').querySelector('[value=EUR]').disabled=!(CUR.eur_rate>0);
@@ -1748,6 +2246,9 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
  $('leg').innerHTML=keys.map(k=>'<span><i style="background:'+css(k.c)+'"></i>'+k.n+'</span>').join('');
  stacked($('daily'),r.daily,keys);FIRST=false;
  tbl($('models'),r.models,[{h:t('model'),v:x=>x.model,f:esc},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('tokens'),v:x=>x.tokens,f:tok},{h:t('turns'),v:x=>x.turns,f:v=>v}]);
+ if(r.branches.length)tbl($('branches'),r.branches,[{h:t('branch'),v:x=>x.branch,f:(v,x)=>'<b>'+esc(x.task||v)+'</b>'+(x.task?' <span class="mut">'+esc(v)+'</span>':'')+'<br><span class="mut">'+esc(x.repos.join(', '))+(x.clients.length?' · '+esc(x.clients.join(', ')):'')+'</span>'},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('sessions'),v:x=>x.sessions,f:v=>v},{h:t('last_day'),v:x=>x.last,f:v=>esc(v)}]);
+ else $('branches').innerHTML='<p class="empty">'+t('no_branches')+'</p>';
+ fixed($('fixed'),r.fixed);
  tbl($('clients'),r.clients,[{h:t('client'),v:x=>x.client,f:v=>esc(v=='otros'?t('others'):v)},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('tokens'),v:x=>x.tokens,f:tok},{h:t('sessions'),v:x=>x.sessions,f:v=>v}]);
  const sk=[{k:'c_cr',n:t('cache_read'),c:'--b'},{k:'c_cw',n:t('cache_write'),c:'--c'},{k:'c_inp',n:t('input_nc'),c:'--e'},{k:'c_out',n:t('output'),c:'--d'},{k:'c_think',n:t('thinking'),c:'--h'},{k:'sub_cost',n:t('subagents'),c:'--g'}];
  $('sleg').innerHTML=sk.map(k=>'<span><i style="background:'+css(k.c)+'"></i>'+k.n+'</span>').join('');
@@ -1772,6 +2273,8 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
   '<dl><dt>'+t('evidence')+'</dt><dd>'+esc(x.evidence)+'</dd><dt>'+t('what_to_do')+'</dt><dd>'+esc(x.action)+'</dd>'+
   ((x.tools||[]).length?'<dt>'+t('with_')+'</dt><dd class="tools">'+x.tools.map(o=>'<span><b>'+esc(o.n)+'</b> <em>'+esc(o.k)+'</em> '+esc(o.why)+' <em>· '+esc(o.cost)+'</em></span>').join('')+'</dd>':'')+
   '<dt>'+t('check')+'</dt><dd>'+esc(x.verify)+'</dd></dl>'+
+  (x.can_apply?'<div class="pr ap-row"><span>'+t('apply_hint',{c:'<code>'+esc(x.change)+'</code>'})+'</span><button type="button" class="ap" data-id="'+esc(x.id)+'">'+t('apply')+'</button></div>':'')+
+  (x.applied?'<div class="pr ap-row"><span>'+t('applied_on',{d:dm(x.applied.day),c:'<code>'+esc(x.change||'')+'</code>'})+(x.applied.before!=null&&x.applied.after!=null&&x.applied.days>0?' '+t('applied_ba',{a:fm(x.metric_money?x.applied.before*CUR.rate:x.applied.before),b:fm(x.metric_money?x.applied.after*CUR.rate:x.applied.after),n:x.applied.days}):' '+t('applied_wait'))+'</span><button type="button" class="ap" data-u="1" data-id="'+esc(x.id)+'">'+t('undo')+'</button></div>':'')+
   (x.prompt?'<div class="pr"><span>'+t('prompt_for')+' <code>'+esc(FILE)+'</code></span><button type="button" class="cp" data-i="'+ix+'">'+t('copy_prompt')+'</button></div>':'')+
   '<details data-k="d-'+x.id+'"'+(openK.has('d-'+x.id)?' open':'')+'><summary>'+t('tradeoff_h')+'</summary><dl><dt>'+t('tradeoff')+'</dt><dd>'+esc(x.tradeoff)+'</dd>'+(x.impact_note?'<dt>'+t('calc')+'</dt><dd>'+esc(x.impact_note)+'</dd>':'')+'<dt>'+t('confidence')+'</dt><dd>'+esc(x.confidence)+'</dd></dl></details></div>'}).join('')||'<p class="mut">'+t('nothing')+'</p>';
  const B=r.compare.before,A=r.compare.after;
@@ -1812,12 +2315,42 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def do_GET(self):
+    def _local(self):
         # a web page that points its own domain at 127.0.0.1 (DNS rebinding) would send its domain as Host
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0] if not (self.headers.get("Host") or "").startswith("[") \
             else (self.headers.get("Host") or "").split("]")[0] + "]"
         if host not in ("127.0.0.1", "localhost", "[::1]"):
             self.send_error(403, "Tokenometro only answers on 127.0.0.1 or localhost")
+            return False
+        return True
+
+    def do_POST(self):
+        """Apply or undo a recommendation. Needs the token embedded in our own page: another site can't read
+        that page, and can't send the custom header without a CORS preflight we never answer."""
+        if not self._local():
+            return
+        u = urlparse(self.path)
+        ok = hmac.compare_digest((self.headers.get("X-Tokenometro-Page") or "").encode("utf-8", "replace"), _PAGE_TOKEN.encode())
+        origin = self.headers.get("Origin")
+        if not ok or (origin and urlparse(origin).hostname not in ("127.0.0.1", "localhost", "::1")):
+            return self.send_error(403)
+        if u.path not in ("/api/apply", "/api/undo"):
+            return self.send_error(404)
+        try:
+            n = min(int(self.headers.get("Content-Length") or 0), 4096)
+            rid = json.loads(self.rfile.read(n) or b"{}").get("id")
+            (apply_rec if u.path == "/api/apply" else undo_rec)(str(rid))
+            self._send(json.dumps({"ok": True}), "application/json")
+        except (ValueError, OSError, AttributeError) as e:
+            self.send_response(400)
+            b = json.dumps({"ok": False, "error": str(e)}).encode()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+    def do_GET(self):
+        if not self._local():
             return
         u = urlparse(self.path)
         if u.path == "/api/quit":
@@ -1831,7 +2364,7 @@ class H(BaseHTTPRequestHandler):
             return
         try:
             if u.path == "/":
-                self._send(PAGE.replace("__DEFLANG__", LANG_DEFAULT), "text/html; charset=utf-8")
+                self._send(PAGE.replace("__DEFLANG__", LANG_DEFAULT).replace("__PAGETOKEN__", _PAGE_TOKEN), "text/html; charset=utf-8")
             elif u.path == "/api/data":
                 qs = parse_qs(u.query)
                 days = max(1, min(365, int(qs.get("days", ["7"])[0])))
@@ -1875,6 +2408,50 @@ class H(BaseHTTPRequestHandler):
             self.send_error(500, str(e)[:200])
 
 
+def _ver(v):
+    return tuple(int(x) for x in re.findall(r"[0-9]+", v or "")[:3])
+
+
+def check_update(force=False):
+    """Once a day, ask GitHub which release is the latest. Only that request leaves your machine, with no data
+    of yours; TOKENOMETRO_UPDATE_CHECK=0 turns it off. Failures are remembered too, so it never insists."""
+    if _env("UPDATE_CHECK", "1") == "0":
+        return
+    c = _small_json(UPDATE_FILE)
+    if not force and time.time() - (c.get("checked") or 0) < 86400:
+        return
+    c["checked"] = time.time()
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                     headers={"User-Agent": f"tokenometro/{VERSION}", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            d = json.loads(r.read(65536).decode("utf-8"))
+        if isinstance(d.get("tag_name"), str) and _ver(d["tag_name"]):
+            c.update(latest=d["tag_name"].lstrip("v"), url=d.get("html_url") or f"https://github.com/{REPO}/releases")
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(UPDATE_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(c, f)
+        os.replace(UPDATE_FILE + ".tmp", UPDATE_FILE)
+    except OSError:
+        pass
+
+
+def update_info():
+    """A newer release, and how to get it for the way this copy was installed."""
+    if _env("UPDATE_CHECK", "1") == "0":
+        return None
+    c = _small_json(UPDATE_FILE)
+    if _ver(c.get("latest")) <= _ver(VERSION):
+        return None
+    via = _small_json(os.path.join(BASE, "install.json")).get("via") or "git"
+    how = {"plugin": "claude plugin update tokenometro@tokenometro",
+           "pipx": "pipx upgrade tokenometro && tokenometro install",
+           "git": "git pull && python3 install.py"}.get(via, "git pull && python3 install.py")
+    return {"latest": c["latest"], "current": VERSION, "url": c.get("url") or f"https://github.com/{REPO}/releases", "how": how}
+
+
 def loop():
     last_snap = 0
     while True:
@@ -1888,10 +2465,16 @@ def loop():
                 last_snap = time.time()
             except Exception as e:
                 print("snapshot error:", e, file=sys.stderr)
+            try:
+                write_digest()
+            except Exception as e:
+                print("digest error:", e, file=sys.stderr)
+            check_update()
         time.sleep(INGEST_EVERY)
 
 
 _TOKEN = ""
+_PAGE_TOKEN = secrets.token_hex(16)  # for the dashboard's own buttons; the stop token never goes into the page
 
 
 def write_control():
@@ -1936,6 +2519,15 @@ def main():
         ingest()
         sys.stdout.flush()
         sys.stdout.buffer.write(report(month, opt("--by", "session"), opt("--client", ALL)).encode("utf-8"))  # bytes: no \r\r\n on Windows
+        return
+    if cmd == "digest":
+        # tracker.py digest [YYYY-MM-DD]: the week (Monday to Sunday) holding that day; last week by default
+        set_lang(LANG_DEFAULT)
+        ingest()
+        day = next((x for x in sys.argv[2:] if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", x)), None)
+        d = date.fromisoformat(day) if day else date.today() - timedelta(days=7)
+        sys.stdout.flush()
+        sys.stdout.buffer.write(digest(d - timedelta(days=d.weekday())).encode("utf-8"))
         return
     if cmd == "backfill":
         t0 = time.time()

@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>Mira cuánto cuestan tus sesiones de Claude Code, en qué se van los tokens y qué cambiar para gastar menos.</b><br>
-  Un solo fichero de Python · sin dependencias · nada sale de tu equipo · inglés y español · claro y oscuro
+  Un solo fichero de Python · sin dependencias · tus datos no salen de tu equipo · inglés y español · claro y oscuro
 </p>
 
 <p align="center">
@@ -34,6 +34,9 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
 | **Tu plan** | % de la ventana de 5 horas y de la semana, cuándo se reinician, el tope estimado en € o $ y si al ritmo actual lo agotarás antes de que se reinicie. |
 | **Mejoras recomendadas** | Tarjetas hechas con *tus* datos y *tu* `settings.json`: qué cambiar, cuánto pesa, cómo comprobar que ha funcionado y un prompt listo para pegarle a Claude. |
 | **Sesiones** | Coste de cada sesión separado en entrada, salida, lecturas y escrituras de caché; el modelo más barato que habría bastado; tramos entre compactaciones, subagentes y las llamadas a herramientas más gordas. |
+| **Por rama / tarea** | Coste por rama de git. Si el nombre de la rama lleva un ticket (`feature/7067`, `fix/ABC-123`), todos los repos que tocaste para él suman una sola tarea; si no, igualmente ves el coste por rama. |
+| **Coste fijo por sesión** | Lo que lleva cada sesión antes de que escribas nada: prompt de sistema, herramientas integradas, cada servidor MCP, tu CLAUDE.md, memoria y skills. Cuánto costó en el periodo, y una tarjeta cuando un servidor MCP se carga en todas partes pero casi no se usa. |
+| **Resumen semanal** | Cada lunes un Markdown en `~/.claude/reports/` con el gasto de la semana pasada frente a la anterior, las sesiones y tareas más caras, el coste fijo y las recomendaciones que cambiaron. |
 | **Informes** | Un CSV mensual por sesión o por cliente, para compartirlo o repercutirlo a un cliente, desde el panel o por consola. |
 | **Antes / después** | Elige la fecha de un cambio (un ajuste nuevo, una costumbre nueva) y compara el coste por mensaje, el contexto y las compactaciones a cada lado. |
 
@@ -85,6 +88,17 @@ python3 install.py --statusline  # además usa statusline.py para ver el % del p
 2. Añade en `~/.claude/settings.json` un hook `SessionStart` que levanta el panel al abrir Claude Code. Antes guarda una copia: `settings.json.bak-tokenometro-<fecha>`.
 3. Lee el histórico (la primera vez tarda un poco) y abre el servidor en http://127.0.0.1:7878.
 
+**Con pipx**:
+
+```bash
+pipx install git+https://github.com/Jaferdi/tokenometro
+tokenometro install              # igual que install.py; añade --statusline para el % del plan
+```
+
+El comando `tokenometro` también hace `open`, `restart`, `report`, `digest`, `demo` y `uninstall` (`tokenometro help`).
+
+**Actualizaciones**: cuando sale una versión nueva, el panel muestra *vX.Y disponible* junto al título, con el comando según cómo lo instalaste: `claude plugin update tokenometro@tokenometro`, `git pull && python3 install.py` o `pipx upgrade tokenometro && tokenometro install`. Para enterarte por correo, en GitHub *Watch → Custom → Releases*.
+
 Si ya tenías la versión anterior en `~/.local/share/claude-tokens`, copia datos y configuración y cambia el hook.
 
 Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quita el hook y la statusLine propia; los datos se quedan hasta que borres la carpeta).
@@ -93,7 +107,8 @@ Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quit
 
 - Solo lee `~/.claude/projects/**/*.jsonl` (y, si existe, la última lectura del plugin sub-meter).
 - Escucha en `127.0.0.1`: el panel no es accesible desde fuera de tu equipo.
-- No se conecta a internet ni envía nada. Todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
+- Tus datos no salen de tu equipo: todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
+- Su única petición a internet: una vez al día pregunta a GitHub cuál es la última versión (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`), sin enviar nada tuyo. GitHub ve tu IP, como en cualquier visita. Se apaga con `TOKENOMETRO_UPDATE_CHECK=0`.
 - En «Llamadas más gordas» enmascara lo que parezca un secreto, pero el panel muestra trozos de tus comandos y rutas: no lo compartas en capturas sin mirarlo.
 
 ## Qué significa «€ eq.»
@@ -109,6 +124,7 @@ Cada tarjeta sale de una regla que cruza tus datos del periodo con tu configurac
 - **Métrica e historial**: cada hora se guarda una foto diaria de todas las tarjetas (`recs_hist`). De ahí salen los cuadritos de los últimos 14 días, «pendiente desde…» o «bien desde…» y la tendencia frente a hace 7 días. Si una tarjeta cambia mientras miras el panel, parpadea.
 - **Antes / después**: algunas reglas comparan con la fecha de corte. Hasta tener 7 días desde el corte la tarjeta sale «En observación», porque con menos días el tipo de tarea pesa más que el cambio.
 - **Con qué**: herramientas o ajustes que existen y compensan para resolverlo.
+- **Aplicar**: cuando el arreglo es un solo ajuste (`autoCompactWindow`, `CLAUDE_CODE_SUBAGENT_MODEL`), la tarjeta trae un botón *Aplicar*. Guarda una copia fechada de `~/.claude/settings.json`, cambia solo esa clave y, desde el día siguiente, enseña la métrica de la tarjeta antes y después. *Deshacer* devuelve el valor anterior, salvo que lo hayas cambiado a mano después.
 - **Prompt**: el texto para pedírselo a Claude se guarda en `~/.claude/reports/mejoras-AAAA-MM-DD.md` (`improvements-…` en inglés) y se copia con «Copiar prompt».
 
 Reglas actuales: contexto demasiado grande y compactaciones, retomar sesiones tras pausas largas (reescribe la caché), subagentes con Opus, lecturas de ficheros enormes, ver el contexto en la barra de estado (solo si no tienes ya statusLine o un plugin que lo enseñe), salida del modelo (solo si pasa del 25 % del coste) y modelo rentable.
@@ -138,6 +154,8 @@ El % del plan solo existe con suscripción (Pro, Max, Team…): con API no hay l
    ```
    python3 "$HOME/.local/share/tokenometro/statusline.py" --tee | <tu comando actual>
    ```
+
+Por sí sola, `statusline.py` muestra `5h 46%  week 20%` y añade `· runs out 16:40` cuando, al ritmo que llevas desde que se abrió la ventana, llegarías al 100 % antes del reinicio (con `TOKENOMETRO_LANG=es` sale en castellano: `semana 20% · se agota jue 16:40`).
 
 Usa la lectura más reciente de las dos. Sin ninguna, el panel enseña solo lo gastado en las últimas 5 horas y 7 días.
 
@@ -177,6 +195,7 @@ El tipo de cambio se actualiza a mano: el tokenómetro no se conecta a nada. Si 
 | `TOKENOMETRO_CUT` | Fecha de corte de «Antes / después» | la de `clients.json` o hace 7 días |
 | `TOKENOMETRO_CURRENCY` | `EUR` o `USD` por defecto | la de `prices.json` |
 | `TOKENOMETRO_LANG` | `en` o `es` por defecto | `en` |
+| `TOKENOMETRO_UPDATE_CHECK` | `0` para no preguntar nunca a GitHub por versiones nuevas | `1` |
 | `TOKENOMETRO_NO_START` | `1` para que el instalador no lo arranque | |
 
 Siguen valiendo los nombres antiguos `CLAUDE_TOKENS_*`.
@@ -188,9 +207,10 @@ python3 ~/.local/share/tokenometro/tracker.py            # servidor (lo que hace
 python3 ~/.local/share/tokenometro/tracker.py ingest     # lee lo nuevo y saca un resumen
 python3 ~/.local/share/tokenometro/tracker.py backfill   # rellena datos de herramientas del histórico (una vez)
 python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur EUR   # CSV mensual por la salida estándar
+python3 ~/.local/share/tokenometro/tracker.py digest 2026-11-17   # resumen de la semana que contiene ese día
 ```
 
-`report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE` y `--cur USD|EUR`. El mismo CSV está en el panel, en la tarjeta *Por cliente*.
+`report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE` y `--cur USD|EUR`. El mismo CSV está en el panel, en la tarjeta *Por cliente*. `digest` imprime el resumen en Markdown de una semana (de lunes a domingo; por defecto la pasada). El servidor también escribe solo el de la semana pasada, una vez, como `~/.claude/reports/tokenometro-semana-AAAA-Www.md` (`tokenometro-week-…` en inglés).
 
 Reiniciar el servidor (solo lo para si es Tokenometro):
 
@@ -216,6 +236,7 @@ python3 ~/.local/share/tokenometro/start.py --restart
 | `install.py` | Instalar, actualizar y desinstalar (`install.sh` lo llama) |
 | `.claude-plugin/`, `hooks/` | Plugin de Claude Code |
 | `demo.py` | Probarlo con datos inventados, sin instalar nada |
+| `cli.py`, `pyproject.toml` | El comando `tokenometro` cuando se instala con pipx |
 | `usage.db` | Datos (se regenera desde los registros si lo borras) |
 | `plan.json` | Última lectura del plan de `statusline.py` |
 | `tracker.log` | Log del servidor |

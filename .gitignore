@@ -5,3 +5,8 @@ clients.json
 clientes.json
 *.bak-*
 __pycache__/
+build/
+dist/
+*.egg-info/
+install.json
+update.json

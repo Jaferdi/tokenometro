@@ -182,6 +182,95 @@ class IngestTest(Base):
         self.assertEqual(self.count(), 1)
 
 
+def now_ts(minutes_ago=0):
+    t = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def turn(sid, mid, cwd="/work/front", branch=None, ctx=40_000, minutes_ago=0, tools=()):
+    d = json.loads(record(sid, now_ts(minutes_ago), mid, inp=ctx, cwd=cwd))
+    if branch:
+        d["gitBranch"] = branch
+    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
+    return json.dumps(d)
+
+
+def shape(sid, mcp=None, deferred=0, system=8_000):
+    tool = lambda n, size: {"name": n, "description": "x" * size, "input_schema": {}}
+    tools = [tool("Bash", 4_000), tool("Read", 4_000)]
+    tools += [tool(f"mcp__{mcp}__{n}", 10_000) for n in ("a", "b")] if mcp else []
+    tools += [dict(tool(f"mcp__later__t{i}", 50), defer_loading=True) for i in range(deferred)]
+    return json.dumps({"type": "api-request-shape", "sessionId": sid, "timestamp": now_ts(),
+                       "shape": {"system": [{"type": "text", "text": "s" * system}], "tools": tools}})
+
+
+class BranchAndFixedCostTest(Base):
+    def test_task_comes_from_the_branch_name(self):
+        for branch, task in (("feature/7067", "7067"), ("fix/ABC-123-login", "ABC-123"), ("task/18499-ui", "18499"),
+                             ("main", None), ("feature/v2", None), ("release/1.10", None), ("", None), (None, None)):
+            self.assertEqual(self.t.task_of(branch), task, branch)
+
+    def test_a_task_spans_repos_and_other_branches_keep_their_name(self):
+        self.write("a.jsonl", [turn("s1", "m1", "/work/front", "feature/7067"), turn("s2", "m2", "/work/back", "feature/7067"),
+                               turn("s3", "m3", "/work/front", "main"), turn("s4", "m4", "/work/nogit")])
+        self.t.ingest()
+        rows = {r["task"] or r["branch"]: r for r in self.t.data(7, self.t.ALL)["branches"]}
+        self.assertEqual(set(rows), {"7067", "main"})
+        self.assertEqual(rows["7067"]["repos"], ["back", "front"])
+        self.assertEqual(rows["7067"]["sessions"], 2)
+
+    def test_fixed_cost_parts_ignore_subagents_and_deferred_tools(self):
+        self.write("s1.jsonl", [shape("s1", mcp="docs", deferred=3), turn("s1", "m1")])
+        sub = os.path.join(self.proj, "s1", "subagents")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "agent-x.jsonl"), "w") as f:
+            f.write(shape("s1", system=10) + "\n")
+        self.t.ingest()
+        fx = self.t.data(7, self.t.ALL)["fixed"]
+        parts = {p["k"]: p["tokens"] for p in fx["parts"]}
+        self.assertEqual(parts["system"], 2_000)
+        self.assertIn("mcp:docs", parts)
+        self.assertNotIn("mcp:later", parts)
+        self.assertEqual(fx["deferred"], 3)
+        self.assertEqual(fx["servers"]["docs"]["sessions"], 1)
+
+    def test_fixed_cost_is_the_smallest_context_read_on_every_turn(self):
+        self.write("s1.jsonl", [turn("s1", "m1", ctx=50_000, minutes_ago=3), turn("s1", "m2", ctx=30_000, minutes_ago=2),
+                                turn("s1", "m3", ctx=90_000, minutes_ago=1)])
+        self.t.ingest()
+        p = self.t.load_prices()["claude-opus-5-5"]
+        fx = self.t.data(7, self.t.ALL)["fixed"]
+        self.assertEqual(fx["base"], 30_000)
+        self.assertAlmostEqual(fx["cost"], 30_000 * (3 * p["cache_read"] + p["cache_write_5m"]) / 1e6, places=6)
+
+    def test_heavy_unused_mcp_server_is_recommended(self):
+        lines = []
+        for i in range(4):
+            lines += [shape(f"s{i}", mcp="docs"), turn(f"s{i}", f"m{i}", minutes_ago=i)]
+        self.write("a.jsonl", lines)
+        self.t.ingest()
+        self.assertIn("mcp", [r["id"] for r in self.t.data(7, self.t.ALL)["recs"]])
+        self.write("b.jsonl", [turn(f"s{i}", f"u{i}", tools=["mcp__docs__a"]) for i in range(2)])
+        self.t.ingest()
+        self.assertNotIn("mcp", [r["id"] for r in self.t.data(7, self.t.ALL)["recs"]])
+
+    def test_old_database_gets_the_branch_and_reads_history_again(self):
+        con = sqlite3.connect(self.t.DB)
+        con.executescript("""CREATE TABLE files(path TEXT PRIMARY KEY, offset INTEGER, size INTEGER);
+            CREATE TABLE msgs(id TEXT PRIMARY KEY, ts TEXT, day TEXT, hour INTEGER, session TEXT, project TEXT, client TEXT,
+              model TEXT, sidechain INTEGER, agent TEXT, inp INTEGER, cw5 INTEGER, cw1h INTEGER, cr INTEGER, out INTEGER,
+              think INTEGER, web INTEGER);
+            INSERT INTO files VALUES('x.jsonl', 500, 500);""")
+        con.commit()
+        con.close()
+        con = self.t.connect()
+        try:
+            self.assertIn("branch", [r[1] for r in con.execute("PRAGMA table_info(msgs)")])
+            self.assertEqual(con.execute("SELECT offset FROM files").fetchone()[0], 0)
+        finally:
+            con.close()
+
+
 class SecretsTest(Base):
     def test_masks(self):
         cases = {
@@ -222,6 +311,138 @@ class PlanTest(Base):
         self.write_plan(datetime.now(timezone.utc) - timedelta(hours=1))
         w = {x["kind"]: x for x in self.plan()["windows"]}["five_hour"]
         self.assertIsNone(w["pct"])
+
+
+class StatuslineForecastTest(unittest.TestCase):
+    def setUp(self):
+        import statusline
+        self.s = statusline
+        self.now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+
+    def test_runs_out_before_the_reset(self):
+        # opened 2h ago, 70% used: 30% more takes ~51 min, the reset is in 3h
+        end = self.s.runs_out(70, self.now + timedelta(hours=3), "five_hour", self.now)
+        self.assertAlmostEqual((end - self.now).total_seconds() / 60, 51.4, places=0)
+
+    def test_lasts_until_the_reset_or_too_early_to_tell(self):
+        self.assertIsNone(self.s.runs_out(30, self.now + timedelta(hours=3), "five_hour", self.now))
+        self.assertIsNone(self.s.runs_out(20, self.now + timedelta(hours=4, minutes=50), "five_hour", self.now))
+        self.assertIsNone(self.s.runs_out(100, self.now + timedelta(hours=1), "five_hour", self.now))
+
+    def test_printed_line(self):
+        end = self.now + timedelta(minutes=30)
+        self.assertTrue(self.s.label("five_hour", 70, end).startswith("5h 70% · runs out "))
+        self.assertEqual(self.s.label("seven_day", 20, None), "week 20%")
+
+
+def paused(sid, days_ago, cw=2_000_000):
+    """Two turns of one session two hours apart, `days_ago` days back: one pause over 1 h with a big cache write."""
+    out = []
+    for i, minutes in enumerate((days_ago * 1440 + 120, days_ago * 1440)):
+        d = json.loads(record(sid, now_ts(minutes), f"{sid}_{i}", inp=10))
+        d["message"]["usage"]["cache_creation_input_tokens"] = cw
+        out.append(json.dumps(d))
+    return out
+
+
+class PausesCardTest(Base):
+    HOOK = {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 x.py"}]}]}}
+
+    def card(self, hook, since=None):
+        with open(os.path.join(self.home, ".claude", "settings.json"), "w") as f:
+            json.dump(self.HOOK if hook else {}, f)
+        self.t.ingest()
+        if since is not None:
+            con = self.t.connect()
+            con.execute("INSERT OR REPLACE INTO seen(key, ts) VALUES ('gap_hook', ?)", (now_ts(since * 1440),))
+            con.commit()
+            con.close()
+        return [r for r in self.t.data(90, self.t.ALL)["recs"] if r["id"] == "gaps"]
+
+    def test_without_the_hook_it_is_pending_and_offers_the_prompt(self):
+        self.write("a.jsonl", paused("s1", 3))
+        [c] = self.card(False)
+        self.assertEqual((c["status"], c["metric"]), ("todo", 1))
+        self.assertTrue(c["prompt"] and c["tools"])
+
+    def test_a_new_hook_is_under_review_for_a_week_and_earlier_pauses_today_do_not_count(self):
+        self.write("a.jsonl", paused("s1", 3) + paused("s2", 0))
+        [c] = self.card(True)
+        self.assertEqual((c["status"], c["metric"], c["prompt"], c["tools"]), ("warn", 0, "", []))
+        self.assertIn((datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"), c["evidence"])
+
+    def test_after_a_week_with_cheaper_pauses_it_is_done(self):
+        self.write("a.jsonl", paused("s1", 20) + paused("s2", 15) + paused("s3", 12))
+        [c] = self.card(True, since=10)
+        self.assertEqual((c["status"], c["metric"]), ("ok", 0))
+
+    def test_after_a_week_with_the_same_pauses_it_stays_under_review(self):
+        self.write("a.jsonl", paused("s1", 20) + paused("s2", 15) + paused("s3", 5) + paused("s4", 3))
+        [c] = self.card(True, since=10)
+        self.assertEqual((c["status"], c["metric"]), ("warn", 2))
+
+    def test_removing_the_hook_goes_back_to_pending(self):
+        self.write("a.jsonl", paused("s1", 3))
+        self.card(True, since=10)
+        [c] = self.card(False)
+        self.assertEqual(c["status"], "todo")
+        con = self.t.connect()
+        self.assertIsNone(con.execute("SELECT ts FROM seen WHERE key='gap_hook'").fetchone())
+        con.close()
+
+
+class UpdateTest(Base):
+    def save(self, name, value):
+        with open(os.path.join(self.app, name), "w") as f:
+            json.dump(value, f)
+
+    def test_versions_agree(self):
+        self.assertEqual(read(os.path.join(ROOT, ".claude-plugin", "plugin.json"))["version"], self.t.VERSION)
+        self.assertIn(f'version = "{self.t.VERSION}"', read_text(os.path.join(ROOT, "pyproject.toml")))
+
+    def test_newer_release_shows_the_command_for_how_it_was_installed(self):
+        self.save("update.json", {"checked": time.time(), "latest": "99.0.0", "url": "https://example.test/r"})
+        info = self.t.update_info()
+        self.assertEqual((info["latest"], info["how"]), ("99.0.0", "git pull && python3 install.py"))
+        self.save("install.json", {"via": "plugin"})
+        self.assertEqual(self.t.update_info()["how"], "claude plugin update tokenometro@tokenometro")
+        self.save("update.json", {"checked": time.time(), "latest": self.t.VERSION})
+        self.assertIsNone(self.t.update_info())
+
+    def test_check_asks_github_once_a_day_and_can_be_turned_off(self):
+        calls = []
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n):
+                return b'{"tag_name": "v99.1.0", "html_url": "https://example.test/r"}'
+
+        real = self.t.urllib.request.urlopen
+        self.t.urllib.request.urlopen = lambda req, timeout: calls.append(req.full_url) or Resp()
+        try:
+            os.environ["TOKENOMETRO_UPDATE_CHECK"] = "0"
+            self.t.check_update()
+            self.assertEqual(calls, [])
+            del os.environ["TOKENOMETRO_UPDATE_CHECK"]
+            self.t.check_update()
+            self.t.check_update()
+            self.assertEqual(calls, ["https://api.github.com/repos/Jaferdi/tokenometro/releases/latest"])
+            self.assertEqual(self.t.update_info()["latest"], "99.1.0")
+        finally:
+            self.t.urllib.request.urlopen = real
+            os.environ.pop("TOKENOMETRO_UPDATE_CHECK", None)
+
+
+class CliTest(unittest.TestCase):
+    def test_help_and_unknown_command(self):
+        import cli
+        self.assertEqual(cli.main(["help"]), 0)
+        self.assertEqual(cli.main(["nope"]), 2)
 
 
 class I18nTest(unittest.TestCase):
@@ -266,6 +487,24 @@ class DemoAndServerTest(Base):
         r = self.t.data(7, "nobody")
         self.assertEqual(r["sessions"], [])
 
+    def test_demo_has_branches_and_fixed_cost(self):
+        r = self.t.data(30, self.t.ALL)
+        self.assertTrue(any(b["task"] == "PAY-142" for b in r["branches"]))
+        self.assertGreater(r["fixed"]["measured"], 10)
+
+    def test_weekly_digest_is_written_once(self):
+        from datetime import date
+        monday = date.today() - timedelta(days=date.today().weekday())
+        path = self.t.write_digest(monday)
+        self.assertTrue(os.path.basename(path).startswith("tokenometro-week-"))
+        text = read_text(path)
+        self.assertIn("# Tokenometro", text)
+        self.assertIn("PAY-", text)
+        with open(path, "w") as f:
+            f.write("kept")
+        self.t.write_digest(monday)
+        self.assertEqual(read_text(path), "kept")
+
     def test_session_detail(self):
         sid = self.t.data(30, self.t.ALL)["sessions"][0]["session"]
         d = self.t.session_detail(sid)
@@ -298,6 +537,71 @@ class DemoAndServerTest(Base):
                 self.assertEqual(e.exception.code, 403)
             req = urllib.request.Request(f"http://127.0.0.1:{port}/api/quit", headers={"X-Tokenometro-Token": "secret-token"})
             self.assertEqual(urllib.request.urlopen(req, timeout=10).read(), b"bye")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+class ApplyTest(Base):
+    def settings(self, value=None):
+        path = os.path.join(self.home, ".claude", "settings.json")
+        if value is not None:
+            with open(path, "w") as f:
+                json.dump(value, f)
+        return read(path)
+
+    def test_apply_sets_the_key_keeps_the_rest_and_undo_puts_it_back(self):
+        self.settings({"model": "opus", "env": {"FOO": "1"}})
+        self.t.apply_rec("subagent-model")
+        self.assertEqual(self.settings(), {"model": "opus", "env": {"FOO": "1", "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"}})
+        self.assertTrue([f for f in os.listdir(os.path.join(self.home, ".claude")) if ".bak-tokenometro-" in f])
+        self.t.apply_rec("subagent-model")  # twice is once
+        self.t.undo_rec("subagent-model")
+        self.assertEqual(self.settings(), {"model": "opus", "env": {"FOO": "1"}})
+
+    def test_undo_leaves_what_you_changed_by_hand(self):
+        self.settings({"autoCompactWindow": 200000})
+        self.t.apply_rec("ctx")
+        self.assertEqual(self.settings()["autoCompactWindow"], 300000)
+        self.settings({"autoCompactWindow": 250000})
+        self.t.undo_rec("ctx")
+        self.assertEqual(self.settings()["autoCompactWindow"], 250000)
+
+    def test_only_known_recommendations(self):
+        with self.assertRaises(ValueError):
+            self.t.apply_rec("anything")
+        with self.assertRaises(ValueError):
+            self.t.undo_rec("ctx")
+
+    def test_card_offers_apply_and_then_shows_it_applied(self):
+        recs = [{"id": "ctx", "status": "todo"}, {"id": "reads", "status": "todo"}]
+        con = self.t.connect()
+        self.t.attach_applied(con, recs)
+        self.assertEqual([r["can_apply"] for r in recs], [True, False])
+        self.t.apply_rec("ctx")
+        self.t.attach_applied(con, recs)
+        con.close()
+        self.assertFalse(recs[0]["can_apply"])
+        self.assertEqual(recs[0]["applied"]["day"], datetime.now().strftime("%Y-%m-%d"))
+
+    def test_http_apply_needs_the_page_token(self):
+        self.settings({})
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), self.t.H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        post = lambda headers: urllib.request.urlopen(urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/apply", data=b'{"id": "ctx"}', headers=headers, method="POST"), timeout=10)
+        try:
+            page = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10).read().decode()
+            self.assertIn(self.t._PAGE_TOKEN, page)
+            for headers in ({}, {"X-Tokenometro-Page": "wrong"},
+                            {"X-Tokenometro-Page": self.t._PAGE_TOKEN, "Origin": "https://evil.example"}):
+                with self.assertRaises(urllib.error.HTTPError) as e:
+                    post(headers)
+                self.assertEqual(e.exception.code, 403)
+            self.assertNotIn("autoCompactWindow", self.settings())
+            self.assertEqual(json.loads(post({"X-Tokenometro-Page": self.t._PAGE_TOKEN}).read()), {"ok": True})
+            self.assertEqual(self.settings()["autoCompactWindow"], 300000)
         finally:
             srv.shutdown()
             srv.server_close()
@@ -372,6 +676,8 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(len(hooks), 2)
         self.assertIn("echo mine", hooks)
         self.assertTrue(any("start.py" in h and "--port 7998" in h for h in hooks))
+        dest = os.path.join(self.home, "AppData", "tokenometro") if os.name == "nt" else os.path.join(self.home, ".local", "share", "tokenometro")
+        self.assertEqual(read(os.path.join(dest, "install.json")), {"via": "git"})  # picks the update command
         self.assertEqual(read(self.settings)["statusLine"]["command"], "mybar")  # someone else's: untouched
         self.assertIn("--tee", r.stdout)
         r = self.install("--uninstall")
