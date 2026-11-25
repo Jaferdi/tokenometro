@@ -47,7 +47,7 @@ def _env(name, default):
 
 
 PORT = int(_env("PORT", "7878"))
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 REPO = "Jaferdi/tokenometro"
 UPDATE_FILE = os.path.join(BASE, "update.json")
 
@@ -2465,6 +2465,9 @@ th.s:focus-visible,tr.click:focus-visible{outline:2px solid var(--c);outline-off
 
 /* charts and legends */
 .leg{display:flex;flex-wrap:wrap;gap:6px 14px;margin:0 0 8px}
+#leg,#sleg{gap:6px}.leg .lg{display:inline-flex;align-items:center;gap:6px;font:500 12px var(--fb);color:var(--mut);background:none;border:1px solid transparent;border-radius:999px;padding:3px 10px;cursor:pointer;transition:opacity .15s,border-color .15s,color .15s}
+.leg .lg:hover{border-color:var(--line);color:var(--fg)}.leg .lg[aria-pressed=true]{border-color:var(--line);background:var(--card);color:var(--fg);font-weight:600}
+.leg .lg.off{opacity:.45}.leg .lg.all{color:var(--fg);border-color:var(--line)}.leg .lg i{width:10px;height:10px;border-radius:3px;display:inline-block}
 .leg span{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut)}.leg i{width:10px;height:10px;border-radius:3px;display:inline-block}
 svg text{fill:var(--mut);font-size:10px;font-family:var(--fb)}
 svg.grow rect{transform-box:fill-box;transform-origin:50% 100%;animation:grow .8s var(--ease) both}
@@ -2512,7 +2515,7 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 </main>
 <script>
 const I18N={
-en:{title:'Tokenometro',pace:'This month <b>{m}</b> · at the pace of the last 7 days it ends near <b>{p}</b>',pace_last:' (last month {l})',odd:'Unusual day: {d}',odd_tip:'{d} cost {c}, {x} times your usual day ({m}). Most of it: «{s}» ({sc}). See Sessions.',nav_label:'Sections',nav_now:'Now',nav_plan:'Plan',nav_summary:'Summary',nav_recs:'Improvements',nav_daily:'By day',nav_ba:'Before/after',nav_breakdown:'Breakdown',nav_sessions:'Sessions',period:'Period',today:'Today',d7:'7 days',d30:'30 days',d90:'90 days',client:'Client',allclients:'All clients',others:'Others',currency:'Currency',language:'Language',theme:'Theme',th_system:'◐ Auto (system)',th_light:'☀ Light',th_dark:'☾ Dark',
+en:{title:'Tokenometro',leg_tip:'Show only this one',leg_tip_all:'Show them all again',leg_all:'Show all',pace:'This month <b>{m}</b> · at the pace of the last 7 days it ends near <b>{p}</b>',pace_last:' (last month {l})',odd:'Unusual day: {d}',odd_tip:'{d} cost {c}, {x} times your usual day ({m}). Most of it: «{s}» ({sc}). See Sessions.',nav_label:'Sections',nav_now:'Now',nav_plan:'Plan',nav_summary:'Summary',nav_recs:'Improvements',nav_daily:'By day',nav_ba:'Before/after',nav_breakdown:'Breakdown',nav_sessions:'Sessions',period:'Period',today:'Today',d7:'7 days',d30:'30 days',d90:'90 days',client:'Client',allclients:'All clients',others:'Others',currency:'Currency',language:'Language',theme:'Theme',th_system:'◐ Auto (system)',th_light:'☀ Light',th_dark:'☾ Dark',
  refresh:'Refresh',refreshing:'Refreshing…',spent_today:'Spent today, at API prices (equivalent cost)',spark_aria:'Spend today by hour',right_now:'Right now',active_title:'There are active sessions',
  your_plan:'Your plan',plan_note:'The % is calculated by Claude Code and includes what you use in claude.ai. The ceiling is an estimate: what you have spent here divided by the % used.',
  summary:'Period summary',eq_rest:'With a subscription (Pro, Max, Team…) you do not pay this amount, but it lets you compare periods and habits; with the API it is roughly your real bill.',
@@ -2542,7 +2545,7 @@ en:{title:'Tokenometro',pace:'This month <b>{m}</b> · at the pace of the last 7
  evidence:'Evidence',what_to_do:'What to do',with_:'With',check:'Check',tradeoff_h:'Trade-off, calculation and confidence',tradeoff:'Trade-off',calc:'Calculation',confidence:'Confidence',nothing:'Nothing to recommend in this period.',nothing_yet:'Nothing proven yet: {n} under study, below.',study_h:'Under study ({n})',study_hint:'Found in your data but not proven yet. They move up on their own once they repeat on 3 days and save enough for you.',dismissed_h:'Dismissed ({n})',dismissed_hint:'Hidden by you. The ones with an amount come back on their own if it doubles.',dismiss:'Not for me',dismiss_tip:'Hide this card; it comes back if its cost doubles',restore:'Restore',
  cost_day:'Cost per day',cost_msg:'Cost per message',turns_msg:'Turns per message',avg_ctx:'Average context',change:'Change',short_warn:'Short sample: {n} day(s) per side. Inconclusive (it depends a lot on the type of task).',
  win_cap:'You have used <b>{c}</b> eq. ({tok} tokens) of the ≈<b>{cap}</b> this window seems to allow; ≈<b>{left}</b> left{now}.',win_now:' (≈{n} % if counted up to this minute)',win_nocap:'You have used <b>{c}</b> eq. ({tok} tokens) in this window. The allowance is only estimated once you pass 10 % of the plan.',period_sub:'{n} tokens in total',help_period:'Total equivalent cost of the selected period, and the tokens (pieces of text) processed.',help_msg:'Average cost of each message you send. A turn is one reply of the model; a message can trigger several.',help_sub:'Subagents are helper agents Claude launches on its own (searching, reviewing…). Their cost is part of the total.',help_cw:'Cache write: saving the conversation so it is cheap to resend. It is paid on a new session, after a compaction, when switching model and after a long pause.',help_over:'Context over {n}: when a conversation grows past that size, every reply resends the excess. A compaction is Claude summarising the chat to shrink it.',help_best:'Cheapest model that would have been enough given what the session did; the figure is the estimated saving.',help_went:'What most of the cost of this session went to.',help_compact:'Times Claude summarised the conversation because it was too long.',help_msgs:'Messages you sent in the session.',daily_note:'Cache read: resending the conversation from the cache (cheap per token). Cache write: saving new context (pricier). Uncached input: new text sent without caching. Output: what the model writes, including its reasoning (thinking).',odo_eur:'euros today',odo_usd:'dollars today',h_title:'{h} h: {v}'},
-es:{title:'Tokenómetro',pace:'Este mes <b>{m}</b> · al ritmo de los últimos 7 días acabará en unos <b>{p}</b>',pace_last:' (el mes pasado, {l})',odd:'Día fuera de lo normal: {d}',odd_tip:'El {d} costó {c}, {x} veces tu día normal ({m}). Sobre todo: «{s}» ({sc}). Míralo en Sesiones.',nav_label:'Secciones',nav_now:'Ahora',nav_plan:'Plan',nav_summary:'Resumen',nav_recs:'Mejoras',nav_daily:'Por día',nav_ba:'Antes/después',nav_breakdown:'Desglose',nav_sessions:'Sesiones',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días',d90:'90 días',client:'Cliente',allclients:'Todos los clientes',others:'Otros',currency:'Moneda',language:'Idioma',theme:'Tema',th_system:'◐ Auto (sistema)',th_light:'☀ Claro',th_dark:'☾ Oscuro',
+es:{title:'Tokenómetro',leg_tip:'Ver solo este',leg_tip_all:'Volver a ver todos',leg_all:'Ver todos',pace:'Este mes <b>{m}</b> · al ritmo de los últimos 7 días acabará en unos <b>{p}</b>',pace_last:' (el mes pasado, {l})',odd:'Día fuera de lo normal: {d}',odd_tip:'El {d} costó {c}, {x} veces tu día normal ({m}). Sobre todo: «{s}» ({sc}). Míralo en Sesiones.',nav_label:'Secciones',nav_now:'Ahora',nav_plan:'Plan',nav_summary:'Resumen',nav_recs:'Mejoras',nav_daily:'Por día',nav_ba:'Antes/después',nav_breakdown:'Desglose',nav_sessions:'Sesiones',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días',d90:'90 días',client:'Cliente',allclients:'Todos los clientes',others:'Otros',currency:'Moneda',language:'Idioma',theme:'Tema',th_system:'◐ Auto (sistema)',th_light:'☀ Claro',th_dark:'☾ Oscuro',
  refresh:'Actualizar',refreshing:'Actualizando…',spent_today:'Gastado hoy, a precios de API (coste equivalente)',spark_aria:'Gasto de hoy por horas',right_now:'Ahora mismo',active_title:'Hay sesiones activas',
  your_plan:'Tu plan',plan_note:'El % lo calcula Claude Code e incluye lo que uses en claude.ai. El techo es una estimación: lo que llevas gastado dividido entre el % usado.',
  summary:'Resumen del periodo',eq_rest:'Con suscripción (Pro, Max, Team…) no pagas esta cantidad, pero sirve para comparar periodos y hábitos; con la API es, aproximadamente, tu factura real.',
@@ -2654,6 +2657,11 @@ document.addEventListener('click',async e=>{const b=e.target.closest('.dm,.rs');
 document.addEventListener('click',async e=>{const b=e.target.closest('.cp');if(!b)return;e.preventDefault();e.stopPropagation();
  const x=(RECS[+b.dataset.i]||{}).prompt||'';try{await navigator.clipboard.writeText(x)}catch(_){const a=document.createElement('textarea');a.value=x;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}
  const o=b.textContent;b.textContent=t('copied');b.classList.add('ok');setTimeout(()=>{b.textContent=o;b.classList.remove('ok')},1600)});
+// daily chart legend: a click shows that cost alone, on its own scale; another click (or "All") shows them all again
+let DSEL=null,DROWS=[],DKEYS=[],SSEL=null,SDRAW=()=>{};
+function legend(el,keys,sel,rows){el.innerHTML=keys.map(k=>'<button type="button" class="lg'+(sel&&sel!=k.k?' off':'')+'" data-k="'+k.k+'" aria-pressed="'+(sel==k.k)+'" title="'+esc(t(sel==k.k?'leg_tip_all':'leg_tip'))+'"><i style="background:'+css(k.c)+'"></i>'+k.n+(sel==k.k?' · '+usd(rows.reduce((a,r)=>a+(r[k.k]||0),0)):'')+'</button>').join('')
+  +(sel?'<button type="button" class="lg all" data-k="">'+t('leg_all')+'</button>':'')}
+function drawDaily(){legend($('leg'),DKEYS,DSEL,DROWS);stacked($('daily'),DROWS,DSEL?DKEYS.filter(k=>k.k==DSEL):DKEYS)}
 function stacked(el,rows,keys){const W=Math.max(el.clientWidth,320),H=180,P=28;
  if(!rows.length){el.innerHTML='<p class="mut">'+t('no_data')+'</p>';return}
  const tot=rows.map(r=>keys.reduce((s,k)=>s+(r[k.k]||0),0)),max=Math.max(...tot,1e-9),bw=(W-P)/rows.length;
@@ -2710,21 +2718,22 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
   [t('subagents'),(k.cost?100*k.sub_cost/k.cost:0).toFixed(0)+'%',t('of_cost'),'help_sub'],
   [t('cache_write'),usd(k.c_cw),t('pct_cost_comp',{p:(k.cost?100*k.c_cw/k.cost:0).toFixed(0),n:k.compacts}),'help_cw'],[t('over_k',{n:tok(L.ctx)}),'~'+usd(k.over),t('over_sub',{p:(k.cost?100*k.over/k.cost:0).toFixed(0),n:tok(L.ctx)}),'help_over']].map(x=>'<div class="k" title="'+esc(t(x[3],{n:tok(L.ctx)}))+'"><span>'+x[0]+'</span><b>'+x[1]+'</b><span>'+x[2]+'</span></div>').join('');
  const keys=[{k:'c_cr',n:t('cache_read'),c:'--b'},{k:'c_cw',n:t('cache_write'),c:'--c'},{k:'c_inp',n:t('input_nc'),c:'--e'},{k:'c_out',n:t('output_think'),c:'--d'}];
- $('leg').innerHTML=keys.map(k=>'<span><i style="background:'+css(k.c)+'"></i>'+k.n+'</span>').join('');
- stacked($('daily'),r.daily,keys);FIRST=false;
+ DROWS=r.daily;DKEYS=keys;drawDaily();FIRST=false;
  tbl($('models'),r.models,[{h:t('model'),v:x=>x.model,f:esc},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('tokens'),v:x=>x.tokens,f:tok},{h:t('turns'),v:x=>x.turns,f:v=>v}]);
  if(r.branches.length)tbl($('branches'),r.branches,[{h:t('branch'),v:x=>x.branch,f:(v,x)=>'<b>'+esc(x.task||v)+'</b>'+(x.task?' <span class="mut">'+esc(v)+'</span>':'')+'<br><span class="mut">'+esc(x.repos.join(', '))+(x.clients.length?' · '+esc(x.clients.join(', ')):'')+'</span>'},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('sessions'),v:x=>x.sessions,f:v=>v},{h:t('last_day'),v:x=>x.last,f:v=>esc(v)}]);
  else $('branches').innerHTML='<p class="empty">'+t('no_branches')+'</p>';
  fixed($('fixed'),r.fixed);
  tbl($('clients'),r.clients,[{h:t('client'),v:x=>x.client,f:v=>esc(v=='otros'?t('others'):v)},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('tokens'),v:x=>x.tokens,f:tok},{h:t('sessions'),v:x=>x.sessions,f:v=>v}]);
  const sk=[{k:'c_cr',n:t('cache_read'),c:'--b'},{k:'c_cw',n:t('cache_write'),c:'--c'},{k:'c_inp',n:t('input_nc'),c:'--e'},{k:'c_out',n:t('output'),c:'--d'},{k:'c_think',n:t('thinking'),c:'--h'},{k:'sub_cost',n:t('subagents'),c:'--g'}];
- $('sleg').innerHTML=sk.map(k=>'<span><i style="background:'+css(k.c)+'"></i>'+k.n+'</span>').join('');
- const smax=Math.max(...r.sessions.map(x=>x.cost||0),1e-9);
- const sbar=x=>'<div style="display:flex;gap:6px;align-items:center;justify-content:flex-end">'+usd(x.cost)+'<div class="sbar" style="width:'+Math.max(4,84*(x.cost||0)/smax)+'px">'+sk.map(k=>'<i style="width:'+(x.cost?100*(x[k.k]||0)/x.cost:0)+'%;background:'+css(k.c)+'" title="'+k.n+': '+usd(x[k.k])+'"></i>').join('')+'</div></div>';
+ SDRAW=()=>{if(SSEL&&!sk.some(k=>k.k==SSEL))SSEL=null;
+ legend($('sleg'),sk,SSEL,r.sessions);
+ const rows=SSEL?[...r.sessions].sort((a,b)=>(b[SSEL]||0)-(a[SSEL]||0)):r.sessions,vk=SSEL?sk.filter(k=>k.k==SSEL):sk,cv=x=>SSEL?(x[SSEL]||0):(x.cost||0);
+ const smax=Math.max(...rows.map(cv),1e-9);
+ const sbar=x=>'<div style="display:flex;gap:6px;align-items:center;justify-content:flex-end">'+usd(cv(x))+'<div class="sbar" style="width:'+Math.max(4,84*cv(x)/smax)+'px">'+vk.map(k=>'<i style="width:'+(cv(x)?100*(x[k.k]||0)/cv(x):0)+'%;background:'+css(k.c)+'" title="'+k.n+': '+usd(x[k.k])+'"></i>').join('')+'</div></div>';
  const fue=x=>{if(!x.cost)return '-';const m=sk.reduce((b,k)=>(x[k.k]||0)>(x[b.k]||0)?k:b,sk[0]);return '<span style="display:inline-flex;align-items:center;gap:5px"><i style="width:8px;height:8px;border-radius:2px;background:'+css(m.c)+'"></i>'+m.n+' '+(100*(x[m.k]||0)/x.cost).toFixed(0)+'%</span>'};
  const tt=x=>x.top_tool?esc(x.top_tool.name)+' <span class="mut">~'+tok((x.top_tool.chars||0)/4)+' · '+x.top_tool.calls+'</span>':'-';
- tbl($('sessions'),r.sessions,[{h:t('session'),v:x=>x,f:(x)=>'<b>'+esc(x.title||x.session.slice(0,8))+'</b><br><span class="mut">'+short(x.project)+' · '+esc((x.first||'').slice(0,16).replace('T',' '))+'</span>'},
-  {h:t('cost'),v:x=>x,s:x=>x.cost,f:sbar,bar:false},{h:t('best_model'),help:t('help_best'),v:x=>x,s:x=>x.fit?x.fit.save:-1,f:fit},{h:t('went_on'),help:t('help_went'),v:x=>x,f:fue},{h:t('top_tool'),v:x=>x,f:tt},{h:t('messages_h'),help:t('help_msgs'),v:x=>x.prompts,f:v=>v},{h:t('max_ctx'),v:x=>x.peak_ctx,f:tok},{h:t('over_k',{n:tok(L.ctx)}),help:t('help_over',{n:tok(L.ctx)}),v:x=>x.over,f:v=>v>0.5?'~'+usd(v):'-'},{h:t('compact_h'),help:t('help_compact'),v:x=>x.compacts,f:v=>v},{h:t('subagents'),v:x=>x,s:x=>x.cost?x.sub_cost/x.cost:0,f:x=>x.cost?(100*x.sub_cost/x.cost).toFixed(0)+'%':'-'}],{click:openSession});
+ tbl($('sessions'),rows,[{h:t('session'),v:x=>x,f:(x)=>'<b>'+esc(x.title||x.session.slice(0,8))+'</b><br><span class="mut">'+short(x.project)+' · '+esc((x.first||'').slice(0,16).replace('T',' '))+'</span>'},
+  {h:t('cost'),v:x=>x,s:cv,f:sbar,bar:false},{h:t('best_model'),help:t('help_best'),v:x=>x,s:x=>x.fit?x.fit.save:-1,f:fit},{h:t('went_on'),help:t('help_went'),v:x=>x,f:fue},{h:t('top_tool'),v:x=>x,f:tt},{h:t('messages_h'),help:t('help_msgs'),v:x=>x.prompts,f:v=>v},{h:t('max_ctx'),v:x=>x.peak_ctx,f:tok},{h:t('over_k',{n:tok(L.ctx)}),help:t('help_over',{n:tok(L.ctx)}),v:x=>x.over,f:v=>v>0.5?'~'+usd(v):'-'},{h:t('compact_h'),help:t('help_compact'),v:x=>x.compacts,f:v=>v},{h:t('subagents'),v:x=>x,s:x=>x.cost?x.sub_cost/x.cost:0,f:x=>x.cost?(100*x.sub_cost/x.cost).toFixed(0)+'%':'-'}],{click:openSession})};SDRAW();
  const stl={todo:t('st_todo'),warn:t('st_warn'),ok:t('st_ok'),info:t('st_info')};
  const openK=new Set([...document.querySelectorAll('#recs details[open],#recs_more details[open]')].map(d=>d.dataset.k));
  const dm=d=>d?d.slice(8,10)+'-'+d.slice(5,7):'';
@@ -2767,6 +2776,9 @@ $('lang').onchange=()=>{LANGSEL=$('lang').value;LANG=LANGSEL;try{localStorage.se
 applyI18n();
 {const d=new Date();$('month').value=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');$('month').max=$('month').value;$('month').onchange=csvLinks}
 fetch('/api/clients').then(r=>r.json()).then(cs=>cs.forEach(c=>$('client').insertAdjacentHTML('beforeend','<option value="'+esc(c)+'">'+esc(c)+'</option>'))).catch(()=>{}).then(()=>{applyI18n();load()});
+const legClick=(el,get,set,draw)=>el.onclick=e=>{const b=e.target.closest('button');if(!b)return;const k=b.dataset.k;set(!k||get()==k?null:k);draw();
+ const f=el.querySelector(k&&get()?'[data-k="'+k+'"]':'.lg');if(f)f.focus()};
+legClick($('leg'),()=>DSEL,v=>DSEL=v,drawDaily);legClick($('sleg'),()=>SSEL,v=>SSEL=v,()=>SDRAW());
 // sticky bar: shadow line once it sticks, and the section you are reading marked in it
 {const bar=$('topbar'),links=[...document.querySelectorAll('#nav a')];let tick=0;
  const mark=()=>{tick=0;const h=bar.offsetHeight;document.documentElement.style.setProperty('--barh',h+'px');
