@@ -34,6 +34,7 @@ The demo runs in a temporary folder with invented data: it doesn't read your log
 | **Your plan** | % of the 5-hour window and of the week, when it resets, the estimated ceiling in $ or €, and whether you'll run out before it resets at your current pace. |
 | **Recommended improvements** | Cards built from *your* data and *your* `settings.json`: what to change, how much it weighs, how to check it worked, and a ready-to-paste prompt for Claude. |
 | **Sessions** | Cost per session split into input, output, cache reads and writes; the cheapest model that would have done the job; segments between compactions, subagents and the biggest tool calls. |
+| **Budget and reports** | Set a daily, weekly or monthly limit and get a warning at 80% and 100% in the dashboard and the status line. Download a monthly CSV per session or per client to share or bill. |
 | **Before / after** | Pick the date of a change (a new setting, a new habit) and compare cost per message, context and compactions on each side. |
 
 <table>
@@ -90,7 +91,8 @@ To remove it: `bash ~/.local/share/tokenometro/install.sh --uninstall` (removes 
 - **Plan**: % used of the 5-hour window and of the week, when it resets, and an estimated ceiling in equivalent € or $ (see below).
 - **Recommended improvements**: cards with what to change, how much it weighs and how to check it worked.
 - **Sessions**: cost per session broken down (input, output, cache reads and cache writes), the most cost-effective model for each, where the spend went and the tool that added the most text. Click a row for details: segments between compactions, subagents and biggest calls.
-- **By model and by client**, and **Before / after** a date to measure whether a settings change helped.
+- **Budget**: spend against your daily, weekly and monthly limits, with a warning next to the title from 80%.
+- **By model and by client**, with a monthly CSV report per session or per client, and **Before / after** a date to measure whether a settings change helped.
 
 The top bar picks period, client, currency (€ or $), language (English or Spanish) and theme (system, light or dark). Tables are paginated.
 
@@ -152,6 +154,12 @@ Groups sessions by client based on the folder you worked in (the first matching 
 - `clients`: name → list of path fragments.
 - `cut` (optional): YYYY-MM-DD date of the change you want to measure in "Before / after". Defaults to 7 days ago.
 
+- `budget` (optional): limits per `day`, `week` (from Monday) and `month`, in `currency` (`USD` by default, or `EUR`). The dashboard warns from 80% and the status line from `statusline.py` adds "budget today 92%".
+
+```json
+"budget": {"day": 30, "week": 150, "month": 600, "currency": "EUR"}
+```
+
 The Spanish names from earlier versions (`clientes.json`, `clientes`, `corte`) still work.
 
 ### `prices.json`
@@ -185,7 +193,10 @@ The old `CLAUDE_TOKENS_*` names still work.
 python3 ~/.local/share/tokenometro/tracker.py            # server (what the hook runs)
 python3 ~/.local/share/tokenometro/tracker.py ingest     # read new logs and print a summary
 python3 ~/.local/share/tokenometro/tracker.py backfill   # fill in tool data for old history (once)
+python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur EUR   # monthly CSV to stdout
 ```
+
+`report` takes `[YYYY-MM]` (this month by default), `--by session|client`, `--client NAME` and `--cur USD|EUR`. The same CSV is in the dashboard, in the *By client* card.
 
 Restart the server (kills only the process listening on the port):
 

@@ -52,7 +52,23 @@ def main():
         sys.stdout.write(raw)
         return
     names = {"five_hour": "5h", "seven_day": "week"}
-    print("  ".join(f"{names[x['kind']]} {float(x['percentUsed']):.0f}%" for x in limits))
+    parts = [f"{names[x['kind']]} {float(x['percentUsed']):.0f}%" for x in limits]
+    parts += budget_warnings()
+    print("  ".join(parts))
+
+
+def budget_warnings():
+    """Budgets at 80 % or more, from the status.json the dashboard rewrites every minute."""
+    try:
+        with open(os.path.join(os.path.dirname(OUT), "status.json"), encoding="utf-8") as f:
+            st = json.load(f)
+        if time.time() * 1000 - st.get("at", 0) > 15 * 60 * 1000:
+            return []  # stale: the dashboard is not running
+        labels = {"day": "today", "week": "week", "month": "month"}
+        return [f"budget {labels.get(b['kind'], b['kind'])} {b['pct']:.0f}%" + ("!" if b["pct"] >= 100 else "")
+                for b in st.get("budget") or [] if b.get("level") in ("warn", "over")]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
 
 
 if __name__ == "__main__":
