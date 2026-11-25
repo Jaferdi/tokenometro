@@ -35,6 +35,7 @@ The demo runs in a temporary folder with invented data: it doesn't read your log
 | **Recommended improvements** | Cards built from *your* data and *your* `settings.json`: what to change, how much it weighs, how to check it worked, and a ready-to-paste prompt for Claude. |
 | **Sessions** | Cost per session split into input, output, cache reads and writes; the cheapest model that would have done the job; segments between compactions, subagents and the biggest tool calls. |
 | **By branch / task** | Cost per git branch. If the branch name carries a ticket (`feature/7067`, `fix/ABC-123`), all the repos you touched for it add up into one task; if not, you still get cost per branch. |
+| **Month pace** | Under today's spend: this month so far, where it ends at the pace of the last 7 days, and last month. A chip warns about an unusual day (over twice your median day and your 90th percentile) and names the session behind it. |
 | **Fixed cost per session** | What every session carries before you type anything: system prompt, built-in tools, each MCP server, your CLAUDE.md, memory and skills. How much it cost in the period, and a card when an MCP server is loaded everywhere but hardly used. |
 | **Weekly summary** | Every Monday a Markdown file in `~/.claude/reports/` with last week's spend against the week before, top sessions and tasks, fixed cost and recommendations that changed. |
 | **Reports** | A monthly CSV per session or per client, to share or to bill a client, from the dashboard or the command line. |

@@ -500,6 +500,31 @@ class ClientsFileTest(Base):
         self.assertEqual(set(self.load(cfg)), {"acme", "company-c"})
 
 
+class PaceTest(Base):
+    def days(self, spec):
+        """spec: {days_ago: requests}, one request of 1M input tokens each, at this same time of day."""
+        self.write("a.jsonl", [record(f"s{d}", now_ts(d * 1440), f"m{d}_{i}") for d, n in spec.items() for i in range(n)])
+        return self.t.data(30, self.t.ALL)["pace"]
+
+    def test_month_end_follows_the_last_seven_days(self):
+        p = self.days({1: 2, 3: 5})
+        self.assertAlmostEqual(p["rate"], self.cost("claude-opus-5-5") / 7)  # 7 requests over 7 days
+        self.assertGreaterEqual(p["proj"], p["month"])
+        self.assertIsNone(p["odd"])  # under 10 days to compare with
+
+    def test_unusual_day_is_flagged_with_its_session(self):
+        spec = {d: 1 for d in range(8, 28)}
+        spec[2] = 6
+        p = self.days(spec)
+        self.assertIsNotNone(p["odd"])
+        self.assertAlmostEqual(p["odd"]["ratio"], 6, places=3)
+        self.assertEqual(p["odd"]["session"], "s2")
+
+    def test_a_normal_week_is_not_flagged(self):
+        p = self.days({d: 1 for d in range(0, 28)})
+        self.assertIsNone(p["odd"])
+
+
 class NewDetectorsTest(Base):
     def rec(self, rid):
         return next((r for r in self.t.data(30, self.t.ALL)["recs"] if r["id"] == rid), None)

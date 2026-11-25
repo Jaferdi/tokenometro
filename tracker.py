@@ -612,6 +612,41 @@ def report(month, by="session", client=ALL):
     return out.getvalue()
 
 
+def pace(con, C, cw_, ca_, now=None):
+    """This month so far, where it ends at the pace of the last 7 full days, and last month for comparison.
+    Plus the most unusual recent day: over twice your median day and over your 90th percentile (with at least
+    10 active days to compare and a floor of 1 USD, so light users are not nagged), with the session behind it."""
+    now = now or datetime.now()
+    today = now.date()
+    first = today.replace(day=1)
+    prev_first = (first - timedelta(days=1)).replace(day=1)
+    days_in = (first.replace(month=first.month % 12 + 1, year=first.year + first.month // 12) - first).days
+    by = {r["day"]: r["cost"] or 0 for r in q(con, f"""SELECT day, SUM({C}) cost FROM msgs WHERE day >= ?{cw_}
+        GROUP BY day""", [(today - timedelta(days=60)).isoformat()] + ca_)}
+    cost = lambda d: by.get(d.isoformat(), 0)
+    mtd_before = sum(cost(first + timedelta(days=i)) for i in range((today - first).days))
+    rate = sum(cost(today - timedelta(days=i)) for i in range(1, 8)) / 7
+    proj = mtd_before + max(cost(today), rate) + rate * (days_in - today.day)
+    last = q(con, f"SELECT COALESCE(SUM({C}),0) c FROM msgs WHERE day >= ? AND day < ?{cw_}",
+             [prev_first.isoformat(), first.isoformat()] + ca_)[0]["c"]
+    out = {"month": mtd_before + cost(today), "proj": proj, "rate": rate, "last_month": last,
+           "month_name": first.isoformat()[:7], "odd": None}
+    past = sorted(v for d, v in by.items() if d < (today - timedelta(days=7)).isoformat() and v > 0.01)
+    if len(past) >= 10:
+        med, p90 = past[len(past) // 2], past[min(len(past) - 1, int(len(past) * 0.9))]
+        bar = max(2 * med, p90, 1.0)
+        odd = [(cost(d) / med, d) for d in (today - timedelta(days=i) for i in range(7)) if cost(d) > bar]
+        if odd:
+            ratio, d = max(odd)
+            top = q(con, f"""SELECT m.session, t.title, SUM({C.replace('model', 'm.model')}) cost FROM msgs m
+                LEFT JOIN titles t ON t.session = m.session WHERE m.day = ?{cw_.replace('client', 'm.client')}
+                GROUP BY m.session ORDER BY cost DESC LIMIT 1""", [d.isoformat()] + ca_)
+            out["odd"] = {"day": d.isoformat(), "cost": cost(d), "median": med, "ratio": ratio,
+                          "session": top[0]["session"] if top else None, "title": top[0]["title"] if top else None,
+                          "session_cost": top[0]["cost"] if top else 0}
+    return out
+
+
 def data(days, client, cut=CUT_DEFAULT):
     if time.time() - _last_ingest > 20:
         ingest()
@@ -665,6 +700,7 @@ def data(days, client, cut=CUT_DEFAULT):
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "days": days, "client": client,
         "kpi_today": kpi(today),
+        "pace": pace(con, C, cw_, ca_),
         "kpi_range": kpi(since),
         "daily": q(con, f"""SELECT day, SUM(inp) inp, SUM(cw5+cw1h) cw, SUM(cr) cr, SUM(out) out,
             SUM({C}) cost, SUM({T['cr']}) c_cr, SUM({T['cw']}) c_cw, SUM({T['inp']}) c_inp,
@@ -2311,7 +2347,7 @@ main{padding:16px 28px 40px;display:grid;gap:18px;grid-template-columns:repeat(a
 .wide{grid-column:1/-1}
 @media (min-width:900px){main{grid-template-columns:repeat(2,minmax(0,1fr))}}  /* two fixed columns: the half-width pair never leaves a hole */
 h2{font:600 16px/1.25 var(--fd);margin:0 0 12px;letter-spacing:.01em;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
-.chips:empty{display:none}.chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0}
+.chip.odd{--k:var(--f)}.chips:empty{display:none}.chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0}
 .chip{--k:var(--c);display:inline-flex;align-items:center;gap:7px;padding:3px 10px;border-radius:999px;font-size:12px;color:var(--fg);text-decoration:none;
  background:color-mix(in srgb,var(--k) 12%,transparent);border:1px solid color-mix(in srgb,var(--k) 35%,transparent);transition:background .15s}
 .chip:hover{background:color-mix(in srgb,var(--k) 20%,transparent)}.chip:focus-visible{outline:2px solid var(--k);outline-offset:2px}
@@ -2450,7 +2486,7 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 <button id="re" data-i18n="refresh">Refresh</button></div></div></div>
 <main>
 <section class="hero" id="s-now">
- <div class="meter"><p class="lbl" data-i18n="spent_today">Spent today, at API rates</p><div class="odo" id="odo" role="img"></div><p class="sub" id="todaysub"></p>
+ <div class="meter"><p class="lbl" data-i18n="spent_today">Spent today, at API rates</p><div class="odo" id="odo" role="img"></div><p class="sub" id="todaysub"></p><p class="sub" id="pace"></p>
   <div class="spark" id="spark" data-i18n-aria="spark_aria" aria-label="Spend today by hour"></div><div class="spark-x"><span>0 h</span><span>6 h</span><span>12 h</span><span>18 h</span><span>23 h</span></div></div>
  <div class="now"><h2><span data-i18n="right_now">Right now</span> <span class="pulse" id="pulse" data-i18n-title="active_title" title="There are active sessions"></span></h2><p class="mut" id="livehint"></p><div id="live"></div></div>
 </section>
@@ -2476,7 +2512,7 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 </main>
 <script>
 const I18N={
-en:{title:'Tokenometro',nav_label:'Sections',nav_now:'Now',nav_plan:'Plan',nav_summary:'Summary',nav_recs:'Improvements',nav_daily:'By day',nav_ba:'Before/after',nav_breakdown:'Breakdown',nav_sessions:'Sessions',period:'Period',today:'Today',d7:'7 days',d30:'30 days',d90:'90 days',client:'Client',allclients:'All clients',others:'Others',currency:'Currency',language:'Language',theme:'Theme',th_system:'◐ Auto (system)',th_light:'☀ Light',th_dark:'☾ Dark',
+en:{title:'Tokenometro',pace:'This month <b>{m}</b> · at the pace of the last 7 days it ends near <b>{p}</b>',pace_last:' (last month {l})',odd:'Unusual day: {d}',odd_tip:'{d} cost {c}, {x} times your usual day ({m}). Most of it: «{s}» ({sc}). See Sessions.',nav_label:'Sections',nav_now:'Now',nav_plan:'Plan',nav_summary:'Summary',nav_recs:'Improvements',nav_daily:'By day',nav_ba:'Before/after',nav_breakdown:'Breakdown',nav_sessions:'Sessions',period:'Period',today:'Today',d7:'7 days',d30:'30 days',d90:'90 days',client:'Client',allclients:'All clients',others:'Others',currency:'Currency',language:'Language',theme:'Theme',th_system:'◐ Auto (system)',th_light:'☀ Light',th_dark:'☾ Dark',
  refresh:'Refresh',refreshing:'Refreshing…',spent_today:'Spent today, at API prices (equivalent cost)',spark_aria:'Spend today by hour',right_now:'Right now',active_title:'There are active sessions',
  your_plan:'Your plan',plan_note:'The % is calculated by Claude Code and includes what you use in claude.ai. The ceiling is an estimate: what you have spent here divided by the % used.',
  summary:'Period summary',eq_rest:'With a subscription (Pro, Max, Team…) you do not pay this amount, but it lets you compare periods and habits; with the API it is roughly your real bill.',
@@ -2506,7 +2542,7 @@ en:{title:'Tokenometro',nav_label:'Sections',nav_now:'Now',nav_plan:'Plan',nav_s
  evidence:'Evidence',what_to_do:'What to do',with_:'With',check:'Check',tradeoff_h:'Trade-off, calculation and confidence',tradeoff:'Trade-off',calc:'Calculation',confidence:'Confidence',nothing:'Nothing to recommend in this period.',nothing_yet:'Nothing proven yet: {n} under study, below.',study_h:'Under study ({n})',study_hint:'Found in your data but not proven yet. They move up on their own once they repeat on 3 days and save enough for you.',dismissed_h:'Dismissed ({n})',dismissed_hint:'Hidden by you. The ones with an amount come back on their own if it doubles.',dismiss:'Not for me',dismiss_tip:'Hide this card; it comes back if its cost doubles',restore:'Restore',
  cost_day:'Cost per day',cost_msg:'Cost per message',turns_msg:'Turns per message',avg_ctx:'Average context',change:'Change',short_warn:'Short sample: {n} day(s) per side. Inconclusive (it depends a lot on the type of task).',
  win_cap:'You have used <b>{c}</b> eq. ({tok} tokens) of the ≈<b>{cap}</b> this window seems to allow; ≈<b>{left}</b> left{now}.',win_now:' (≈{n} % if counted up to this minute)',win_nocap:'You have used <b>{c}</b> eq. ({tok} tokens) in this window. The allowance is only estimated once you pass 10 % of the plan.',period_sub:'{n} tokens in total',help_period:'Total equivalent cost of the selected period, and the tokens (pieces of text) processed.',help_msg:'Average cost of each message you send. A turn is one reply of the model; a message can trigger several.',help_sub:'Subagents are helper agents Claude launches on its own (searching, reviewing…). Their cost is part of the total.',help_cw:'Cache write: saving the conversation so it is cheap to resend. It is paid on a new session, after a compaction, when switching model and after a long pause.',help_over:'Context over {n}: when a conversation grows past that size, every reply resends the excess. A compaction is Claude summarising the chat to shrink it.',help_best:'Cheapest model that would have been enough given what the session did; the figure is the estimated saving.',help_went:'What most of the cost of this session went to.',help_compact:'Times Claude summarised the conversation because it was too long.',help_msgs:'Messages you sent in the session.',daily_note:'Cache read: resending the conversation from the cache (cheap per token). Cache write: saving new context (pricier). Uncached input: new text sent without caching. Output: what the model writes, including its reasoning (thinking).',odo_eur:'euros today',odo_usd:'dollars today',h_title:'{h} h: {v}'},
-es:{title:'Tokenómetro',nav_label:'Secciones',nav_now:'Ahora',nav_plan:'Plan',nav_summary:'Resumen',nav_recs:'Mejoras',nav_daily:'Por día',nav_ba:'Antes/después',nav_breakdown:'Desglose',nav_sessions:'Sesiones',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días',d90:'90 días',client:'Cliente',allclients:'Todos los clientes',others:'Otros',currency:'Moneda',language:'Idioma',theme:'Tema',th_system:'◐ Auto (sistema)',th_light:'☀ Claro',th_dark:'☾ Oscuro',
+es:{title:'Tokenómetro',pace:'Este mes <b>{m}</b> · al ritmo de los últimos 7 días acabará en unos <b>{p}</b>',pace_last:' (el mes pasado, {l})',odd:'Día fuera de lo normal: {d}',odd_tip:'El {d} costó {c}, {x} veces tu día normal ({m}). Sobre todo: «{s}» ({sc}). Míralo en Sesiones.',nav_label:'Secciones',nav_now:'Ahora',nav_plan:'Plan',nav_summary:'Resumen',nav_recs:'Mejoras',nav_daily:'Por día',nav_ba:'Antes/después',nav_breakdown:'Desglose',nav_sessions:'Sesiones',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días',d90:'90 días',client:'Cliente',allclients:'Todos los clientes',others:'Otros',currency:'Moneda',language:'Idioma',theme:'Tema',th_system:'◐ Auto (sistema)',th_light:'☀ Claro',th_dark:'☾ Oscuro',
  refresh:'Actualizar',refreshing:'Actualizando…',spent_today:'Gastado hoy, a precios de API (coste equivalente)',spark_aria:'Gasto de hoy por horas',right_now:'Ahora mismo',active_title:'Hay sesiones activas',
  your_plan:'Tu plan',plan_note:'El % lo calcula Claude Code e incluye lo que uses en claude.ai. El techo es una estimación: lo que llevas gastado dividido entre el % usado.',
  summary:'Resumen del periodo',eq_rest:'Con suscripción (Pro, Max, Team…) no pagas esta cantidad, pero sirve para comparar periodos y hábitos; con la API es, aproximadamente, tu factura real.',
@@ -2550,7 +2586,7 @@ function applyI18n(){document.documentElement.lang=LANG;document.title=t('title'
 const num=(v,d)=>(v||0).toLocaleString(LOC(),{minimumFractionDigits:d,maximumFractionDigits:d,useGrouping:false});
 const tok=n=>{n=n||0;return n>=999.95e6?num(n/1e9,1)+'B':n>=999.5e3?num(n/1e6,1)+'M':n>=1e3?num(n/1e3,0)+'K':Math.round(n)+''};
 let CUR={code:'USD',sym:'$',rate:1};
-const usd=n=>{const v=(n||0)*CUR.rate;return num(v,v<10?2:0)+' '+CUR.sym};
+const usd=n=>{const v=(n||0)*CUR.rate;return num(v,v<10?2:0)+'\u00a0'+CUR.sym};
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const short=p=>esc((p||'').replace(/^\/(home|Users)\/[^/]+/,'~'));
 const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
@@ -2645,6 +2681,8 @@ function alerts(r){const a=[];
   a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_unp',{n:r.unpriced.length})+'</span>')}
  if(r.update){const tip=t('al_update_tip',{c:r.update.current,n:r.update.latest,h:r.update.how});
   a.push('<a class="chip" href="'+esc(r.update.url)+'" target="_blank" rel="noopener" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_update',{n:esc(r.update.latest)})+'</a>')}
+ const o=r.pace&&r.pace.odd;if(o){const d=o.day.slice(8,10)+'-'+o.day.slice(5,7),tip=t('odd_tip',{d:d,c:usd(o.cost),x:num(o.ratio,1),m:usd(o.median),s:o.title||(o.session||'').slice(0,8),sc:usd(o.session_cost)});
+  a.push('<a class="chip odd" href="#s-sessions" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+esc(t('odd',{d:d}))+'</a>')}
  $('alerts').innerHTML=a.join('')}
 function csvLinks(){const d=new Date(),m=$('month').value||d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'),c=$('client').value;
  const u=by=>'/api/report.csv?month='+m+'&by='+by+'&client='+encodeURIComponent(c)+'&cur='+CUR.code+'&lang='+LANG;$('csv_s').href=u('session');$('csv_c').href=u('client')}
@@ -2665,7 +2703,8 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
   $('spark').className='spark'+(FIRST?' grow':'');$('spark').innerHTML=[...Array(24)].map((_,h)=>{const v=hm[h]||0;return '<i class="'+(h==nh?'now':v?'':'z')+'" style="height:'+Math.max(3,100*v/mx)+'%;animation-delay:'+(h*25)+'ms" title="'+t('h_title',{h:String(h).padStart(2,'0'),v:usd(v)})+'"></i>'}).join('')}
  $('pulse').classList.toggle('on',r.live.length>0);plan(r.plan);alerts(r);csvLinks();gauges($('live'),r.live,L);odometer($('odo'),r.kpi_today.cost);
  const tt0=r.kpi_today,k=r.kpi_range;
- $('todaysub').innerHTML=t('today_sub',{tok:tok(tt0.tokens),n:tt0.prompts,c:usd(k.cost)});$('gen').textContent=t('updated',{t:r.generated.slice(11,16)});
+ $('todaysub').innerHTML=t('today_sub',{tok:tok(tt0.tokens),n:tt0.prompts,c:usd(k.cost)});
+ {const p=r.pace;$('pace').innerHTML=p&&p.month>0.01?t('pace',{m:usd(p.month),p:usd(p.proj)})+(p.last_month>0.01?t('pace_last',{l:usd(p.last_month)}):''):''}$('gen').textContent=t('updated',{t:r.generated.slice(11,16)});
  $('kpis').innerHTML=[[t('period_k'),usd(k.cost),t('period_sub',{n:tok(k.tokens)}),'help_period'],
   [t('per_msg'),usd(k.cost_per_prompt),t('turns_plus',{a:(k.prompts?num(k.main_turns/k.prompts,1):0),b:(k.prompts?num(k.sub_turns/k.prompts,1):0)}),'help_msg'],
   [t('subagents'),(k.cost?100*k.sub_cost/k.cost:0).toFixed(0)+'%',t('of_cost'),'help_sub'],
