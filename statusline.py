@@ -45,6 +45,10 @@ def label(kind, pct, end):
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # Claude Code reads UTF-8; a Windows pipe would default to cp1252
+    except AttributeError:
+        pass
     raw = sys.stdin.read()
     tee = "--tee" in sys.argv
     try:
