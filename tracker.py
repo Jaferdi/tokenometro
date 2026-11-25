@@ -50,6 +50,8 @@ PORT = int(_env("PORT", "7878"))
 VERSION = "0.6.0"
 REPO = "Jaferdi/tokenometro"
 UPDATE_FILE = os.path.join(BASE, "update.json")
+LITELLM_FILE = os.path.join(BASE, "prices.litellm.json")
+LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 
 def _small_json(path):
@@ -462,11 +464,92 @@ def agent_meta(session, agent):
 
 
 def load_prices():
+    """prices.json, plus LiteLLM's price for models it does not have (cached by refresh_prices). Ours always wins."""
     try:
         p = read_json(PRICES)
     except Exception:
         p = {}
+    if _env("PRICE_REFRESH", "1") != "0":
+        for k, v in _valid_prices(_small_json(LITELLM_FILE).get("models")).items():
+            if k not in p:
+                p[k] = v
+                p.setdefault("_sources", {})[k] = "litellm"
     return p
+
+
+_PRICE_FIELDS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+
+
+def _valid_prices(models):
+    """Only names and numbers that are safe to put in the cost SQL: these come from a downloaded file."""
+    out = {}
+    for k, v in (models or {}).items() if isinstance(models, dict) else ():
+        if isinstance(k, str) and re.fullmatch(r"claude-[a-z0-9-]{1,60}", k) and isinstance(v, dict) and all(
+                isinstance(v.get(f), (int, float)) and not isinstance(v.get(f), bool) and 0 <= v[f] < 10000 for f in _PRICE_FIELDS):
+            out[k] = {f: float(v[f]) for f in _PRICE_FIELDS}
+    return out
+
+
+def _from_litellm(raw):
+    """LiteLLM's Anthropic entries in our units (USD per million tokens). Missing cache prices follow Anthropic's rule:
+    read 0.1x, 5-minute write 1.25x and 1-hour write 2x of input."""
+    out = {}
+    for k, v in (raw or {}).items():
+        if not isinstance(v, dict) or v.get("litellm_provider") != "anthropic":
+            continue
+        try:
+            inp = float(v["input_cost_per_token"]) * 1e6
+            out[k] = {"input": inp, "output": float(v["output_cost_per_token"]) * 1e6,
+                      "cache_read": float(v.get("cache_read_input_token_cost", inp / 1e7)) * 1e6,
+                      "cache_write_5m": float(v.get("cache_creation_input_token_cost", inp * 1.25 / 1e6)) * 1e6,
+                      "cache_write_1h": float(v.get("cache_creation_input_token_cost_above_1hr", inp * 2 / 1e6)) * 1e6}
+            out[k] = {f: round(x, 6) for f, x in out[k].items()}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return _valid_prices(out)
+
+
+def refresh_prices(force=False):
+    """Once a day, and only if you use a model that prices.json does not know, take its price from LiteLLM's public
+    list (a plain download from GitHub, sending nothing of yours) instead of valuing it at _default. Only the
+    prices of those models are kept. TOKENOMETRO_PRICE_REFRESH=0 turns it off; without a network nothing changes."""
+    if _env("PRICE_REFRESH", "1") == "0":
+        return
+    c = _small_json(LITELLM_FILE)
+    if not force and time.time() - (c.get("checked") or 0) < 86400:
+        return
+    c["checked"] = time.time()
+    con = connect()
+    try:
+        used = [{"model": r[0]} for r in con.execute("SELECT DISTINCT model FROM msgs")]
+    finally:
+        con.close()
+    try:
+        ours = read_json(PRICES)
+    except Exception:
+        ours = {}
+    need = [m["model"] for m in unpriced(used, ours)]
+    if not need:
+        c["models"] = {}
+    else:
+        try:
+            req = urllib.request.Request(LITELLM_URL, headers={"User-Agent": f"tokenometro/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                table = _from_litellm(json.loads(r.read(64 << 20).decode("utf-8")))
+            picked = {}
+            for m in need:
+                best = max((k for k in table if k in m), key=len, default=None)
+                if best:
+                    picked[best] = table[best]
+            c.update(models=picked, fetched=date.today().isoformat())
+        except (OSError, ValueError):
+            pass
+    try:
+        with open(LITELLM_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(c, f)
+        os.replace(LITELLM_FILE + ".tmp", LITELLM_FILE)
+    except OSError:
+        pass
 
 
 def _currency_cfg():
@@ -820,6 +903,9 @@ def data(days, client, cut=CUT_DEFAULT):
     funnel(con, res["recs"], span, res["kpi_range"]["cost"] / span * 7)
     res["plan"] = plan_info(con, C, tot, res["live"])
     res["unpriced"] = unpriced(res["models"], prices)
+    src = prices.get("_sources") or {}
+    res["litellm"] = [m["model"] for m in unpriced(res["models"], {k: v for k, v in prices.items() if k not in src})
+                      if m not in res["unpriced"]]
     order = {"todo": 0, "warn": 1, "info": 2, "ok": 3}
     res["recs"].sort(key=lambda x: (order[x["status"]], -(x["impact"] or 0)))
     res["currency"] = currency()
@@ -2530,7 +2616,7 @@ en:{title:'Tokenometro',leg_tip:'Show only this one',leg_tip_all:'Show them all 
  plan_src:'Your plan usage (from {src}, read at {at})',plan_ago:', {t} ago',five_h:'5 hours',week:'Week',
  eta:'At the current pace you reach 100 % on {eta}, before it resets.',noeta:'At the current pace you will not run out before it resets ({reset}).',resets:'resets in {t} ({at})',
  copied:'Copied',al_update:'v{n} available',al_update_tip:'You have {c} and {n} is out. To update: {h}',apply:'Apply',undo:'Undo',apply_hint:'Tokenometro can do it for you: sets {c} in ~/.claude/settings.json (a backup is saved first).',applied_on:'Applied from here on {d} ({c}).',applied_ba:'Before: {a} · after: {b} ({n} day(s)).',applied_wait:'The before/after appears from tomorrow.',undo_confirm:'Put back the previous value in ~/.claude/settings.json?',apply_failed:'Could not change settings.json',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
- al_unp:'{n} model(s) without a price',
+ al_unp:'{n} model(s) without a price',al_lit:'{n} price(s) from LiteLLM',al_lit_tip:'Not in prices.json, so their price comes from LiteLLM\'s public list: {m}. Add them to prices.json to fix it yourself.',
  al_unpriced:'Estimated prices for <code>{m}</code>: not in prices.json, so they are valued at the <code>_default</code> price. Add them to prices.json for exact figures.',
  csv_hint:'Monthly report to share or bill: tokens and cost per session or per client.',csv_sessions:'CSV by session',csv_clients:'CSV by client',month_label:'Month of the CSV report',
  load_err:'Could not refresh: is Tokenometro still running? Showing the last data received.',cut_label:'Cut-off date for before / after',
@@ -2560,7 +2646,7 @@ es:{title:'Tokenómetro',leg_tip:'Ver solo este',leg_tip_all:'Volver a ver todos
  plan_src:'Uso de tu plan (dato de {src}, leído a las {at})',plan_ago:', hace {t}',five_h:'5 horas',week:'Semana',
  eta:'Al ritmo actual llegarás al 100 % el {eta}, antes de que se reinicie.',noeta:'Al ritmo actual no lo agotarás antes de que se reinicie ({reset}).',resets:'se reinicia en {t} ({at})',
  copied:'Copiado',al_update:'v{n} disponible',al_update_tip:'Tienes la {c} y ya está la {n}. Para actualizar: {h}',apply:'Aplicar',undo:'Deshacer',apply_hint:'Tokenometro puede hacerlo por ti: pone {c} en ~/.claude/settings.json (antes guarda una copia).',applied_on:'Aplicada desde aquí el {d} ({c}).',applied_ba:'Antes: {a} · después: {b} ({n} día(s)).',applied_wait:'El antes/después sale a partir de mañana.',undo_confirm:'¿Volver a poner el valor anterior en ~/.claude/settings.json?',apply_failed:'No se pudo cambiar settings.json',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
- al_unp:'{n} modelo(s) sin precio',
+ al_unp:'{n} modelo(s) sin precio',al_lit:'{n} precio(s) de LiteLLM',al_lit_tip:'No están en prices.json y su precio sale de la lista pública de LiteLLM: {m}. Añádelos a prices.json para fijarlo tú.',
  al_unpriced:'Precios estimados para <code>{m}</code>: no están en prices.json y se valoran al precio de <code>_default</code>. Añádelos a prices.json para tener cifras exactas.',
  csv_hint:'Informe mensual para compartir o repercutir: tokens y coste por sesión o por cliente.',csv_sessions:'CSV por sesión',csv_clients:'CSV por cliente',month_label:'Mes del informe CSV',
  load_err:'No se pudo actualizar: ¿sigue en marcha Tokenometro? Se muestran los últimos datos recibidos.',cut_label:'Fecha de corte para antes / después',
@@ -2687,6 +2773,8 @@ async function openSession(x,tr,n){const nx=tr.nextElementSibling;if(nx&&nx.clas
 function alerts(r){const a=[];
  if(r.unpriced&&r.unpriced.length){const tip=t('al_unpriced',{m:r.unpriced.map(m=>m.model).join(', ')}).replace(/<[^>]+>/g,'');
   a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_unp',{n:r.unpriced.length})+'</span>')}
+ if(r.litellm&&r.litellm.length){const tip=t('al_lit_tip',{m:r.litellm.join(', ')});
+  a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_lit',{n:r.litellm.length})+'</span>')}
  if(r.update){const tip=t('al_update_tip',{c:r.update.current,n:r.update.latest,h:r.update.how});
   a.push('<a class="chip" href="'+esc(r.update.url)+'" target="_blank" rel="noopener" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_update',{n:esc(r.update.latest)})+'</a>')}
  const o=r.pace&&r.pace.odd;if(o){const d=o.day.slice(8,10)+'-'+o.day.slice(5,7),tip=t('odd_tip',{d:d,c:usd(o.cost),x:num(o.ratio,1),m:usd(o.median),s:o.title||(o.session||'').slice(0,8),sc:usd(o.session_cost)});
@@ -2907,8 +2995,8 @@ def _ver(v):
 
 
 def check_update(force=False):
-    """Once a day, ask GitHub which release is the latest. Only that request leaves your machine, with no data
-    of yours; TOKENOMETRO_UPDATE_CHECK=0 turns it off. Failures are remembered too, so it never insists."""
+    """Once a day, ask GitHub which release is the latest, with no data of yours (refresh_prices is the only
+    other request); TOKENOMETRO_UPDATE_CHECK=0 turns it off. Failures are remembered too, so it never insists."""
     if _env("UPDATE_CHECK", "1") == "0":
         return
     c = _small_json(UPDATE_FILE)
@@ -2964,6 +3052,10 @@ def loop():
             except Exception as e:
                 print("digest error:", e, file=sys.stderr)
             check_update()
+            try:
+                refresh_prices()
+            except Exception as e:
+                print("prices error:", e, file=sys.stderr)
         time.sleep(INGEST_EVERY)
 
 
