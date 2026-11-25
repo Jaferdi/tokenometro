@@ -194,6 +194,10 @@ def connect():
         con.execute("ALTER TABLE msgs ADD COLUMN branch TEXT")
         con.execute("UPDATE files SET offset=0")  # read the history again to fill the branch and the request shapes
         con.commit()
+    if "miss" not in [r[1] for r in con.execute("PRAGMA table_info(msgs)")]:
+        con.execute("ALTER TABLE msgs ADD COLUMN miss TEXT")  # message.diagnostics.cache_miss_reason.type
+        con.execute("UPDATE files SET offset=0")  # read the history again to fill it
+        con.commit()
     con.execute("CREATE TABLE IF NOT EXISTS applied(id TEXT PRIMARY KEY, at TEXT, day TEXT, prev TEXT, backup TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS seen(key TEXT PRIMARY KEY, ts TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS dismissed(id TEXT PRIMARY KEY, day TEXT, impact REAL)")
@@ -317,10 +321,11 @@ def _handle(con, d, sub=False):
         mid = msg.get("id") or d.get("uuid")
         con.execute(
             "INSERT OR REPLACE INTO msgs(id, ts, day, hour, session, project, client, model, sidechain, agent,"
-            " inp, cw5, cw1h, cr, out, think, web, branch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " inp, cw5, cw1h, cr, out, think, web, branch, miss) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (mid, ts, day, hour, session, cwd, cl, model, side, d.get("agentId"),
              u.get("input_tokens") or 0, cw5, cw1h, u.get("cache_read_input_tokens") or 0,
-             u.get("output_tokens") or 0, think, web, d.get("gitBranch") or None),
+             u.get("output_tokens") or 0, think, web, d.get("gitBranch") or None,
+             ((msg.get("diagnostics") or {}).get("cache_miss_reason") or {}).get("type")),
         )
         for b in msg.get("content") or []:
             if isinstance(b, dict) and b.get("type") == "tool_use":
@@ -988,10 +993,15 @@ def main_chain(con, w, a, T):
     loss = f"({T['cw']} - {T['cr'].replace('cr*', '(cw5+cw1h)*')})"
     by = {}
     for r in q(con, f"""SELECT id, session, ts, day, model, inp+cw5+cw1h+cr ctx, cw5+cw1h cw, cw5, cw1h, cr, {loss} loss,
-            {T['cr'].replace('cr*', '1*')} crp FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a):
+            {T['cr'].replace('cr*', '1*')} crp, miss FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a):
         r["t"] = local(r["ts"])
         by.setdefault(r["session"], []).append(r)
     return by
+
+
+# message.diagnostics.cache_miss_reason.type → cause; "unavailable" (no reason given) falls back to the guess
+MISS_CAUSES = {"model_changed": "model", "system_changed": "config", "tools_changed": "config",
+               "messages_changed": "trim", "previous_message_not_found": "evicted"}
 
 
 def cache_miss_rec(con, chain):
@@ -999,20 +1009,28 @@ def cache_miss_rec(con, chain):
     prefix changed. Counted when the write is over 20K tokens and over half the context, the context didn't shrink
     by more than 40% (that is a compaction or /clear) nor grow by more than half (a first big read). The cost is the
     write minus what those tokens would have cost read from the cache. Causes: the model changed, the context was
-    trimmed (it shrank a little: old content cleared near the limit), or nothing visible in the logs."""
+    trimmed (it shrank a little: old content cleared near the limit), or nothing visible in the logs.
+    Recent Claude Code versions write the real reason (message.diagnostics.cache_miss_reason); when it is there it
+    wins over the guess, and a cache the server no longer had is reported apart, since nothing you do avoids it."""
     causes = {}
+    known = 0
     for rows in chain.values():
         for p, r in zip(rows, rows[1:]):
             if not (p["t"] and r["t"]) or (r["t"] - p["t"]).total_seconds() >= 300:
                 continue
             if r["cw"] <= 20000 or r["cw"] <= 0.5 * r["ctx"] or not (0.6 * p["ctx"] <= r["ctx"] <= 1.5 * p["ctx"]):
                 continue
-            k = "model" if r["model"] != p["model"] else "trim" if r["ctx"] < 0.95 * p["ctx"] else "other"
+            k = MISS_CAUSES.get(r.get("miss"))
+            if k:
+                known += 1
+            else:
+                k = "model" if r["model"] != p["model"] else "trim" if r["ctx"] < 0.95 * p["ctx"] else "other"
             c = causes.setdefault(k, {"n": 0, "cost": 0.0, "sessions": set(), "days": set()})
             c["n"] += 1
             c["cost"] += max(r["loss"] or 0, 0)
             c["sessions"].add(r["session"])
             c["days"].add(r["day"])
+    evicted = causes.pop("evicted", None)
     if not causes:
         return None
     total = sum(c["cost"] for c in causes.values())
@@ -1020,8 +1038,14 @@ def cache_miss_rec(con, chain):
     main = max(causes, key=lambda k: causes[k]["cost"])
     names = {"model": tr("model changed mid-session", "cambio de modelo a mitad de sesión"),
              "trim": tr("context trimmed near the limit", "contexto recortado cerca del límite"),
+             "config": tr("system prompt or tools changed (MCP, plugins, CLAUDE.md, an update…)",
+                          "cambió el prompt de sistema o las herramientas (MCP, plugins, CLAUDE.md, una actualización…)"),
              "other": tr("no visible cause (MCP or plugins changed, an update…)", "sin causa visible (cambio de MCP o plugins, una actualización…)")}
     parts = "; ".join(f"{names[k]}: {c['n']} ({money(c['cost'], 1)})" for k, c in sorted(causes.items(), key=lambda x: -x[1]["cost"]))
+    if evicted:
+        parts += tr(f". Not counted: {evicted['n']} the server had already dropped ({money(evicted['cost'], 1)}), nothing to change there",
+                    f". Sin contar: {evicted['n']} que el servidor ya había descartado ({money(evicted['cost'], 1)}), ahí no hay nada que cambiar")
+    exact = known and known >= 0.8 * (n + (evicted or {}).get("n", 0))
     action = {
         "model": tr("Pick the model when the session starts and keep it: every switch (/model, plan modes that change model) "
                     "starts the cache from zero for the whole conversation. If you need another model, open a new session.",
@@ -1031,6 +1055,10 @@ def cache_miss_rec(con, chain):
                    "written again, several times. Compact or /clear earlier (autoCompactWindow lower, e.g. 300000).",
                    "No dejes que las sesiones se acerquen al límite de contexto: entonces se borra contenido antiguo y la caché "
                    "entera se vuelve a escribir, varias veces. Compacta o haz /clear antes (autoCompactWindow más bajo, p. ej. 300000)."),
+        "config": tr("Avoid changing MCP servers, plugins, CLAUDE.md or settings in the middle of a long session, and start a new "
+                     "one after updating Claude Code: any change in the tools or the system prompt invalidates the cache.",
+                     "Evita cambiar servidores MCP, plugins, CLAUDE.md o ajustes en mitad de una sesión larga, y empieza una nueva "
+                     "después de actualizar Claude Code: cualquier cambio en las herramientas o el prompt de sistema invalida la caché."),
         "other": tr("Avoid changing MCP servers, plugins or settings in the middle of a long session, and start a new one after "
                     "updating Claude Code: any change in the tools or the system prompt invalidates the cache.",
                     "Evita cambiar servidores MCP, plugins o ajustes en mitad de una sesión larga, y empieza una nueva después "
@@ -1044,7 +1072,8 @@ def cache_miss_rec(con, chain):
         "status": "todo", "impact": total,
         "impact_note": tr("measured: each rewrite minus what those tokens cost read from the cache",
                           "medido: cada reescritura menos lo que esos tokens cuestan leídos de la caché"),
-        "confidence": tr("high for the amount, medium for the cause", "alta en el importe, media en la causa"),
+        "confidence": tr("high: Claude Code logs the cause", "alta: la causa la registra Claude Code") if exact else
+                      tr("high for the amount, medium for the cause", "alta en el importe, media en la causa"),
         "evidence": tr(f"{n} time(s) a request wrote the whole conversation to the cache again less than 5 minutes after the "
                        f"previous one, in {len(sessions)} session(s): {money(total, 1)}. By cause: {parts}.",
                        f"{n} vez(es) una petición volvió a escribir toda la conversación en la caché menos de 5 minutos después "
