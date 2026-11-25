@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import sys
 import threading
@@ -173,6 +174,7 @@ def connect():
         con.execute("ALTER TABLE msgs ADD COLUMN branch TEXT")
         con.execute("UPDATE files SET offset=0")  # read the history again to fill the branch and the request shapes
         con.commit()
+    con.execute("CREATE TABLE IF NOT EXISTS applied(id TEXT PRIMARY KEY, at TEXT, day TEXT, prev TEXT, backup TEXT)")
     return con
 
 
@@ -743,6 +745,7 @@ def data(days, client, cut=CUT_DEFAULT):
     res["currency"] = currency()
     res["lang"] = lang()
     attach_history(con, res["recs"])
+    attach_applied(con, res["recs"])
     rf = recs_file_path()
     res["recs_file"] = "~" + rf[len(HOME):] if rf.startswith(HOME + os.sep) else rf
     con.close()
@@ -898,6 +901,108 @@ def mcp_rec(con, w, a, fx):
                      f"Mira dónde está configurado el servidor MCP {srv} (~/.claude.json, .mcp.json o un plugin) y propón cómo "
                      "activarlo solo en los proyectos que lo usan. Enséñame el diff antes de guardar."),
     }
+# Recommendations the dashboard can apply itself: always a fixed change decided here, never a value sent by the page
+APPLY = {
+    "ctx": {"autoCompactWindow": 300000},
+    "subagent-model": {"env.CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
+}
+_ABSENT = {"__tokenometro__": "absent"}
+
+
+def _dig(d, path, value=None, mode="get"):
+    keys = path.split(".")
+    for k in keys[:-1]:
+        if mode == "set" and not isinstance(d.get(k), dict):
+            d[k] = {}
+        d = d.get(k) if isinstance(d.get(k), dict) else {}
+    if mode == "get":
+        return d.get(keys[-1], _ABSENT)
+    if mode == "set":
+        d[keys[-1]] = value
+    else:
+        d.pop(keys[-1], None)
+
+
+def change_settings(fn):
+    """Edit ~/.claude/settings.json the safe way: a dated backup first, then write aside and swap."""
+    path = os.path.join(HOME, ".claude", "settings.json")
+    s = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            s = json.load(f)
+    if not isinstance(s, dict):
+        raise ValueError("settings.json is not a JSON object")
+    backup = ""
+    if os.path.exists(path):
+        backup = path + ".bak-tokenometro-" + datetime.now().strftime("%Y%m%d%H%M%S")
+        shutil.copy2(path, backup)
+    fn(s)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp-tokenometro"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(s, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+    return backup
+
+
+def apply_rec(rid):
+    if rid not in APPLY:
+        raise ValueError("this recommendation can't be applied from the dashboard")
+    with _lock:
+        con = connect()
+        try:
+            if con.execute("SELECT 1 FROM applied WHERE id=?", (rid,)).fetchone():
+                return
+            prev = {}
+
+            def fn(s):
+                for k, v in APPLY[rid].items():
+                    prev[k] = _dig(s, k)
+                    _dig(s, k, v, "set")
+            backup = change_settings(fn)
+            now = datetime.now()
+            con.execute("INSERT INTO applied VALUES(?,?,?,?,?)",
+                        (rid, now.isoformat(timespec="seconds"), now.strftime("%Y-%m-%d"), json.dumps(prev), backup))
+            con.commit()
+        finally:
+            con.close()
+
+
+def undo_rec(rid):
+    """Put back what was there before, key by key, only where the value is still the one we set:
+    anything you changed by hand afterwards is yours and stays."""
+    with _lock:
+        con = connect()
+        try:
+            row = con.execute("SELECT prev FROM applied WHERE id=?", (rid,)).fetchone()
+            if not row or rid not in APPLY:
+                raise ValueError("nothing to undo")
+            prev = json.loads(row[0])
+
+            def fn(s):
+                for k, v in APPLY[rid].items():
+                    if _dig(s, k) == v:
+                        _dig(s, k, mode="del") if prev.get(k) == _ABSENT else _dig(s, k, prev.get(k), "set")
+            change_settings(fn)
+            con.execute("DELETE FROM applied WHERE id=?", (rid,))
+            con.commit()
+        finally:
+            con.close()
+
+
+def attach_applied(con, recs):
+    """Mark what can be applied with one click and, for what was, compare its metric before and after that day."""
+    done = {r["id"]: r for r in q(con, "SELECT id, day FROM applied")}
+    for x in recs:
+        a = done.get(x["id"])
+        x["can_apply"] = x["id"] in APPLY and not a and x["status"] == "todo"
+        if x["id"] in APPLY:
+            x["change"] = ", ".join(f"{k.split('.')[-1]}: {json.dumps(v)}" for k, v in APPLY[x["id"]].items())
+        if a:
+            m = q(con, """SELECT AVG(CASE WHEN day < ? THEN metric END) before, AVG(CASE WHEN day >= ? THEN metric END) after,
+                SUM(day >= ?) days FROM recs_hist WHERE id=? AND day >= date(?, '-14 days')""",
+                  [a["day"], a["day"], a["day"], x["id"], a["day"]])[0]
+            x["applied"] = {"day": a["day"], "before": m["before"], "after": m["after"], "days": m["days"] or 0}
 
 
 def session_detail(sid):
@@ -1463,6 +1568,37 @@ def recommendations(con, w, a, cut, k, C, T, ctx):
                          "línea a ~/.claude/CLAUDE.md para que se usen las copias -sonnet salvo que pida Opus, y dime cómo invocarlas."),
         })
 
+    # 3b) No default model for subagents: they inherit the main one, often Opus
+    mine = con.execute("SELECT day FROM applied WHERE id='subagent-model'").fetchone()
+    if (not cfg["subagent_model"] and by_type) or mine:
+        since = mine[0] if mine else cut
+        after = q(con, f"""SELECT COALESCE(SUM({C}),0) c FROM msgs WHERE sidechain=1 AND model LIKE '%opus%' AND day >= ? AND {w}""",
+                  [since] + a)[0]["c"] if mine else sum(by_type.values())
+        recs.append({
+            "id": "subagent-model", "title": tr("Subagents run on the main model (Opus) by default",
+                                                "Los subagentes usan por defecto el modelo principal (Opus)"),
+            "status": ("ok" if after < 0.5 else "warn") if mine else "todo", "impact": after * 0.5,
+            "impact_note": tr("Sonnet costs half of Opus (prices.json)", "Sonnet cuesta la mitad que Opus (prices.json)"),
+            "confidence": tr("medium", "media"),
+            "evidence": tr(f"Since {since}, subagents on Opus cost {money(after, 2)}. Without CLAUDE_CODE_SUBAGENT_MODEL each subagent "
+                           "uses the model of the session that launched it, even for searching or reading files.",
+                           f"Desde el {since}, los subagentes con Opus costaron {money(after, 2)}. Sin CLAUDE_CODE_SUBAGENT_MODEL cada subagente "
+                           "usa el modelo de la sesión que lo lanza, aunque solo sea para buscar o leer ficheros."),
+            "action": tr('Set "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} in ~/.claude/settings.json; an agent that needs Opus can still ask for it.',
+                         'Pon "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} en ~/.claude/settings.json; un agente que necesite Opus puede seguir pidiéndolo.'),
+            "verify": tr("«Costliest subagents» shows Sonnet and this card's amount drops.",
+                         "«Subagentes más caros» muestra Sonnet y el importe de esta tarjeta baja."),
+            "tradeoff": tr("Subagents doing reviews or hard research may do a bit worse.",
+                           "Los subagentes que revisan código o investigan algo difícil pueden hacerlo algo peor."),
+            "metric": round(after, 2), "metric_money": True,
+            "metric_label": tr(f"{sym()} of subagents on Opus", f"{sym()} de subagentes con Opus"),
+            "tools": [],
+            "prompt": tr('With the update-config skill, add "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} to ~/.claude/settings.json '
+                         "without touching any other key. Show me the diff before saving.",
+                         'Con la skill update-config, añade "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} a ~/.claude/settings.json '
+                         "sin tocar ninguna otra clave. Enséñame el diff antes de guardar."),
+        })
+
     # 4) Large and repeated reads of the same file
     rr = q(con, f"""SELECT session, input_head f, COUNT(*) n, SUM(result_chars) ch FROM tools
                     WHERE name='Read' AND result_chars > 20000 AND input_head IS NOT NULL AND {w}
@@ -1779,7 +1915,8 @@ th.s:focus-visible,tr.click:focus-visible{outline:2px solid var(--c);outline-off
 .rec .hist i.h-todo{background:var(--f)}.rec .hist i.h-warn{background:var(--a)}.rec .hist i.h-ok{background:var(--b)}.rec .hist i.h-info{background:var(--c)}
 .rec dd.tools{display:flex;flex-direction:column;gap:3px}.rec dd.tools b{font-weight:600}.rec dd.tools em{font-style:normal;color:var(--mut);font-size:12px}
 .rec div.pr{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:6px 10px;display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px;color:var(--mut)}
-.rec div.pr code{font-size:11.5px;color:var(--fg,inherit);overflow-wrap:anywhere}.rec div.pr .cp{flex:none}
+.rec div.pr code{font-size:11.5px;color:var(--fg,inherit);overflow-wrap:anywhere}.rec div.pr .cp,.rec div.pr .ap{flex:none}
+.rec div.ap-row{border-color:var(--a);color:var(--fg,inherit)}
 .pager{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:8px;font-size:12px;color:var(--mut)}
 .pager button{font:600 14px/1 var(--fb);width:28px;height:26px;border:1px solid var(--line);background:var(--card);color:inherit;border-radius:8px;cursor:pointer}
 .pager button:disabled{opacity:.35;cursor:default}.pager button:not(:disabled):hover{border-color:var(--a)}
@@ -1791,8 +1928,8 @@ th.s:focus-visible,tr.click:focus-visible{outline:2px solid var(--c);outline-off
 .rec details.pr{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:6px 10px}
 .rec details.pr summary{margin:0;display:flex;justify-content:space-between;align-items:center;gap:10px;color:var(--fg,inherit)}
 .rec details.pr pre{white-space:pre-wrap;font:12px/1.55 var(--fb);margin:8px 0 2px;color:var(--mut)}
-.rec .cp{font:600 12px var(--fb);border:1px solid var(--line);background:var(--card);color:inherit;border-radius:8px;padding:3px 10px;cursor:pointer}
-.rec .cp:hover{border-color:var(--a)}.rec .cp.ok{border-color:var(--b);color:var(--b)}
+.rec .cp,.rec .ap{font:600 12px var(--fb);border:1px solid var(--line);background:var(--card);color:inherit;border-radius:8px;padding:3px 10px;cursor:pointer}
+.rec .cp:hover,.rec .ap:hover{border-color:var(--a)}.rec .ap:not([data-u]){background:var(--a);border-color:var(--a);color:var(--card)}.rec .ap:disabled{opacity:.5;cursor:wait}.rec .cp.ok{border-color:var(--b);color:var(--b)}
 .rec.chg{animation:chg 2.4s var(--ease)}@keyframes chg{0%,30%{box-shadow:0 0 0 2px var(--a)}100%{box-shadow:0 0 0 0 transparent}}
 .rec details summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:8px}.rec details[open] dl{animation:fade .3s var(--ease)}
 @keyframes fade{from{opacity:0;transform:translateY(-3px)}}
@@ -1858,7 +1995,7 @@ en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',
  plan_nopct:'{n} tokens. The plan % only exists with a subscription (with the API there is no 5 h or weekly limit) and Claude Code only gives it to the statusLine and plugins: enable statusline.py (see README) or the sub-meter plugin and the % and the estimated cap will show up here.',
  plan_src:'Your plan usage (from {src}, read at {at})',plan_ago:', {t} ago',five_h:'5 hours',week:'Week',
  eta:'At the current pace you reach 100 % on {eta}, before it resets.',noeta:'At the current pace you will not run out before it resets ({reset}).',resets:'resets in {t} ({at})',
- copied:'Copied',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
+ copied:'Copied',apply:'Apply',undo:'Undo',apply_hint:'Tokenometro can do it for you: sets {c} in ~/.claude/settings.json (a backup is saved first).',applied_on:'Applied from here on {d} ({c}).',applied_ba:'Before: {a} · after: {b} ({n} day(s)).',applied_wait:'The before/after appears from tomorrow.',undo_confirm:'Put back the previous value in ~/.claude/settings.json?',apply_failed:'Could not change settings.json',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
  al_unp:'{n} model(s) without a price',
  al_unpriced:'Estimated prices for <code>{m}</code>: not in prices.json, so they are valued at the <code>_default</code> price. Add them to prices.json for exact figures.',
  csv_hint:'Monthly report to share or bill: tokens and cost per session or per client.',csv_sessions:'CSV by session',csv_clients:'CSV by client',month_label:'Month of the CSV report',
@@ -1888,7 +2025,7 @@ es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días
  plan_nopct:'{n} tokens. El % del plan solo existe con suscripción (con API no hay límite de 5 h ni semanal) y Claude Code solo se lo da a la statusLine y a los plugins: activa statusline.py (ver README) o el plugin sub-meter y aquí saldrá el % y el techo estimado.',
  plan_src:'Uso de tu plan (dato de {src}, leído a las {at})',plan_ago:', hace {t}',five_h:'5 horas',week:'Semana',
  eta:'Al ritmo actual llegarás al 100 % el {eta}, antes de que se reinicie.',noeta:'Al ritmo actual no lo agotarás antes de que se reinicie ({reset}).',resets:'se reinicia en {t} ({at})',
- copied:'Copiado',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
+ copied:'Copiado',apply:'Aplicar',undo:'Deshacer',apply_hint:'Tokenometro puede hacerlo por ti: pone {c} en ~/.claude/settings.json (antes guarda una copia).',applied_on:'Aplicada desde aquí el {d} ({c}).',applied_ba:'Antes: {a} · después: {b} ({n} día(s)).',applied_wait:'El antes/después sale a partir de mañana.',undo_confirm:'¿Volver a poner el valor anterior en ~/.claude/settings.json?',apply_failed:'No se pudo cambiar settings.json',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
  al_unp:'{n} modelo(s) sin precio',
  al_unpriced:'Precios estimados para <code>{m}</code>: no están en prices.json y se valoran al precio de <code>_default</code>. Añádelos a prices.json para tener cifras exactas.',
  csv_hint:'Informe mensual para compartir o repercutir: tokens y coste por sesión o por cliente.',csv_sessions:'CSV por sesión',csv_clients:'CSV por cliente',month_label:'Mes del informe CSV',
@@ -1973,6 +2110,12 @@ function plan(p){const c=$('plancard');c.hidden=!p;if(!p)return;
   return '<div class="pl'+lv+'"><div class="gh"><b>'+n+'</b><span class="p">'+t('resets',{t:hm(Math.max(0,w.reset_min)),at:w.reset})+'</span><span class="v">'+w.pct.toFixed(0)+' %</span></div>'+
    '<div class="track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+w.pct+'" aria-label="'+n+'"><i class="fill" style="--w:'+Math.min(100,w.pct)+'%"></i></div>'+
    '<div class="gm">'+cap+'</div></div>'}).join('')}
+const PTOK='__PAGETOKEN__';
+document.addEventListener('click',async e=>{const b=e.target.closest('.ap');if(!b)return;e.preventDefault();e.stopPropagation();
+ if(b.dataset.u&&!confirm(t('undo_confirm')))return;
+ b.disabled=true;let res;try{res=await fetch(b.dataset.u?'/api/undo':'/api/apply',{method:'POST',headers:{'Content-Type':'application/json','X-Tokenometro-Page':PTOK},body:JSON.stringify({id:b.dataset.id})});res=await res.json()}catch(_){res={ok:false}}
+ if(!res.ok){b.disabled=false;alert(t('apply_failed')+(res.error?': '+res.error:''));return}
+ load()});
 document.addEventListener('click',async e=>{const b=e.target.closest('.cp');if(!b)return;e.preventDefault();e.stopPropagation();
  const x=(RECS[+b.dataset.i]||{}).prompt||'';try{await navigator.clipboard.writeText(x)}catch(_){const a=document.createElement('textarea');a.value=x;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}
  const o=b.textContent;b.textContent=t('copied');b.classList.add('ok');setTimeout(()=>{b.textContent=o;b.classList.remove('ok')},1600)});
@@ -2054,6 +2197,8 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
   '<dl><dt>'+t('evidence')+'</dt><dd>'+esc(x.evidence)+'</dd><dt>'+t('what_to_do')+'</dt><dd>'+esc(x.action)+'</dd>'+
   ((x.tools||[]).length?'<dt>'+t('with_')+'</dt><dd class="tools">'+x.tools.map(o=>'<span><b>'+esc(o.n)+'</b> <em>'+esc(o.k)+'</em> '+esc(o.why)+' <em>· '+esc(o.cost)+'</em></span>').join('')+'</dd>':'')+
   '<dt>'+t('check')+'</dt><dd>'+esc(x.verify)+'</dd></dl>'+
+  (x.can_apply?'<div class="pr ap-row"><span>'+t('apply_hint',{c:'<code>'+esc(x.change)+'</code>'})+'</span><button type="button" class="ap" data-id="'+esc(x.id)+'">'+t('apply')+'</button></div>':'')+
+  (x.applied?'<div class="pr ap-row"><span>'+t('applied_on',{d:dm(x.applied.day),c:'<code>'+esc(x.change||'')+'</code>'})+(x.applied.before!=null&&x.applied.after!=null&&x.applied.days>0?' '+t('applied_ba',{a:fm(x.metric_money?x.applied.before*CUR.rate:x.applied.before),b:fm(x.metric_money?x.applied.after*CUR.rate:x.applied.after),n:x.applied.days}):' '+t('applied_wait'))+'</span><button type="button" class="ap" data-u="1" data-id="'+esc(x.id)+'">'+t('undo')+'</button></div>':'')+
   (x.prompt?'<div class="pr"><span>'+t('prompt_for')+' <code>'+esc(FILE)+'</code></span><button type="button" class="cp" data-i="'+ix+'">'+t('copy_prompt')+'</button></div>':'')+
   '<details data-k="d-'+x.id+'"'+(openK.has('d-'+x.id)?' open':'')+'><summary>'+t('tradeoff_h')+'</summary><dl><dt>'+t('tradeoff')+'</dt><dd>'+esc(x.tradeoff)+'</dd>'+(x.impact_note?'<dt>'+t('calc')+'</dt><dd>'+esc(x.impact_note)+'</dd>':'')+'<dt>'+t('confidence')+'</dt><dd>'+esc(x.confidence)+'</dd></dl></details></div>'}).join('')||'<p class="mut">'+t('nothing')+'</p>';
  const B=r.compare.before,A=r.compare.after;
@@ -2094,12 +2239,42 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def do_GET(self):
+    def _local(self):
         # a web page that points its own domain at 127.0.0.1 (DNS rebinding) would send its domain as Host
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0] if not (self.headers.get("Host") or "").startswith("[") \
             else (self.headers.get("Host") or "").split("]")[0] + "]"
         if host not in ("127.0.0.1", "localhost", "[::1]"):
             self.send_error(403, "Tokenometro only answers on 127.0.0.1 or localhost")
+            return False
+        return True
+
+    def do_POST(self):
+        """Apply or undo a recommendation. Needs the token embedded in our own page: another site can't read
+        that page, and can't send the custom header without a CORS preflight we never answer."""
+        if not self._local():
+            return
+        u = urlparse(self.path)
+        ok = hmac.compare_digest((self.headers.get("X-Tokenometro-Page") or "").encode("utf-8", "replace"), _PAGE_TOKEN.encode())
+        origin = self.headers.get("Origin")
+        if not ok or (origin and urlparse(origin).hostname not in ("127.0.0.1", "localhost", "::1")):
+            return self.send_error(403)
+        if u.path not in ("/api/apply", "/api/undo"):
+            return self.send_error(404)
+        try:
+            n = min(int(self.headers.get("Content-Length") or 0), 4096)
+            rid = json.loads(self.rfile.read(n) or b"{}").get("id")
+            (apply_rec if u.path == "/api/apply" else undo_rec)(str(rid))
+            self._send(json.dumps({"ok": True}), "application/json")
+        except (ValueError, OSError, AttributeError) as e:
+            self.send_response(400)
+            b = json.dumps({"ok": False, "error": str(e)}).encode()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+    def do_GET(self):
+        if not self._local():
             return
         u = urlparse(self.path)
         if u.path == "/api/quit":
@@ -2113,7 +2288,7 @@ class H(BaseHTTPRequestHandler):
             return
         try:
             if u.path == "/":
-                self._send(PAGE.replace("__DEFLANG__", LANG_DEFAULT), "text/html; charset=utf-8")
+                self._send(PAGE.replace("__DEFLANG__", LANG_DEFAULT).replace("__PAGETOKEN__", _PAGE_TOKEN), "text/html; charset=utf-8")
             elif u.path == "/api/data":
                 qs = parse_qs(u.query)
                 days = max(1, min(365, int(qs.get("days", ["7"])[0])))
@@ -2178,6 +2353,7 @@ def loop():
 
 
 _TOKEN = ""
+_PAGE_TOKEN = secrets.token_hex(16)  # for the dashboard's own buttons; the stop token never goes into the page
 
 
 def write_control():

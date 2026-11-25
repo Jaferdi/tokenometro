@@ -432,6 +432,71 @@ class DemoAndServerTest(Base):
             srv.server_close()
 
 
+class ApplyTest(Base):
+    def settings(self, value=None):
+        path = os.path.join(self.home, ".claude", "settings.json")
+        if value is not None:
+            with open(path, "w") as f:
+                json.dump(value, f)
+        return read(path)
+
+    def test_apply_sets_the_key_keeps_the_rest_and_undo_puts_it_back(self):
+        self.settings({"model": "opus", "env": {"FOO": "1"}})
+        self.t.apply_rec("subagent-model")
+        self.assertEqual(self.settings(), {"model": "opus", "env": {"FOO": "1", "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"}})
+        self.assertTrue([f for f in os.listdir(os.path.join(self.home, ".claude")) if ".bak-tokenometro-" in f])
+        self.t.apply_rec("subagent-model")  # twice is once
+        self.t.undo_rec("subagent-model")
+        self.assertEqual(self.settings(), {"model": "opus", "env": {"FOO": "1"}})
+
+    def test_undo_leaves_what_you_changed_by_hand(self):
+        self.settings({"autoCompactWindow": 200000})
+        self.t.apply_rec("ctx")
+        self.assertEqual(self.settings()["autoCompactWindow"], 300000)
+        self.settings({"autoCompactWindow": 250000})
+        self.t.undo_rec("ctx")
+        self.assertEqual(self.settings()["autoCompactWindow"], 250000)
+
+    def test_only_known_recommendations(self):
+        with self.assertRaises(ValueError):
+            self.t.apply_rec("anything")
+        with self.assertRaises(ValueError):
+            self.t.undo_rec("ctx")
+
+    def test_card_offers_apply_and_then_shows_it_applied(self):
+        recs = [{"id": "ctx", "status": "todo"}, {"id": "reads", "status": "todo"}]
+        con = self.t.connect()
+        self.t.attach_applied(con, recs)
+        self.assertEqual([r["can_apply"] for r in recs], [True, False])
+        self.t.apply_rec("ctx")
+        self.t.attach_applied(con, recs)
+        con.close()
+        self.assertFalse(recs[0]["can_apply"])
+        self.assertEqual(recs[0]["applied"]["day"], datetime.now().strftime("%Y-%m-%d"))
+
+    def test_http_apply_needs_the_page_token(self):
+        self.settings({})
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), self.t.H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        post = lambda headers: urllib.request.urlopen(urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/apply", data=b'{"id": "ctx"}', headers=headers, method="POST"), timeout=10)
+        try:
+            page = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10).read().decode()
+            self.assertIn(self.t._PAGE_TOKEN, page)
+            for headers in ({}, {"X-Tokenometro-Page": "wrong"},
+                            {"X-Tokenometro-Page": self.t._PAGE_TOKEN, "Origin": "https://evil.example"}):
+                with self.assertRaises(urllib.error.HTTPError) as e:
+                    post(headers)
+                self.assertEqual(e.exception.code, 403)
+            self.assertNotIn("autoCompactWindow", self.settings())
+            self.assertEqual(json.loads(post({"X-Tokenometro-Page": self.t._PAGE_TOKEN}).read()), {"ok": True})
+            self.assertEqual(self.settings()["autoCompactWindow"], 300000)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 class ReportTest(Base):
     clients = {"clients": {"acme": ["/work/"]}}
 
