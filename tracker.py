@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local Claude Code token tracker.
 
-Reads the transcripts in ~/.claude/projects (read-only, incremental) and serves a
+Reads the transcripts in ~/.claude/projects (or CLAUDE_CONFIG_DIR, ~/.config/claude; read-only, incremental) and serves a
 dashboard at http://127.0.0.1:7878. No dependencies: standard library only.
 
   python3 tracker.py serve      # periodic ingest + dashboard
@@ -25,7 +25,33 @@ from urllib.parse import parse_qs, urlparse
 
 HOME = os.path.expanduser("~")
 BASE = os.path.dirname(os.path.abspath(__file__))
-PROJECTS = os.path.join(HOME, ".claude", "projects")
+
+
+def _claude_dirs():
+    """Claude Code data folders, like Claude Code itself: CLAUDE_CONFIG_DIR (one folder or a comma-separated list)
+    replaces the defaults; otherwise ~/.config/claude (newer installs) and ~/.claude. Only folders with projects/
+    count, so an empty leftover folder does not hide the real one."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    dirs = [os.path.expanduser(p.strip()) for p in env.split(",") if p.strip()] or \
+        [os.path.join(HOME, ".config", "claude"), os.path.join(HOME, ".claude")] + _windows_dirs_from_wsl()
+    return [d for d in dirs if os.path.isdir(os.path.join(d, "projects"))] or dirs[-1:]
+
+
+def _windows_dirs_from_wsl(root="/mnt"):
+    """Inside WSL, Claude Code may also run on the Windows side (C:\\Users\\<you>\\.claude, seen as
+    /mnt/c/Users/<you>/.claude). Only taken when exactly one Windows user has it, so a shared PC never mixes
+    someone else's usage in; otherwise CLAUDE_CONFIG_DIR says which one."""
+    if not (os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
+        return []
+    found = glob.glob(os.path.join(root, "*", "Users", "*", ".claude", "projects"))
+    return [os.path.dirname(found[0])] if len(found) == 1 else []
+
+
+CLAUDE_DIRS = _claude_dirs()
+# settings.json, CLAUDE.md, plugins and skills live in the first folder that has a settings.json
+CLAUDE_HOME = next((d for d in CLAUDE_DIRS if os.path.isfile(os.path.join(d, "settings.json"))), CLAUDE_DIRS[0])
+PROJECTS_DIRS = [os.path.join(d, "projects") for d in CLAUDE_DIRS]
+PROJECTS = PROJECTS_DIRS[0]
 DB = os.path.join(BASE, "usage.db")
 PRICES = os.path.join(BASE, "prices.json")
 CONTROL = os.path.join(BASE, ".control")  # port, pid and the token that lets the installer stop this server
@@ -398,7 +424,7 @@ def ingest():
         con = connect()
         known = {p: (o, h) for p, o, h in con.execute("SELECT path, offset, head FROM files")}
         n_lines = 0
-        for root, _dirs, files in os.walk(PROJECTS):
+        for root, _dirs, files in (w for d in PROJECTS_DIRS for w in os.walk(d)):
             for fn in files:
                 if not fn.endswith(".jsonl"):
                     continue
@@ -427,7 +453,7 @@ def backfill():
     """Fill input_head on already-ingested calls (one-off, reads every transcript)."""
     con = connect()
     n = 0
-    for root, _dirs, files in os.walk(PROJECTS):
+    for root, _dirs, files in (w for d in PROJECTS_DIRS for w in os.walk(d)):
         for fn in files:
             if not fn.endswith(".jsonl"):
                 continue
@@ -453,7 +479,7 @@ def backfill():
 
 
 def agent_meta(session, agent):
-    for f in glob.glob(os.path.join(PROJECTS, "*", session or "?", "subagents", f"agent-{agent}.meta.json")):
+    for f in (f for d in PROJECTS_DIRS for f in glob.glob(os.path.join(d, "*", session or "?", "subagents", f"agent-{agent}.meta.json"))):
         try:
             return read_json(f)
         except Exception:
@@ -918,7 +944,7 @@ def fixed_cost(con, w, a, T, total):
         for k, v in json.loads(s["parts"] or "{}").items():
             parts[k] = parts.get(k, 0) + v / 4 / n
     if n:
-        g = claude_md_chars(os.path.join(HOME, ".claude", "CLAUDE.md")) / 4
+        g = claude_md_chars(os.path.join(CLAUDE_HOME, "CLAUDE.md")) / 4
         if g and r["base"] - sum(parts.values()) > g:
             parts["claude_md"] = g
     known = sum(parts.values())
@@ -1319,7 +1345,7 @@ def _dig(d, path, value=None, mode="get"):
 
 def change_settings(fn):
     """Edit ~/.claude/settings.json the safe way: a dated backup first, then write aside and swap."""
-    path = os.path.join(HOME, ".claude", "settings.json")
+    path = os.path.join(CLAUDE_HOME, "settings.json")
     s = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -1441,7 +1467,7 @@ def read_config():
            "opus_plugin_agents": [], "read_rule": False, "read_guard": False, "gap_hook": False,
            "statusline": False, "caveman": False, "cbm": False}
     try:
-        st = read_json(os.path.join(HOME, ".claude", "settings.json"))
+        st = read_json(os.path.join(CLAUDE_HOME, "settings.json"))
     except Exception:
         st = {}
     cfg["autoCompactWindow"] = st.get("autoCompactWindow")
@@ -1451,7 +1477,7 @@ def read_config():
     for key, on in (st.get("enabledPlugins") or {}).items():
         if on and "@" in key:
             name, mkt = key.split("@", 1)
-            vers = sorted(glob.glob(os.path.join(HOME, ".claude", "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
+            vers = sorted(glob.glob(os.path.join(CLAUDE_HOME, "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
             try:
                 hook_sets.append(read_json(os.path.join(vers[-1], "hooks", "hooks.json")).get("hooks") or {})
             except Exception:
@@ -1462,7 +1488,7 @@ def read_config():
     # A plugin (e.g. context-meter) can show the context without touching statusLine
     cfg["ctx_plugins"] = [k.split("@")[0] for k, on in (st.get("enabledPlugins") or {}).items()
                           if on and re.search(r"context[-_]?meter|status[-_]?line|ctx[-_]?bar", k.split("@")[0], re.I)]
-    cfg["caveman"] = os.path.isdir(os.path.join(HOME, ".claude", "skills", "caveman"))
+    cfg["caveman"] = os.path.isdir(os.path.join(CLAUDE_HOME, "skills", "caveman"))
     cfg["cbm"] = os.path.exists(os.path.join(HOME, ".local", "bin", "codebase-memory-mcp"))
     cfg["bashOutputMaxChars"] = st.get("bashOutputMaxChars")
     cfg["subagent_model"] = (st.get("env") or {}).get("CLAUDE_CODE_SUBAGENT_MODEL")
@@ -1471,7 +1497,7 @@ def read_config():
         if not on or "@" not in key:
             continue
         name, mkt = key.split("@", 1)
-        vers = sorted(glob.glob(os.path.join(HOME, ".claude", "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
+        vers = sorted(glob.glob(os.path.join(CLAUDE_HOME, "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
         for f in glob.glob(os.path.join(vers[-1], "agents", "*.md")) if vers else []:
             try:
                 head = read_head(f, 1500)
@@ -1481,7 +1507,7 @@ def read_config():
             if m and "opus" in m.group(1):
                 cfg["opus_plugin_agents"].append(f"{name}:{os.path.basename(f)[:-3]}")
     try:
-        cfg["read_rule"] = "offset" in read_head(os.path.join(HOME, ".claude", "CLAUDE.md"), -1)
+        cfg["read_rule"] = "offset" in read_head(os.path.join(CLAUDE_HOME, "CLAUDE.md"), -1)
     except OSError:
         pass
     return cfg
@@ -1585,7 +1611,7 @@ def model_fit(con, w, a, C):
     return out
 
 
-SUBMETER_GLOB = os.path.join(HOME, ".claude", "plugins", "store", "sub-meter_*.json")
+SUBMETER_GLOB = os.path.join(CLAUDE_HOME, "plugins", "store", "sub-meter_*.json")
 PLAN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plan.json")  # written by statusline.py
 
 
@@ -1658,7 +1684,7 @@ def plan_info(con, C, tot, live):
     return res
 
 
-REPORTS = os.path.join(HOME, ".claude", "reports")
+REPORTS = os.path.join(CLAUDE_HOME, "reports")
 
 
 def recs_file_path(day=None):
