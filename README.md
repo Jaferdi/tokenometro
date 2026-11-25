@@ -112,6 +112,7 @@ Each card comes from a rule that crosses your data for the period with your actu
 - **Metric and history**: every hour a daily snapshot of all cards is saved (`recs_hist`). That feeds the squares for the last 14 days, "to do since…" or "good since…", and the trend versus 7 days ago. If a card changes while the dashboard is open, it flashes.
 - **Before / after**: some rules compare against the cut-off date. Until there are 7 days since the cut-off the card shows "Under observation", because with fewer days the kind of task weighs more than the change.
 - **With what**: existing tools or settings that are worth it to fix it.
+- **Apply**: when the fix is a single setting (`autoCompactWindow`, `CLAUDE_CODE_SUBAGENT_MODEL`), the card has an *Apply* button. It saves a dated backup of `~/.claude/settings.json`, changes only that key and, from the next day on, shows the card's metric before and after. *Undo* puts back the previous value, unless you changed it by hand since.
 - **Prompt**: the text to ask Claude to do it is saved to `~/.claude/reports/improvements-YYYY-MM-DD.md` (`mejoras-…` in Spanish) and copied with "Copy prompt".
 
 Current rules: oversized context and compactions, resuming sessions after long pauses (rewrites the cache), subagents running on Opus, reading huge files, showing context in the status line (only if you don't already have a statusLine or a plugin showing it), model output (only above 25% of cost) and cost-effective model.
