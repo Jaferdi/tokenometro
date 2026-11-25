@@ -1,0 +1,15 @@
+name: Idea
+description: Something that would make Tokenometro more useful
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would it help you do
+      description: The question you want the dashboard to answer, or the habit you want to change.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: How you picture it

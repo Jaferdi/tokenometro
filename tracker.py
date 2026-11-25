@@ -26,6 +26,16 @@ DB = os.path.join(BASE, "usage.db")
 PRICES = os.path.join(BASE, "prices.json")
 
 
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def read_head(path, n):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read(n)
+
+
 def _env(name, default):
     """TOKENOMETRO_<X>; the old name CLAUDE_TOKENS_<X> is still accepted."""
     return os.environ.get("TOKENOMETRO_" + name) or os.environ.get("CLAUDE_TOKENS_" + name) or default
@@ -56,7 +66,7 @@ def _cfg_get(raw, new, old, default=None):
 def _load_groups():
     """clients.json: {"clients": {...}, "projects": {...}}. Also accepts the old format (clients at the root)."""
     try:
-        raw = json.load(open(CLIENTS_FILE))
+        raw = read_json(CLIENTS_FILE)
     except Exception:
         raw = {}
     clean = lambda d: {k: ([v] if isinstance(v, str) else list(v)) for k, v in (d or {}).items() if not k.startswith("_")}
@@ -373,7 +383,7 @@ def backfill():
 def agent_meta(session, agent):
     for f in glob.glob(os.path.join(PROJECTS, "*", session or "?", "subagents", f"agent-{agent}.meta.json")):
         try:
-            return json.load(open(f))
+            return read_json(f)
         except Exception:
             pass
     return {}
@@ -381,7 +391,7 @@ def agent_meta(session, agent):
 
 def load_prices():
     try:
-        p = json.load(open(PRICES))
+        p = read_json(PRICES)
     except Exception:
         p = {}
     return p
@@ -688,7 +698,7 @@ def read_config():
            "opus_plugin_agents": [], "read_rule": False, "read_guard": False, "gap_hook": False,
            "statusline": False, "caveman": False, "cbm": False}
     try:
-        st = json.load(open(os.path.join(HOME, ".claude", "settings.json")))
+        st = read_json(os.path.join(HOME, ".claude", "settings.json"))
     except Exception:
         st = {}
     cfg["autoCompactWindow"] = st.get("autoCompactWindow")
@@ -699,7 +709,7 @@ def read_config():
             name, mkt = key.split("@", 1)
             vers = sorted(glob.glob(os.path.join(HOME, ".claude", "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
             try:
-                hook_sets.append(json.load(open(os.path.join(vers[-1], "hooks", "hooks.json"))).get("hooks") or {})
+                hook_sets.append(read_json(os.path.join(vers[-1], "hooks", "hooks.json")).get("hooks") or {})
             except Exception:
                 pass
     cfg["read_guard"] = any("Read" in (m.get("matcher") or "") for h in hook_sets for m in h.get("PreToolUse") or [])
@@ -720,14 +730,14 @@ def read_config():
         vers = sorted(glob.glob(os.path.join(HOME, ".claude", "plugins", "cache", mkt, name, "*")), key=os.path.getmtime)
         for f in glob.glob(os.path.join(vers[-1], "agents", "*.md")) if vers else []:
             try:
-                head = open(f).read(1500)
+                head = read_head(f, 1500)
             except OSError:
                 continue
             m = re.search(r"^model:\s*(\S+)", head, re.M)
             if m and "opus" in m.group(1):
                 cfg["opus_plugin_agents"].append(f"{name}:{os.path.basename(f)[:-3]}")
     try:
-        cfg["read_rule"] = "offset" in open(os.path.join(HOME, ".claude", "CLAUDE.md")).read()
+        cfg["read_rule"] = "offset" in read_head(os.path.join(HOME, ".claude", "CLAUDE.md"), -1)
     except OSError:
         pass
     return cfg
@@ -844,7 +854,7 @@ def plan_info(con, C, tot, live):
     fs = sorted(glob.glob(SUBMETER_GLOB) + glob.glob(PLAN_FILE), key=os.path.getmtime)
     d = None
     try:
-        d = json.load(open(fs[-1])) if fs else None
+        d = read_json(fs[-1]) if fs else None
         at = datetime.fromtimestamp(d["at"] / 1000, timezone.utc) if d else None
     except Exception:
         d = None

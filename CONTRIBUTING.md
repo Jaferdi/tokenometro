@@ -15,12 +15,12 @@ Neither `main` nor `develop` accept direct pushes: everything goes through a pul
 3. Small commits, in English, saying what changes and why.
 4. Before opening the PR:
    ```bash
-   python3 -m py_compile tracker.py statusline.py
+   python3 -m unittest discover -s tests    # standard library only, uses temporary folders
    bash -n install.sh start.sh
-   python3 -c "import json; json.load(open('prices.json')); json.load(open('clients.example.json'))"
+   python3 demo.py                          # look at the dashboard with made-up data
    ```
-   then open the dashboard and check it loads with no errors in the browser console, in both languages and both themes.
-5. Pull request to `develop` with what changes, how it was tested and, if it touches the dashboard, a screenshot without personal data.
+   Check the dashboard loads with no errors in the browser console, in both languages and both themes. CI runs the same tests on Python 3.8 to 3.13, Linux and macOS, plus the installer in a throwaway HOME.
+5. Pull request to `develop` with what changes, how it was tested and, if it touches the dashboard, a screenshot without personal data (take it from `demo.py`).
 
 ## Releases
 

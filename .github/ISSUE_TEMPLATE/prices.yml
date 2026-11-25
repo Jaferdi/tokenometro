@@ -1,0 +1,25 @@
+name: Prices out of date
+description: A model is missing from prices.json or its price changed
+labels: [prices]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Model id
+      placeholder: claude-…
+    validations:
+      required: true
+  - type: textarea
+    id: prices
+    attributes:
+      label: New prices (USD per million tokens)
+      description: Input, output, cache read, cache write 5 min and 1 h.
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Source
+      description: Link to the official pricing page.
+    validations:
+      required: true
