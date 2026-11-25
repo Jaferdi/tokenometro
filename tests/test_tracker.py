@@ -779,6 +779,86 @@ class UpdateTest(Base):
             os.environ.pop("TOKENOMETRO_UPDATE_CHECK", None)
 
 
+class PriceRefreshTest(Base):
+    LITELLM = {
+        "claude-future-9": {"litellm_provider": "anthropic", "input_cost_per_token": 1e-05, "output_cost_per_token": 5e-05,
+                            "cache_read_input_token_cost": 1e-06, "cache_creation_input_token_cost": 1.25e-05},
+        "claude-opus-5-5": {"litellm_provider": "anthropic", "input_cost_per_token": 9e-05, "output_cost_per_token": 9e-04},
+        "claude-x' OR 1=1 --": {"litellm_provider": "anthropic", "input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06},
+        "claude-bad": {"litellm_provider": "anthropic", "input_cost_per_token": "free", "output_cost_per_token": 1e-06},
+        "gpt-9": {"litellm_provider": "openai", "input_cost_per_token": 1e-06, "output_cost_per_token": 1e-06},
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        test = self
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n):
+                return json.dumps(test.LITELLM).encode()
+
+        def fake(req, timeout):
+            self.calls.append(req.full_url)
+            if self.fail:
+                raise OSError("offline")
+            return Resp()
+        self.fail = False
+        self.real = self.t.urllib.request.urlopen
+        self.t.urllib.request.urlopen = fake
+
+    def tearDown(self):
+        self.t.urllib.request.urlopen = self.real
+        os.environ.pop("TOKENOMETRO_PRICE_REFRESH", None)
+        super().tearDown()
+
+    def use(self, *models):
+        self.write("s.jsonl", [record("s1", now_ts(), f"m{i}", m) for i, m in enumerate(models)])
+        self.t.ingest()
+
+    def test_a_model_we_do_not_know_takes_litellm_price_and_ours_win(self):
+        self.use("claude-opus-5-5", "claude-future-9-20270101")
+        self.t.refresh_prices()
+        p = self.t.load_prices()
+        self.assertEqual(p["claude-future-9"], {"input": 10.0, "output": 50.0, "cache_read": 1.0,
+                                                "cache_write_5m": 12.5, "cache_write_1h": 20.0})  # 1h: 2x input
+        self.assertEqual(p["_sources"], {"claude-future-9": "litellm"})
+        self.assertNotEqual(p["claude-opus-5-5"]["input"], 90.0)
+        r = self.t.data(7, self.t.ALL)
+        self.assertEqual(r["unpriced"], [])
+        self.assertEqual(r["litellm"], ["claude-future-9-20270101"])
+
+    def test_unsafe_names_and_values_are_dropped(self):
+        table = self.t._from_litellm(self.LITELLM)
+        self.assertEqual(set(table), {"claude-future-9", "claude-opus-5-5"})
+
+    def test_asks_once_a_day_only_when_needed_and_can_be_turned_off(self):
+        self.use("claude-opus-5-5")
+        self.t.refresh_prices(force=True)
+        self.assertEqual(self.calls, [])  # every model has a price
+        self.use("claude-opus-5-5", "claude-future-9")
+        os.environ["TOKENOMETRO_PRICE_REFRESH"] = "0"
+        self.t.refresh_prices(force=True)
+        self.assertEqual(self.calls, [])
+        del os.environ["TOKENOMETRO_PRICE_REFRESH"]
+        self.t.refresh_prices(force=True)
+        self.t.refresh_prices()
+        self.assertEqual(self.calls, [self.t.LITELLM_URL])
+
+    def test_offline_changes_nothing(self):
+        self.use("claude-future-9")
+        self.fail = True
+        self.t.refresh_prices()
+        self.assertNotIn("claude-future-9", self.t.load_prices())
+        self.assertEqual([m["model"] for m in self.t.data(7, self.t.ALL)["unpriced"]], ["claude-future-9"])
+
+
 class CliTest(unittest.TestCase):
     def test_help_and_unknown_command(self):
         import cli

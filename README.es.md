@@ -109,7 +109,9 @@ Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quit
 - Solo lee `~/.claude/projects/**/*.jsonl`, `~/.config/claude/projects` si existe, o las carpetas de `CLAUDE_CONFIG_DIR` (separadas por comas). Dentro de WSL lee también la de Windows (`C:\Users\<tú>\.claude`) si solo un usuario de Windows la tiene. Y, si existe, la última lectura del plugin sub-meter.
 - Escucha en `127.0.0.1`: el panel no es accesible desde fuera de tu equipo.
 - Tus datos no salen de tu equipo: todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
-- Su única petición a internet: una vez al día pregunta a GitHub cuál es la última versión (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`), sin enviar nada tuyo. GitHub ve tu IP, como en cualquier visita. Se apaga con `TOKENOMETRO_UPDATE_CHECK=0`.
+- Sus peticiones a internet, las dos a GitHub y sin enviar nada tuyo (GitHub ve tu IP, como en cualquier visita):
+  - una vez al día pregunta cuál es la última versión (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`). Se apaga con `TOKENOMETRO_UPDATE_CHECK=0`;
+  - solo si usas un modelo que `prices.json` no conoce, una vez al día descarga [la lista pública de precios de LiteLLM](https://github.com/BerriAI/litellm) y se queda con el precio de esos modelos, en vez de valorarlos a `_default`. Tu `prices.json` siempre manda y el panel avisa de qué precios salen de ahí. Se apaga con `TOKENOMETRO_PRICE_REFRESH=0`.
 - En «Llamadas más gordas» enmascara lo que parezca un secreto, pero el panel muestra trozos de tus comandos y rutas: no lo compartas en capturas sin mirarlo.
 
 ## Qué significa «€ eq.»
@@ -186,7 +188,7 @@ Precio por millón de tokens en dólares (tarifa API oficial) de cada modelo act
 "_currency": {"default": "EUR", "eur_per_usd": 0.91, "date": "2026-11-19"}
 ```
 
-El tipo de cambio se actualiza a mano: el tokenómetro no se conecta a nada. Si al actualizar desde una versión anterior tu `prices.json` no tiene `_currency`, el panel solo ofrecerá dólares; cópialo del repo.
+El tipo de cambio se actualiza a mano: el tokenómetro no lo descarga. Si al actualizar desde una versión anterior tu `prices.json` no tiene `_currency`, el panel solo ofrecerá dólares; cópialo del repo.
 
 ### Variables de entorno
 
@@ -198,6 +200,7 @@ El tipo de cambio se actualiza a mano: el tokenómetro no se conecta a nada. Si 
 | `TOKENOMETRO_CURRENCY` | `EUR` o `USD` por defecto | la de `prices.json` |
 | `TOKENOMETRO_LANG` | `en` o `es` por defecto | `en` |
 | `TOKENOMETRO_UPDATE_CHECK` | `0` para no preguntar nunca a GitHub por versiones nuevas | `1` |
+| `TOKENOMETRO_PRICE_REFRESH` | `0` para no tomar nunca de LiteLLM el precio de un modelo que falte | `1` |
 | `TOKENOMETRO_NO_START` | `1` para que el instalador no lo arranque | |
 
 Siguen valiendo los nombres antiguos `CLAUDE_TOKENS_*`.
