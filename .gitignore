@@ -1,0 +1,7 @@
+usage.db*
+plan.json
+tracker.log
+clients.json
+clientes.json
+*.bak-*
+__pycache__/
