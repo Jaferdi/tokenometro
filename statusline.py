@@ -8,6 +8,7 @@ If you already have a statusLine, put this script in front of it: python3 status
 import json
 import os
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -36,10 +37,15 @@ def main():
             limits.append({"kind": kind, "percentUsed": w["used_percentage"], "resetsAt": reset})
     if limits:
         try:
-            tmp = OUT + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"limits": limits, "at": int(time.time() * 1000)}, f)
-            os.replace(tmp, OUT)
+            # one temp file per call: Claude Code can run several statusLines at once
+            fd, tmp = tempfile.mkstemp(prefix=".plan-", suffix=".tmp", dir=os.path.dirname(OUT))
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump({"limits": limits, "at": int(time.time() * 1000)}, f)
+                os.replace(tmp, OUT)
+            except BaseException:
+                os.unlink(tmp)
+                raise
         except OSError:
             pass
     if tee:
