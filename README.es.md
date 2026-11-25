@@ -34,6 +34,9 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
 | **Tu plan** | % de la ventana de 5 horas y de la semana, cuándo se reinician, el tope estimado en € o $ y si al ritmo actual lo agotarás antes de que se reinicie. |
 | **Mejoras recomendadas** | Tarjetas hechas con *tus* datos y *tu* `settings.json`: qué cambiar, cuánto pesa, cómo comprobar que ha funcionado y un prompt listo para pegarle a Claude. |
 | **Sesiones** | Coste de cada sesión separado en entrada, salida, lecturas y escrituras de caché; el modelo más barato que habría bastado; tramos entre compactaciones, subagentes y las llamadas a herramientas más gordas. |
+| **Por rama / tarea** | Coste por rama de git. Si el nombre de la rama lleva un ticket (`feature/7067`, `fix/ABC-123`), todos los repos que tocaste para él suman una sola tarea; si no, igualmente ves el coste por rama. |
+| **Coste fijo por sesión** | Lo que lleva cada sesión antes de que escribas nada: prompt de sistema, herramientas integradas, cada servidor MCP, tu CLAUDE.md, memoria y skills. Cuánto costó en el periodo, y una tarjeta cuando un servidor MCP se carga en todas partes pero casi no se usa. |
+| **Resumen semanal** | Cada lunes un Markdown en `~/.claude/reports/` con el gasto de la semana pasada frente a la anterior, las sesiones y tareas más caras, el coste fijo y las recomendaciones que cambiaron. |
 | **Informes** | Un CSV mensual por sesión o por cliente, para compartirlo o repercutirlo a un cliente, desde el panel o por consola. |
 | **Antes / después** | Elige la fecha de un cambio (un ajuste nuevo, una costumbre nueva) y compara el coste por mensaje, el contexto y las compactaciones a cada lado. |
 
@@ -188,9 +191,10 @@ python3 ~/.local/share/tokenometro/tracker.py            # servidor (lo que hace
 python3 ~/.local/share/tokenometro/tracker.py ingest     # lee lo nuevo y saca un resumen
 python3 ~/.local/share/tokenometro/tracker.py backfill   # rellena datos de herramientas del histórico (una vez)
 python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur EUR   # CSV mensual por la salida estándar
+python3 ~/.local/share/tokenometro/tracker.py digest 2026-11-17   # resumen de la semana que contiene ese día
 ```
 
-`report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE` y `--cur USD|EUR`. El mismo CSV está en el panel, en la tarjeta *Por cliente*.
+`report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE` y `--cur USD|EUR`. El mismo CSV está en el panel, en la tarjeta *Por cliente*. `digest` imprime el resumen en Markdown de una semana (de lunes a domingo; por defecto la pasada). El servidor también escribe solo el de la semana pasada, una vez, como `~/.claude/reports/tokenometro-semana-AAAA-Www.md` (`tokenometro-week-…` en inglés).
 
 Reiniciar el servidor (solo lo para si es Tokenometro):
 

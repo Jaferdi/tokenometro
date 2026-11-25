@@ -167,6 +167,12 @@ def connect():
         con.execute("ALTER TABLE tools ADD COLUMN input_head TEXT")
     if "head" not in [r[1] for r in con.execute("PRAGMA table_info(files)")]:
         con.execute("ALTER TABLE files ADD COLUMN head BLOB")
+    con.execute("""CREATE TABLE IF NOT EXISTS shapes(session TEXT PRIMARY KEY, ts TEXT, system_chars INTEGER,
+        tools_chars INTEGER, deferred INTEGER, parts TEXT)""")
+    if "branch" not in [r[1] for r in con.execute("PRAGMA table_info(msgs)")]:
+        con.execute("ALTER TABLE msgs ADD COLUMN branch TEXT")
+        con.execute("UPDATE files SET offset=0")  # read the history again to fill the branch and the request shapes
+        con.commit()
     return con
 
 
@@ -215,14 +221,38 @@ def _text_len(content):
 
 
 _FIRST_TYPE = re.compile(rb'\{\s*"type"\s*:\s*"([^"]+)"')
-_WANTED_TYPES = {b"assistant", b"user", b"system", b"custom-title"}
+_WANTED_TYPES = {b"assistant", b"user", b"system", b"custom-title", b"api-request-shape"}
 _WANTED_ANY = re.compile(rb'"type"\s*:\s*"(?:assistant|user)"|"compact_boundary"')
 
 
-def _handle(con, d):
+def shape_parts(shape):
+    """What a request carries before the conversation: system prompt and tool definitions, in characters.
+    Tools with defer_loading only travel as a name until they are searched for, so they barely count."""
+    parts, deferred = {}, 0
+    for tl in shape.get("tools") or []:
+        if not isinstance(tl, dict):
+            continue
+        if tl.get("defer_loading"):
+            deferred += 1
+            continue
+        name = tl.get("name") or ""
+        key = "mcp:" + name.split("__")[1] if name.startswith("mcp__") and name.count("__") >= 2 else "builtin"
+        parts[key] = parts.get(key, 0) + len(json.dumps(tl, ensure_ascii=False))
+    system = sum(len(s.get("text") or "") for s in shape.get("system") or [] if isinstance(s, dict))
+    return system, parts, deferred
+
+
+def _handle(con, d, sub=False):
     t = d.get("type")
     if t == "custom-title":
         con.execute("INSERT OR REPLACE INTO titles VALUES(?,?)", (d.get("sessionId"), d.get("customTitle")))
+        return
+    if t == "api-request-shape":
+        if sub or not d.get("sessionId"):
+            return  # subagents carry their own, smaller set; the session's fixed cost is the main one
+        system, parts, deferred = shape_parts(d.get("shape") or {})
+        con.execute("INSERT OR REPLACE INTO shapes VALUES(?,?,?,?,?,?)",
+                    (d["sessionId"], d.get("timestamp") or "", system, sum(parts.values()), deferred, json.dumps(parts)))
         return
     ts = d.get("timestamp") or ""
     lt = local(ts)
@@ -249,10 +279,11 @@ def _handle(con, d):
         web = (u.get("server_tool_use") or {}).get("web_search_requests") or 0
         mid = msg.get("id") or d.get("uuid")
         con.execute(
-            "INSERT OR REPLACE INTO msgs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO msgs(id, ts, day, hour, session, project, client, model, sidechain, agent,"
+            " inp, cw5, cw1h, cr, out, think, web, branch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (mid, ts, day, hour, session, cwd, cl, model, side, d.get("agentId"),
              u.get("input_tokens") or 0, cw5, cw1h, u.get("cache_read_input_tokens") or 0,
-             u.get("output_tokens") or 0, think, web),
+             u.get("output_tokens") or 0, think, web, d.get("gitBranch") or None),
         )
         for b in msg.get("content") or []:
             if isinstance(b, dict) and b.get("type") == "tool_use":
@@ -288,6 +319,7 @@ def _ingest_file(con, path, off, size, head):
     """Read complete lines from off, committing every BATCH_LINES so the write lock is never held for long.
     The offset only advances together with what was saved, so a database error just retries later."""
     n = 0
+    sub = os.sep + "subagents" + os.sep in path
     try:
         with open(path, "rb") as f:
             f.seek(off)
@@ -305,7 +337,7 @@ def _ingest_file(con, path, off, size, head):
                 elif not _WANTED_ANY.search(line):
                     continue
                 try:
-                    _handle(con, json.loads(line))
+                    _handle(con, json.loads(line), sub)
                     n += 1
                     pending += 1
                 except (ValueError, TypeError, AttributeError, KeyError):
@@ -519,13 +551,13 @@ def report(month, by="session", client=ALL):
                 FROM msgs m WHERE {w} GROUP BY m.client ORDER BY cost DESC""", [month] + a)
             head = ["client", "sessions", "messages"]
         else:
-            rows = q(con, f"""SELECT m.client, MIN(m.day) date, m.session, COALESCE(t.title,'') title, MIN(m.project) project,
+            rows = q(con, f"""SELECT m.client, MIN(m.day) date, m.session, COALESCE(t.title,'') title, MIN(m.project) project, COALESCE(MAX(m.branch),'') branch,
                 GROUP_CONCAT(DISTINCT m.model) models,
                 (SELECT COUNT(*) FROM prompts p WHERE p.session=m.session AND substr(p.day,1,7)=?) messages,
                 SUM(m.inp) input, SUM(m.cw5+m.cw1h) cache_write, SUM(m.cr) cache_read, SUM(m.out) output, SUM({C}) cost
                 FROM msgs m LEFT JOIN titles t ON t.session=m.session WHERE {w}
                 GROUP BY m.session ORDER BY m.client, date""", [month] + a)
-            head = ["client", "date", "session", "title", "project", "models", "messages"]
+            head = ["client", "date", "session", "title", "project", "branch", "models", "messages"]
     finally:
         con.close()
     rate = _currency_cfg()[0]
@@ -680,7 +712,12 @@ def data(days, client, cut=CUT_DEFAULT):
     res["today_hours"] = q(con, f"SELECT hour, SUM({C}) cost FROM msgs WHERE day=?{cw_} GROUP BY hour", [today] + ca_)
     res["limits"] = {"ctx": CTX_LIMIT, "cost_warn": COST_WARN, "live_min": LIVE_MIN}
 
+    res["branches"] = branches(con, w, a, C)
+    res["fixed"] = fixed_cost(con, w, a, T, res["kpi_range"]["cost"])
     res["recs"] = recommendations(con, w, a, res["compare"]["cut"], res["kpi_range"], C, T, ctx)
+    mcp = mcp_rec(con, w, a, res["fixed"])
+    if mcp:
+        res["recs"].append(mcp)
 
     ids = [x["session"] for x in res["sessions"]]
     if ids:
@@ -711,6 +748,156 @@ def data(days, client, cut=CUT_DEFAULT):
     con.close()
     res["insights"] = insights(res)
     return res
+
+
+_TASK = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]+-[0-9]+)(?![0-9])|(?<![0-9])([0-9]{3,})(?![0-9])")
+
+
+def task_of(branch):
+    """A ticket in the branch name (feature/7067, fix/ABC-123-login) is the task; otherwise there is none."""
+    m = _TASK.search(branch or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def branches(con, w, a, C):
+    """Cost by git branch: whoever works with tickets in branch names sees tasks; everyone else, branches.
+    Sessions outside a git repo have no branch and are left out (they still count everywhere else)."""
+    raw = q(con, f"""SELECT branch, project, client, SUM({C}) cost, GROUP_CONCAT(DISTINCT session) sids,
+        MIN(day) first, MAX(day) last FROM msgs WHERE branch IS NOT NULL AND branch NOT IN ('', 'HEAD') AND {w}
+        GROUP BY branch, project, client""", a)
+    # a ticket spans repos (front, back...) and is one line; other branches are grouped by name, listing their repos
+    out = {}
+    for r in raw:
+        task = task_of(r["branch"])
+        repo = os.path.basename((r["project"] or "").rstrip("/\\"))
+        g = out.setdefault(("t", task) if task else ("b", r["branch"]),
+                           {"branch": r["branch"], "task": task, "repos": set(), "clients": set(), "sids": set(),
+                            "branches": set(), "cost": 0.0, "first": r["first"], "last": r["last"]})
+        g["repos"].add(repo)
+        g["branches"].add(r["branch"])
+        if r["client"] and r["client"] != OTHERS:
+            g["clients"].add(r["client"])
+        g["sids"].update((r["sids"] or "").split(","))
+        g["cost"] += r["cost"] or 0
+        g["first"], g["last"] = min(g["first"], r["first"]), max(g["last"], r["last"])
+    rows = []
+    for g in out.values():
+        g["sessions"] = len(g.pop("sids"))
+        br = sorted(g.pop("branches"))
+        g["branch"] = br[0] if len(br) == 1 else ", ".join(br)
+        g["repos"], g["clients"] = sorted(g["repos"]), sorted(g["clients"])
+        rows.append(g)
+    return sorted(rows, key=lambda x: -x["cost"])[:200]
+
+
+def claude_md_chars(path, depth=0):
+    """Size of a CLAUDE.md plus the files it pulls in with @path lines (Claude Code inlines them)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return 0
+    n = len(text)
+    if depth < 3:
+        for m in re.finditer(r"(?m)^\s*@(\S+)\s*$", text):
+            p = os.path.expanduser(m.group(1))
+            n += claude_md_chars(p if os.path.isabs(p) else os.path.join(os.path.dirname(path), p), depth + 1)
+    return n
+
+
+def fixed_cost(con, w, a, T, total):
+    """What every session pays before you type anything: system prompt, tool definitions, MCP servers,
+    CLAUDE.md, memory and skills. It is measured as the context of the session's first reply, and every
+    later reply reads it again from the cache (cheap, but on every single turn)."""
+    # the smallest context a session ever had: its first reply, or the one right after a compaction;
+    # resumed sessions start with the whole conversation, so their first reply is not the fixed part
+    mins = sorted(x for (x,) in con.execute(f"""SELECT MIN(inp+cw5+cw1h+cr) FROM msgs
+        WHERE sidechain=0 AND (inp+cw5+cw1h+cr)>0 AND {w} GROUP BY session""", a))
+    med = mins[len(mins) // 2] if mins else 0  # caps the sessions that were only ever seen resumed
+    base = f"""SELECT session, MIN(MIN(inp+cw5+cw1h+cr), {int(med)}) base, MIN(model) model,
+        SUM(cw1h) > SUM(cw5) h1 FROM msgs
+        WHERE sidechain=0 AND (inp+cw5+cw1h+cr)>0 AND {w} GROUP BY session"""
+    reread = T["cr"].replace("cr*", "b.base*").replace("model", "msgs.model")
+    r = q(con, f"""SELECT COUNT(DISTINCT b.session) sessions, COALESCE(SUM({reread}),0) reread, COUNT(*) turns
+        FROM msgs JOIN ({base}) b ON b.session=msgs.session
+        WHERE msgs.sidechain=0 AND {w.replace('day', 'msgs.day').replace('client', 'msgs.client')}""", a + a)[0]
+    # written to the cache once per session; every later turn only reads it
+    write = T["cw"].replace("(cw5*", "(base*(1-h1)*").replace("cw1h*", "base*h1*")  # at the TTL the session used
+    one = q(con, f"SELECT COALESCE(SUM({write}),0) c, COALESCE(AVG(base),0) base FROM ({base})", a)[0]
+    wr, r["base"] = one["c"], one["base"]
+    cost = (r["reread"] or 0) + (wr or 0)
+    shapes = q(con, f"""SELECT s.system_chars, s.parts, s.deferred FROM shapes s
+        WHERE s.session IN (SELECT DISTINCT session FROM msgs WHERE {w})""", a)
+    parts, n = {}, len(shapes)
+    for s in shapes:
+        parts["system"] = parts.get("system", 0) + (s["system_chars"] or 0) / 4 / n
+        for k, v in json.loads(s["parts"] or "{}").items():
+            parts[k] = parts.get(k, 0) + v / 4 / n
+    if n:
+        g = claude_md_chars(os.path.join(HOME, ".claude", "CLAUDE.md")) / 4
+        if g and r["base"] - sum(parts.values()) > g:
+            parts["claude_md"] = g
+    known = sum(parts.values())
+    if n and r["base"] > known:
+        parts["rest"] = r["base"] - known  # CLAUDE.md, memory, skill list, git status and the first message
+    servers = {}
+    for s in shapes:
+        for k, v in json.loads(s["parts"] or "{}").items():
+            if k.startswith("mcp:"):
+                x = servers.setdefault(k[4:], {"chars": 0, "sessions": 0})
+                x["chars"] += v
+                x["sessions"] += 1
+    servers = {k: {"tokens": round(x["chars"] / 4 / x["sessions"]), "sessions": x["sessions"]} for k, x in servers.items()}
+    return {"sessions": r["sessions"], "base": round(r["base"] or 0), "turns": r["turns"], "cost": cost,
+            "share": 100 * cost / total if total else 0, "measured": n,
+            "deferred": round(sum(s["deferred"] or 0 for s in shapes) / n) if n else 0,
+            "parts": sorted(({"k": k, "tokens": round(v)} for k, v in parts.items()), key=lambda x: -x["tokens"]),
+            "servers": servers}
+
+
+def mcp_rec(con, w, a, fx):
+    """An MCP server whose tools are loaded in every session but almost never used costs its share of the
+    fixed cost on every turn. Only servers above 2K tokens, seen in 3+ sessions, used in under 1 in 5."""
+    if not fx["servers"] or not fx["base"]:
+        return None
+    worst = None
+    for srv, s in fx["servers"].items():
+        if s["tokens"] < 2000 or s["sessions"] < 3:
+            continue
+        used = q(con, f"""SELECT COUNT(DISTINCT session) n FROM tools WHERE name LIKE ? ESCAPE '\\' AND {w}""",
+                 [("mcp__" + srv + "__").replace("_", "\\_") + "%"] + a)[0]["n"]
+        if used * 5 >= s["sessions"]:
+            continue
+        cost = fx["cost"] * s["tokens"] / fx["base"] * s["sessions"] / max(fx["measured"], 1)
+        if not worst or cost > worst[3]:
+            worst = (srv, s, used, cost)
+    if not worst:
+        return None
+    srv, s, used, cost = worst
+    return {
+        "id": "mcp", "title": tr(f"The MCP server {srv} is loaded in every session and almost never used",
+                                 f"El servidor MCP {srv} se carga en cada sesión y casi no se usa"),
+        "status": "todo", "impact": cost,
+        "impact_note": tr("its share of the fixed cost of every session", "su parte del coste fijo de cada sesión"),
+        "confidence": tr("medium", "media"),
+        "evidence": tr(f"Its tool definitions take ~{fmt_tok(s['tokens'])} tokens in each request of {s['sessions']} session(s); "
+                       f"its tools were used in {used}. Every reply reads them again: ~{money(cost, 2)} in the period.",
+                       f"Sus definiciones ocupan ~{fmt_tok(s['tokens'])} tokens en cada petición de {s['sessions']} sesión(es); "
+                       f"sus herramientas se usaron en {used}. Cada respuesta las vuelve a leer: ~{money(cost, 2)} en el periodo."),
+        "action": tr(f"Disable {srv} where you don't need it (/mcp, or enable it per project), or turn on tool search "
+                     "so its tools load only when needed.",
+                     f"Desactiva {srv} donde no lo necesites (/mcp, o actívalo solo en su proyecto), o activa la búsqueda "
+                     "de herramientas para que se carguen solo al usarlas."),
+        "verify": tr("The fixed cost card shows that server smaller or gone.", "La tarjeta de coste fijo lo muestra más pequeño o ya no sale."),
+        "tradeoff": tr("When you do need it, you enable it again.", "Cuando lo necesites, hay que volver a activarlo."),
+        "metric": s["tokens"], "metric_label": tr("tokens per request", "tokens por petición"),
+        "tools": [{"n": "/mcp", "k": tr("command", "comando"), "why": tr("enable or disable servers", "activar o desactivar servidores"),
+                   "cost": tr("free", "gratis")}],
+        "prompt": tr(f"Check where the MCP server {srv} is configured (~/.claude.json, .mcp.json or a plugin) and propose how to "
+                     "enable it only in the projects that use it. Show me the diff before saving.",
+                     f"Mira dónde está configurado el servidor MCP {srv} (~/.claude.json, .mcp.json o un plugin) y propón cómo "
+                     "activarlo solo en los proyectos que lo usan. Enséñame el diff antes de guardar."),
+    }
 
 
 def session_detail(sid):
@@ -1008,6 +1195,81 @@ def write_recs_file(recs, kpi):
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     os.replace(tmp, recs_file_path())
+
+
+def digest_path(monday):
+    y, wk, _ = monday.isocalendar()
+    name = "semana" if LANG_DEFAULT == "es" else "week"
+    return os.path.join(REPORTS, f"tokenometro-{name}-{y}-W{wk:02d}.md")
+
+
+def digest(monday):
+    """Weekly summary (Monday to Sunday) as Markdown: spend against the week before, where it went, what changed."""
+    sun, prev = monday + timedelta(days=6), monday - timedelta(days=7)
+    con = connect()
+    try:
+        prices = load_prices()
+        C, T = cost_expr(prices), cost_terms(prices)
+        w, a = "day >= ? AND day <= ?", [monday.isoformat(), sun.isoformat()]
+        cost = lambda ww, aa: q(con, f"SELECT COALESCE(SUM({C}),0) c, COUNT(DISTINCT session) s FROM msgs WHERE {ww}", aa)[0]
+        now_, before = cost(w, a), cost(w, [prev.isoformat(), (monday - timedelta(days=1)).isoformat()])
+        top = q(con, f"""SELECT m.session, COALESCE(t.title,'') title,
+            (SELECT x.project FROM msgs x WHERE x.session=m.session ORDER BY x.ts LIMIT 1) project, SUM({C}) cost FROM msgs m
+            LEFT JOIN titles t ON t.session=m.session WHERE m.day >= ? AND m.day <= ? GROUP BY m.session ORDER BY cost DESC LIMIT 5""", a)
+        br = branches(con, w, a, C)[:5]
+        fx = fixed_cost(con, w, a, T, now_["c"])
+        st = {}
+        for d, rid, status in con.execute("SELECT day, id, status FROM recs_hist WHERE day <= ? ORDER BY day", [sun.isoformat()]):
+            st.setdefault(rid, {})["after" if d >= monday.isoformat() else "before"] = status
+        models = q(con, f"SELECT model, SUM({C}) cost FROM msgs WHERE {w} GROUP BY model", a)
+    finally:
+        con.close()
+    diff = now_["c"] - before["c"]
+    pct = f" ({'+' if diff >= 0 else ''}{100 * diff / before['c']:.0f}%)" if before["c"] else ""
+    names = {"todo": tr("pending", "pendiente"), "warn": tr("applied, review", "aplicada, revisar"),
+             "ok": tr("applied, working", "aplicada, funciona"), "info": tr("informational", "informativa")}
+    L = [tr(f"# Tokenometro · week {monday.isocalendar()[1]} ({monday} to {sun})",
+            f"# Tokenometro · semana {monday.isocalendar()[1]} (del {monday} al {sun})"), "",
+         tr(f"**{money(now_['c'], 2)} eq.** in {now_['s']} sessions; the week before, {money(before['c'], 2)}{pct}.",
+            f"**{money(now_['c'], 2)} eq.** en {now_['s']} sesiones; la semana anterior, {money(before['c'], 2)}{pct}."), ""]
+    if top:
+        L += [tr("## Costliest sessions", "## Sesiones más caras"), ""]
+        L += [f"- {money(r['cost'], 2)} · {r['title'] or r['session'][:8]} · {short_path(r['project'] or '')}" for r in top] + [""]
+    if br:
+        L += [tr("## By branch / task", "## Por rama / tarea"), ""]
+        L += [f"- {money(r['cost'], 2)} · {r['task'] or r['branch']} · {', '.join(r['repos'])}" for r in br] + [""]
+    if fx["measured"]:
+        L += [tr("## Fixed cost per session", "## Coste fijo por sesión"), "",
+              tr(f"~{fmt_tok(fx['base'])} tokens before the conversation starts: {money(fx['cost'], 2)} ({fx['share']:.0f}% of the week).",
+                 f"~{fmt_tok(fx['base'])} tokens antes de empezar la conversación: {money(fx['cost'], 2)} ({fx['share']:.0f}% de la semana)."), ""]
+    changed = [(rid, v) for rid, v in st.items() if v.get("after") and v.get("after") != v.get("before")]
+    if changed:
+        L += [tr("## Recommendations that changed", "## Recomendaciones que cambiaron"), ""]
+        L += [f"- {rid}: {names.get(v.get('before'), '-')} → {names.get(v['after'], v['after'])}" for rid, v in changed] + [""]
+    miss = unpriced(models, prices)
+    if miss:
+        L += [tr("## Models without a price", "## Modelos sin precio"), ""]
+        L += [tr(f"- {m['model']}: valued at _default; add it to prices.json.", f"- {m['model']}: valorado a _default; añádelo a prices.json.")
+              for m in miss] + [""]
+    L.append(tr(f"Dashboard: http://127.0.0.1:{PORT}", f"Panel: http://127.0.0.1:{PORT}"))
+    return "\n".join(L) + "\n"
+
+
+def write_digest(monday=None):
+    """Last week's summary, once: written on the first run after the week ends, never rewritten."""
+    if monday is None:
+        today = date.today()
+        monday = today - timedelta(days=today.weekday() + 7)
+    path = digest_path(monday)
+    if os.path.exists(path):
+        return path
+    set_lang(LANG_DEFAULT)
+    text = digest(monday)
+    os.makedirs(REPORTS, exist_ok=True)
+    with os.fdopen(os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+    return path
 
 
 def snapshot_recs():
@@ -1469,6 +1731,11 @@ h2{font:600 16px/1.25 var(--fd);margin:0 0 12px;letter-spacing:.01em;display:fle
 .track .mark::after{content:attr(data-l);position:absolute;top:-16px;left:50%;transform:translateX(-50%);font-size:10px;color:var(--mut);white-space:nowrap}
 .gm{font-size:12px;color:var(--mut)}.gm .w{color:var(--f);font-weight:600}
 .empty{color:var(--mut);margin:6px 0}
+.fxbar{display:flex;height:12px;border-radius:6px;overflow:hidden;margin:10px 0 12px;background:var(--line)}
+.fxbar i{display:block;height:100%}
+.fxl{display:grid;grid-template-columns:auto 1fr auto;gap:4px 10px;font-size:13px;align-items:center}
+.fxl i{width:10px;height:10px;border-radius:3px;display:inline-block}.fxl .n{text-align:right;font-variant-numeric:tabular-nums}
+.tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:8px;border:1px solid var(--line);color:var(--mut);margin-left:4px}
 
 /* KPI strip */
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0}
@@ -1568,6 +1835,10 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 <section class="card"><h2 data-i18n="by_model"></h2><div id="models"></div></section>
 <section class="card"><h2 data-i18n="by_client"></h2><div id="clients"></div>
 <div class="csv"><span class="mut" data-i18n="csv_hint"></span><span class="csvc"><input type="month" id="month" data-i18n-aria="month_label"><a class="btn" id="csv_s" data-i18n="csv_sessions"></a><a class="btn" id="csv_c" data-i18n="csv_clients"></a></span></div></section>
+<section class="card"><h2><span data-i18n="by_branch"></span> <span class="badge" data-i18n="branch_badge"></span></h2><div id="branches"></div>
+<p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="branch_note"></p></section>
+<section class="card"><h2 data-i18n="fixed_title"></h2><div id="fixed"></div>
+<p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="fixed_note"></p></section>
 <section class="card wide"><h2><span data-i18n="costliest_sessions"></span> <span class="badge" data-i18n="sess_badge"></span></h2><div class="leg" id="sleg"></div><div id="sessions"></div></section>
 <section class="card wide"><h2 data-i18n="costliest_agents"></h2><div id="agents"></div></section>
 </main>
@@ -1580,7 +1851,7 @@ en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',
  eq_usd:'"$ eq." means equivalent cost: what these tokens would cost at the public API prices (prices.json).',eq_eur:'"€ eq." means equivalent cost: what these tokens would cost at the public API prices (prices.json, in dollars), converted to euros at {rate} €/$',
  recs_title:'Recommended improvements',recs_badge:'based on your data and your settings.json',recs_legend:'Orange: pending · yellow: applied but no clear effect · green: applied and noticeable · blue: informational. The impact is for the selected period.',
  daily_title:'Equivalent cost per day and token type',before_after:'Before / after',ba_note:'Same number of days on each side of the date. It follows the client filter, not the period one. Use it to see whether a change you made (e.g. a new setting) moved the numbers.',
- by_model:'By model',by_client:'By client',costliest_sessions:'Costliest sessions',sess_badge:'click a row for details · click a header to sort',costliest_agents:'Costliest subagents',
+ by_branch:'By branch / task',branch_badge:'from git',branch:'Branch',task:'Task',last_day:'Last',branch_note:'Sessions grouped by the git branch they ran on. If the branch name has a ticket (feature/7067, fix/ABC-123) it shows as the task. Sessions outside a git repo are not listed.',no_branches:'No sessions inside a git repository in this period.',fixed_title:'Fixed cost per session',fx_head:'Every reply carries ~{n} tokens before your conversation even starts. In this period that cost {c} ({p}% of the total) across {s} sessions.',fx_system:'System prompt',fx_builtin:'Built-in tools',fx_claude_md:'Your global CLAUDE.md',fx_rest:'Project CLAUDE.md, memory, skills and first message',fx_mcp:'MCP server {n}',fx_deferred:'{n} more tools load on demand (tool search) and barely count.',fx_none:'Not measured yet: it appears after a new session in this period.',fixed_note:'Measured from the smallest context each session had and the request shape Claude Code logs. It is cached, so each turn pays the cache-read price for it, plus one cache write per session.',by_model:'By model',by_client:'By client',costliest_sessions:'Costliest sessions',sess_badge:'click a row for details · click a header to sort',costliest_agents:'Costliest subagents',
  no_data:'No data',sort:'Sort',prev:'Previous',next:'Next',of:'of',last5:'in the last 5 h',of_plan:'of the plan',w5:'5 h',wk:'week',
  live_empty:'No session has activity right now. As soon as Claude answers, it shows up here.',ctx_aria:'Context',accumulated:'spent in this session',messages:'messages',compactions:'compactions',compaction:'compaction',subagents_lc:'subagents',
  over_compact:'over {n} tokens: good time to /compact (summarise) or /clear',plan_nolecture:'no plan reading: only what was spent',last5h:'Last 5 hours',last7d:'Last 7 days',
@@ -1610,7 +1881,7 @@ es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días
  eq_usd:'«$ eq.» es el coste equivalente: lo que costarían estos tokens a los precios públicos de la API (prices.json).',eq_eur:'«€ eq.» es el coste equivalente: lo que costarían estos tokens a los precios públicos de la API (prices.json, en dólares), pasado a euros a {rate} €/$',
  recs_title:'Mejoras recomendadas',recs_badge:'según tus datos y tu settings.json',recs_legend:'Naranja: pendiente · amarillo: aplicada pero sin efecto claro · verde: aplicada y se nota · azul: informativa. El impacto es del periodo elegido.',
  daily_title:'Coste equivalente por día y tipo de token',before_after:'Antes / después del',ba_note:'Mismo número de días a cada lado de la fecha. Respeta el filtro de cliente, no el de periodo. Sirve para ver si un cambio que hiciste (p. ej. un ajuste nuevo) movió las cifras.',
- by_model:'Por modelo',by_client:'Por cliente',costliest_sessions:'Sesiones más caras',sess_badge:'pincha una fila para el detalle · pincha una cabecera para ordenar',costliest_agents:'Subagentes más caros',
+ by_branch:'Por rama / tarea',branch_badge:'de git',branch:'Rama',task:'Tarea',last_day:'Último',branch_note:'Sesiones agrupadas por la rama de git en la que se trabajó. Si el nombre lleva un ticket (feature/7067, fix/ABC-123) sale como tarea. Las sesiones fuera de un repo git no aparecen.',no_branches:'No hay sesiones dentro de un repositorio git en este periodo.',fixed_title:'Coste fijo por sesión',fx_head:'Cada respuesta lleva ~{n} tokens antes incluso de empezar la conversación. En este periodo eso costó {c} ({p}% del total) en {s} sesiones.',fx_system:'Prompt de sistema',fx_builtin:'Herramientas integradas',fx_claude_md:'Tu CLAUDE.md global',fx_rest:'CLAUDE.md del proyecto, memoria, skills y primer mensaje',fx_mcp:'Servidor MCP {n}',fx_deferred:'Otras {n} herramientas se cargan bajo demanda (búsqueda de herramientas) y apenas cuentan.',fx_none:'Aún sin medir: aparece tras una sesión nueva en este periodo.',fixed_note:'Medido con el contexto más pequeño de cada sesión y la forma de la petición que registra Claude Code. Va en caché: cada turno lo paga a precio de lectura de caché, más una escritura de caché por sesión.',by_model:'Por modelo',by_client:'Por cliente',costliest_sessions:'Sesiones más caras',sess_badge:'pincha una fila para el detalle · pincha una cabecera para ordenar',costliest_agents:'Subagentes más caros',
  no_data:'Sin datos',sort:'Ordenar',prev:'Anterior',next:'Siguiente',of:'de',last5:'en las últimas 5 h',of_plan:'del plan',w5:'5 h',wk:'semana',
  live_empty:'No hay ninguna sesión con actividad ahora. En cuanto Claude responda, aparece aquí.',ctx_aria:'Contexto',accumulated:'gastado en esta sesión',messages:'mensajes',compactions:'compactaciones',compaction:'compactación',subagents_lc:'subagentes',
  over_compact:'pasa de {n} tokens: buen momento para /compact (resumir) o /clear',plan_nolecture:'sin lectura del plan: solo lo gastado',last5h:'Últimas 5 horas',last7d:'Últimos 7 días',
@@ -1655,6 +1926,14 @@ function table(rows,cols){if(!rows.length)return '<p class="mut">'+t('no_data')+
  const max=Math.max(...rows.map(r=>cols[1].v(r)||0),1);
  return '<table><tr>'+cols.map(c=>'<th>'+c.h+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map((c,i)=>'<td>'+(i==1&&c.bar!==false?'<div style="display:flex;gap:6px;align-items:center;justify-content:flex-end">'+c.f(c.v(r))+'<div class="bar" style="width:'+Math.max(2,44*(c.v(r)||0)/max)+'px"></div></div>':c.f(c.v(r),r))+'</td>').join('')+'</tr>').join('')+'</table>'}
 const onKey=e=>e.onkeydown=ev=>{if(ev.key=='Enter'||ev.key==' '){ev.preventDefault();e.click()}};
+function fixed(el,f){if(!f.measured){el.innerHTML='<p class="empty">'+t('fx_none')+'</p>';return}
+ const C=['--a','--b','--c','--d','--e'],tot=f.parts.reduce((s,p)=>s+p.tokens,0)||1;
+ const N={system:t('fx_system'),builtin:t('fx_builtin'),claude_md:t('fx_claude_md'),rest:t('fx_rest')};
+ const nm=k=>k.startsWith('mcp:')?t('fx_mcp',{n:esc(k.slice(4))}):(N[k]||esc(k));
+ el.innerHTML='<p style="margin:4px 0 0">'+t('fx_head',{n:tok(f.base),c:usd(f.cost),p:f.share.toFixed(0),s:f.sessions})+'</p>'
+  +'<div class="fxbar">'+f.parts.map((p,i)=>'<i style="width:'+(100*p.tokens/tot)+'%;background:'+css(C[i%C.length])+'" title="'+nm(p.k)+'"></i>').join('')+'</div>'
+  +'<div class="fxl">'+f.parts.map((p,i)=>'<i style="background:'+css(C[i%C.length])+'"></i><span>'+nm(p.k)+'</span><span class="n">~'+tok(p.tokens)+'</span>').join('')+'</div>'
+  +(f.deferred?'<p class="mut" style="font-size:12px;margin:8px 0 0">'+t('fx_deferred',{n:f.deferred})+'</p>':'')}
 function tbl(el,rows,cols,opt){opt=opt||{};el._st=el._st||{k:null,d:-1};const PS=opt.page||8;el._pg=el._pg||0;
  const draw=()=>{let rs=rows.slice();const st=el._st;if(st.k!=null){const c=cols[st.k],f=c.s||c.v;rs.sort((a,b)=>{const x=f(a),y=f(b);return (typeof x=='string'?String(x).localeCompare(y):(x||0)-(y||0))*st.d})}
   const np=Math.max(1,Math.ceil(rs.length/PS));if(el._pg>=np)el._pg=np-1;const off=el._pg*PS,vis=rs.slice(off,off+PS);
@@ -1748,6 +2027,9 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
  $('leg').innerHTML=keys.map(k=>'<span><i style="background:'+css(k.c)+'"></i>'+k.n+'</span>').join('');
  stacked($('daily'),r.daily,keys);FIRST=false;
  tbl($('models'),r.models,[{h:t('model'),v:x=>x.model,f:esc},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('tokens'),v:x=>x.tokens,f:tok},{h:t('turns'),v:x=>x.turns,f:v=>v}]);
+ if(r.branches.length)tbl($('branches'),r.branches,[{h:t('branch'),v:x=>x.branch,f:(v,x)=>'<b>'+esc(x.task||v)+'</b>'+(x.task?' <span class="mut">'+esc(v)+'</span>':'')+'<br><span class="mut">'+esc(x.repos.join(', '))+(x.clients.length?' · '+esc(x.clients.join(', ')):'')+'</span>'},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('sessions'),v:x=>x.sessions,f:v=>v},{h:t('last_day'),v:x=>x.last,f:v=>esc(v)}]);
+ else $('branches').innerHTML='<p class="empty">'+t('no_branches')+'</p>';
+ fixed($('fixed'),r.fixed);
  tbl($('clients'),r.clients,[{h:t('client'),v:x=>x.client,f:v=>esc(v=='otros'?t('others'):v)},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('tokens'),v:x=>x.tokens,f:tok},{h:t('sessions'),v:x=>x.sessions,f:v=>v}]);
  const sk=[{k:'c_cr',n:t('cache_read'),c:'--b'},{k:'c_cw',n:t('cache_write'),c:'--c'},{k:'c_inp',n:t('input_nc'),c:'--e'},{k:'c_out',n:t('output'),c:'--d'},{k:'c_think',n:t('thinking'),c:'--h'},{k:'sub_cost',n:t('subagents'),c:'--g'}];
  $('sleg').innerHTML=sk.map(k=>'<span><i style="background:'+css(k.c)+'"></i>'+k.n+'</span>').join('');
@@ -1888,6 +2170,10 @@ def loop():
                 last_snap = time.time()
             except Exception as e:
                 print("snapshot error:", e, file=sys.stderr)
+            try:
+                write_digest()
+            except Exception as e:
+                print("digest error:", e, file=sys.stderr)
         time.sleep(INGEST_EVERY)
 
 
@@ -1936,6 +2222,15 @@ def main():
         ingest()
         sys.stdout.flush()
         sys.stdout.buffer.write(report(month, opt("--by", "session"), opt("--client", ALL)).encode("utf-8"))  # bytes: no \r\r\n on Windows
+        return
+    if cmd == "digest":
+        # tracker.py digest [YYYY-MM-DD]: the week (Monday to Sunday) holding that day; last week by default
+        set_lang(LANG_DEFAULT)
+        ingest()
+        day = next((x for x in sys.argv[2:] if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", x)), None)
+        d = date.fromisoformat(day) if day else date.today() - timedelta(days=7)
+        sys.stdout.flush()
+        sys.stdout.buffer.write(digest(d - timedelta(days=d.weekday())).encode("utf-8"))
         return
     if cmd == "backfill":
         t0 = time.time()

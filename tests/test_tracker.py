@@ -182,6 +182,95 @@ class IngestTest(Base):
         self.assertEqual(self.count(), 1)
 
 
+def now_ts(minutes_ago=0):
+    t = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def turn(sid, mid, cwd="/work/front", branch=None, ctx=40_000, minutes_ago=0, tools=()):
+    d = json.loads(record(sid, now_ts(minutes_ago), mid, inp=ctx, cwd=cwd))
+    if branch:
+        d["gitBranch"] = branch
+    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
+    return json.dumps(d)
+
+
+def shape(sid, mcp=None, deferred=0, system=8_000):
+    tool = lambda n, size: {"name": n, "description": "x" * size, "input_schema": {}}
+    tools = [tool("Bash", 4_000), tool("Read", 4_000)]
+    tools += [tool(f"mcp__{mcp}__{n}", 10_000) for n in ("a", "b")] if mcp else []
+    tools += [dict(tool(f"mcp__later__t{i}", 50), defer_loading=True) for i in range(deferred)]
+    return json.dumps({"type": "api-request-shape", "sessionId": sid, "timestamp": now_ts(),
+                       "shape": {"system": [{"type": "text", "text": "s" * system}], "tools": tools}})
+
+
+class BranchAndFixedCostTest(Base):
+    def test_task_comes_from_the_branch_name(self):
+        for branch, task in (("feature/7067", "7067"), ("fix/ABC-123-login", "ABC-123"), ("task/18499-ui", "18499"),
+                             ("main", None), ("feature/v2", None), ("release/1.10", None), ("", None), (None, None)):
+            self.assertEqual(self.t.task_of(branch), task, branch)
+
+    def test_a_task_spans_repos_and_other_branches_keep_their_name(self):
+        self.write("a.jsonl", [turn("s1", "m1", "/work/front", "feature/7067"), turn("s2", "m2", "/work/back", "feature/7067"),
+                               turn("s3", "m3", "/work/front", "main"), turn("s4", "m4", "/work/nogit")])
+        self.t.ingest()
+        rows = {r["task"] or r["branch"]: r for r in self.t.data(7, self.t.ALL)["branches"]}
+        self.assertEqual(set(rows), {"7067", "main"})
+        self.assertEqual(rows["7067"]["repos"], ["back", "front"])
+        self.assertEqual(rows["7067"]["sessions"], 2)
+
+    def test_fixed_cost_parts_ignore_subagents_and_deferred_tools(self):
+        self.write("s1.jsonl", [shape("s1", mcp="docs", deferred=3), turn("s1", "m1")])
+        sub = os.path.join(self.proj, "s1", "subagents")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "agent-x.jsonl"), "w") as f:
+            f.write(shape("s1", system=10) + "\n")
+        self.t.ingest()
+        fx = self.t.data(7, self.t.ALL)["fixed"]
+        parts = {p["k"]: p["tokens"] for p in fx["parts"]}
+        self.assertEqual(parts["system"], 2_000)
+        self.assertIn("mcp:docs", parts)
+        self.assertNotIn("mcp:later", parts)
+        self.assertEqual(fx["deferred"], 3)
+        self.assertEqual(fx["servers"]["docs"]["sessions"], 1)
+
+    def test_fixed_cost_is_the_smallest_context_read_on_every_turn(self):
+        self.write("s1.jsonl", [turn("s1", "m1", ctx=50_000, minutes_ago=3), turn("s1", "m2", ctx=30_000, minutes_ago=2),
+                                turn("s1", "m3", ctx=90_000, minutes_ago=1)])
+        self.t.ingest()
+        p = self.t.load_prices()["claude-opus-5-5"]
+        fx = self.t.data(7, self.t.ALL)["fixed"]
+        self.assertEqual(fx["base"], 30_000)
+        self.assertAlmostEqual(fx["cost"], 30_000 * (3 * p["cache_read"] + p["cache_write_5m"]) / 1e6, places=6)
+
+    def test_heavy_unused_mcp_server_is_recommended(self):
+        lines = []
+        for i in range(4):
+            lines += [shape(f"s{i}", mcp="docs"), turn(f"s{i}", f"m{i}", minutes_ago=i)]
+        self.write("a.jsonl", lines)
+        self.t.ingest()
+        self.assertIn("mcp", [r["id"] for r in self.t.data(7, self.t.ALL)["recs"]])
+        self.write("b.jsonl", [turn(f"s{i}", f"u{i}", tools=["mcp__docs__a"]) for i in range(2)])
+        self.t.ingest()
+        self.assertNotIn("mcp", [r["id"] for r in self.t.data(7, self.t.ALL)["recs"]])
+
+    def test_old_database_gets_the_branch_and_reads_history_again(self):
+        con = sqlite3.connect(self.t.DB)
+        con.executescript("""CREATE TABLE files(path TEXT PRIMARY KEY, offset INTEGER, size INTEGER);
+            CREATE TABLE msgs(id TEXT PRIMARY KEY, ts TEXT, day TEXT, hour INTEGER, session TEXT, project TEXT, client TEXT,
+              model TEXT, sidechain INTEGER, agent TEXT, inp INTEGER, cw5 INTEGER, cw1h INTEGER, cr INTEGER, out INTEGER,
+              think INTEGER, web INTEGER);
+            INSERT INTO files VALUES('x.jsonl', 500, 500);""")
+        con.commit()
+        con.close()
+        con = self.t.connect()
+        try:
+            self.assertIn("branch", [r[1] for r in con.execute("PRAGMA table_info(msgs)")])
+            self.assertEqual(con.execute("SELECT offset FROM files").fetchone()[0], 0)
+        finally:
+            con.close()
+
+
 class SecretsTest(Base):
     def test_masks(self):
         cases = {
@@ -265,6 +354,24 @@ class DemoAndServerTest(Base):
     def test_empty_client_does_not_break(self):
         r = self.t.data(7, "nobody")
         self.assertEqual(r["sessions"], [])
+
+    def test_demo_has_branches_and_fixed_cost(self):
+        r = self.t.data(30, self.t.ALL)
+        self.assertTrue(any(b["task"] == "PAY-142" for b in r["branches"]))
+        self.assertGreater(r["fixed"]["measured"], 10)
+
+    def test_weekly_digest_is_written_once(self):
+        from datetime import date
+        monday = date.today() - timedelta(days=date.today().weekday())
+        path = self.t.write_digest(monday)
+        self.assertTrue(os.path.basename(path).startswith("tokenometro-week-"))
+        text = read_text(path)
+        self.assertIn("# Tokenometro", text)
+        self.assertIn("PAY-", text)
+        with open(path, "w") as f:
+            f.write("kept")
+        self.t.write_digest(monday)
+        self.assertEqual(read_text(path), "kept")
 
     def test_session_detail(self):
         sid = self.t.data(30, self.t.ALL)["sessions"][0]["session"]
