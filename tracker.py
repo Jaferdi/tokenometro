@@ -47,7 +47,7 @@ def _env(name, default):
 
 
 PORT = int(_env("PORT", "7878"))
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 REPO = "Jaferdi/tokenometro"
 UPDATE_FILE = os.path.join(BASE, "update.json")
 
@@ -81,13 +81,19 @@ def _cfg_get(raw, new, old, default=None):
     return raw[new] if new in raw else raw.get(old, default)
 
 
+# Earlier installs were seeded with these made-up clients as real ones: left untouched they are ignored,
+# so they don't show up in the client selector.
+SAMPLE_CLIENTS = {"company-a": ["/work/company-a"], "company-b": ["/work/company-b", "/clients/b"]}
+
+
 def _load_groups():
     """clients.json: {"clients": {...}, "projects": {...}}. Also accepts the old format (clients at the root)."""
     try:
         raw = read_json(CLIENTS_FILE)
     except Exception:
         raw = {}
-    clean = lambda d: {k: ([v] if isinstance(v, str) else list(v)) for k, v in (d or {}).items() if not k.startswith("_")}
+    clean = lambda d: {k: ([v] if isinstance(v, str) else list(v)) for k, v in (d or {}).items()
+                       if not k.startswith("_") and SAMPLE_CLIENTS.get(k) != v}
     if any(k in raw for k in ("clients", "clientes", "projects", "proyectos")):
         return clean(_cfg_get(raw, "clients", "clientes")), clean(_cfg_get(raw, "projects", "proyectos")), raw
     return clean(raw), {}, {}
@@ -190,6 +196,7 @@ def connect():
         con.commit()
     con.execute("CREATE TABLE IF NOT EXISTS applied(id TEXT PRIMARY KEY, at TEXT, day TEXT, prev TEXT, backup TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS seen(key TEXT PRIMARY KEY, ts TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS dismissed(id TEXT PRIMARY KEY, day TEXT, impact REAL)")
     return con
 
 
@@ -748,6 +755,12 @@ def data(days, client, cut=CUT_DEFAULT):
     mcp = mcp_rec(con, w, a, res["fixed"])
     if mcp:
         res["recs"].append(mcp)
+    chain = main_chain(con, w, a, T)
+    cfg = read_config()
+    for rec in (cache_miss_rec(con, chain), tool_output_rec(con, w, a, chain, cfg), ttl_rec(con, chain, prices, cfg),
+                error_loops_rec(con, w, a, C), claude_md_rec(res["fixed"])):
+        if rec:
+            res["recs"].append(rec)
 
     ids = [x["session"] for x in res["sessions"]]
     if ids:
@@ -766,6 +779,9 @@ def data(days, client, cut=CUT_DEFAULT):
         x["fit"] = mf["by_session"].get(x["session"])
     if mf["rec"]:
         res["recs"].append(mf["rec"])
+    first = con.execute("SELECT MIN(day) FROM msgs").fetchone()[0]
+    span = max(1, min(days, (date.today() - date.fromisoformat(first)).days + 1)) if first else days
+    funnel(con, res["recs"], span, res["kpi_range"]["cost"] / span * 7)
     res["plan"] = plan_info(con, C, tot, res["live"])
     res["unpriced"] = unpriced(res["models"], prices)
     order = {"todo": 0, "warn": 1, "info": 2, "ok": 3}
@@ -930,10 +946,323 @@ def mcp_rec(con, w, a, fx):
                      f"Mira dónde está configurado el servidor MCP {srv} (~/.claude.json, .mcp.json o un plugin) y propón cómo "
                      "activarlo solo en los proyectos que lo usan. Enséñame el diff antes de guardar."),
     }
+def main_chain(con, w, a, T):
+    """Main-conversation requests in order, with what each cache write would have cost at the read price and the
+    read price per token, for the detectors that follow a session turn by turn."""
+    loss = f"({T['cw']} - {T['cr'].replace('cr*', '(cw5+cw1h)*')})"
+    by = {}
+    for r in q(con, f"""SELECT id, session, ts, day, model, inp+cw5+cw1h+cr ctx, cw5+cw1h cw, cw5, cw1h, cr, {loss} loss,
+            {T['cr'].replace('cr*', '1*')} crp FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a):
+        r["t"] = local(r["ts"])
+        by.setdefault(r["session"], []).append(r)
+    return by
+
+
+def cache_miss_rec(con, chain):
+    """The cache is written again in full although the previous request was under a minute or so before: the
+    prefix changed. Counted when the write is over 20K tokens and over half the context, the context didn't shrink
+    by more than 40% (that is a compaction or /clear) nor grow by more than half (a first big read). The cost is the
+    write minus what those tokens would have cost read from the cache. Causes: the model changed, the context was
+    trimmed (it shrank a little: old content cleared near the limit), or nothing visible in the logs."""
+    causes = {}
+    for rows in chain.values():
+        for p, r in zip(rows, rows[1:]):
+            if not (p["t"] and r["t"]) or (r["t"] - p["t"]).total_seconds() >= 300:
+                continue
+            if r["cw"] <= 20000 or r["cw"] <= 0.5 * r["ctx"] or not (0.6 * p["ctx"] <= r["ctx"] <= 1.5 * p["ctx"]):
+                continue
+            k = "model" if r["model"] != p["model"] else "trim" if r["ctx"] < 0.95 * p["ctx"] else "other"
+            c = causes.setdefault(k, {"n": 0, "cost": 0.0, "sessions": set(), "days": set()})
+            c["n"] += 1
+            c["cost"] += max(r["loss"] or 0, 0)
+            c["sessions"].add(r["session"])
+            c["days"].add(r["day"])
+    if not causes:
+        return None
+    total = sum(c["cost"] for c in causes.values())
+    n = sum(c["n"] for c in causes.values())
+    main = max(causes, key=lambda k: causes[k]["cost"])
+    names = {"model": tr("model changed mid-session", "cambio de modelo a mitad de sesión"),
+             "trim": tr("context trimmed near the limit", "contexto recortado cerca del límite"),
+             "other": tr("no visible cause (MCP or plugins changed, an update…)", "sin causa visible (cambio de MCP o plugins, una actualización…)")}
+    parts = "; ".join(f"{names[k]}: {c['n']} ({money(c['cost'], 1)})" for k, c in sorted(causes.items(), key=lambda x: -x[1]["cost"]))
+    action = {
+        "model": tr("Pick the model when the session starts and keep it: every switch (/model, plan modes that change model) "
+                    "starts the cache from zero for the whole conversation. If you need another model, open a new session.",
+                    "Elige el modelo al empezar la sesión y mantenlo: cada cambio (/model, modos de plan que cambian de modelo) "
+                    "empieza la caché de cero con toda la conversación. Si necesitas otro modelo, abre una sesión nueva."),
+        "trim": tr("Don't let sessions get near the context limit: when they do, old content is cleared and the whole cache is "
+                   "written again, several times. Compact or /clear earlier (autoCompactWindow lower, e.g. 300000).",
+                   "No dejes que las sesiones se acerquen al límite de contexto: entonces se borra contenido antiguo y la caché "
+                   "entera se vuelve a escribir, varias veces. Compacta o haz /clear antes (autoCompactWindow más bajo, p. ej. 300000)."),
+        "other": tr("Avoid changing MCP servers, plugins or settings in the middle of a long session, and start a new one after "
+                    "updating Claude Code: any change in the tools or the system prompt invalidates the cache.",
+                    "Evita cambiar servidores MCP, plugins o ajustes en mitad de una sesión larga, y empieza una nueva después "
+                    "de actualizar Claude Code: cualquier cambio en las herramientas o el prompt de sistema invalida la caché."),
+    }[main]
+    sessions = set().union(*(c["sessions"] for c in causes.values()))
+    days = set().union(*(c["days"] for c in causes.values()))
+    return {
+        "id": "cache-miss", "title": tr("The cache was rebuilt from scratch without a pause",
+                                        "La caché se rehízo entera sin que hubiera pausa"),
+        "status": "todo", "impact": total,
+        "impact_note": tr("measured: each rewrite minus what those tokens cost read from the cache",
+                          "medido: cada reescritura menos lo que esos tokens cuestan leídos de la caché"),
+        "confidence": tr("high for the amount, medium for the cause", "alta en el importe, media en la causa"),
+        "evidence": tr(f"{n} time(s) a request wrote the whole conversation to the cache again less than 5 minutes after the "
+                       f"previous one, in {len(sessions)} session(s): {money(total, 1)}. By cause: {parts}.",
+                       f"{n} vez(es) una petición volvió a escribir toda la conversación en la caché menos de 5 minutos después "
+                       f"de la anterior, en {len(sessions)} sesión(es): {money(total, 1)}. Por causa: {parts}."),
+        "action": action,
+        "verify": tr("This card's amount drops and the main cause disappears from the list.",
+                     "El importe de esta tarjeta baja y la causa principal desaparece de la lista."),
+        "tradeoff": tr("None to speak of; it is about when you change things, not what you use.",
+                       "Ninguna relevante; es cuándo cambias las cosas, no qué usas."),
+        "metric": n, "metric_label": tr("cache rebuilds without a pause", "cachés rehechas sin pausa"),
+        "sample": {"sessions": len(sessions), "days": len(days)},
+        "tools": [],
+        "prompt": "",
+    }
+
+
+def tool_output_rec(con, w, a, chain, cfg):
+    """A tool result over ~5K tokens stays in the context and is read again on every later turn, until a
+    compaction. Counted for every tool but Read (it has its own card), on the main conversation. The estimate is
+    conservative: only the part over 2.5K tokens, only until the next compaction, and only half of it as avoidable."""
+    after = {}
+    for rows in chain.values():
+        nxt = len(rows)
+        for i in range(len(rows) - 1, -1, -1):
+            if i + 1 < len(rows) and rows[i + 1]["ctx"] < 0.6 * rows[i]["ctx"]:
+                nxt = i + 1
+            after[rows[i]["id"]] = (nxt - i - 1, rows[i]["crp"] or 0)
+    by = {}
+    for r in q(con, f"""SELECT name, msg_id, session, day, result_chars FROM tools WHERE sidechain=0 AND name != 'Read'
+            AND result_chars > 20000 AND {w}""", a):
+        turns, price = after.get(r["msg_id"], (0, 0))
+        b = by.setdefault(r["name"], {"n": 0, "cost": 0.0, "sessions": set(), "days": set(), "tokens": 0})
+        b["n"] += 1
+        b["tokens"] += r["result_chars"] / 4
+        b["cost"] += max(r["result_chars"] / 4 - 2500, 0) * turns * price * 0.5
+        b["sessions"].add(r["session"])
+        b["days"].add(r["day"])
+    if not by:
+        return None
+    total = sum(b["cost"] for b in by.values())
+    n = sum(b["n"] for b in by.values())
+    top = sorted(by.items(), key=lambda x: -x[1]["cost"])[:3]
+    parts = "; ".join(f"{k}: {b['n']} (~{fmt_tok(b['tokens'])} tokens, {money(b['cost'], 2)})" for k, b in top)
+    limit = cfg.get("bashOutputMaxChars")
+    bash = any(k == "Bash" for k, _ in top)
+    tip = (tr(f" bashOutputMaxChars is {limit}; lower it if Bash still leads.", f" bashOutputMaxChars está en {limit}; bájalo si Bash sigue en cabeza.")
+           if limit else tr(" Setting bashOutputMaxChars caps what a command can return.",
+                            " Con bashOutputMaxChars se pone un tope a lo que puede devolver un comando.")) if bash else ""
+    sessions = set().union(*(b["sessions"] for b in by.values()))
+    days = set().union(*(b["days"] for b in by.values()))
+    return {
+        "id": "tool-output", "title": tr("Huge tool outputs stay in the context", "Salidas enormes de herramientas se quedan en el contexto"),
+        "status": "todo", "impact": total,
+        "impact_note": tr("estimate: tokens over 2.5K × later turns until a compaction × cache read price, halved",
+                          "estimación: tokens por encima de 2,5K × turnos siguientes hasta compactar × precio de lectura de caché, a la mitad"),
+        "confidence": tr("medium", "media"),
+        "evidence": tr(f"{n} tool result(s) over ~5K tokens in {len(sessions)} session(s). Each one is read again on every later "
+                       f"turn: ~{money(total, 2)}. Biggest: {parts}.",
+                       f"{n} resultado(s) de herramientas de más de ~5K tokens en {len(sessions)} sesión(es). Cada uno se vuelve a "
+                       f"leer en cada turno siguiente: ~{money(total, 2)}. Los mayores: {parts}."),
+        "action": tr("Ask for only what you need: filter commands (| tail -n 50, grep, --quiet), have scripts print a short "
+                     "summary instead of everything, and send long searches to a subagent so only its conclusion comes back." + tip,
+                     "Pide solo lo que necesitas: filtra los comandos (| tail -n 50, grep, --quiet), haz que los scripts impriman "
+                     "un resumen corto en vez de todo y manda las búsquedas largas a un subagente para que solo vuelva la conclusión." + tip),
+        "verify": tr("This card's count and amount drop.", "El número y el importe de esta tarjeta bajan."),
+        "tradeoff": tr("Sometimes the full output is what you need; then it is worth it.",
+                       "A veces la salida entera es lo que hace falta; entonces compensa."),
+        "metric": n, "metric_label": tr("outputs over ~5K tokens", "salidas de más de ~5K tokens"),
+        "sample": {"sessions": len(sessions), "days": len(days)},
+        "tools": [] if (limit or not bash) else [{"n": "bashOutputMaxChars", "k": tr("setting", "ajuste"),
+                  "why": tr("caps what a Bash command can return", "pone tope a lo que devuelve un comando de Bash"),
+                  "cost": tr("free", "gratis")}],
+        "prompt": tr("Add to my CLAUDE.md a short rule: filter command output (tail, grep, --quiet) and have scripts print a "
+                     "summary, never whole logs. Show me the diff before saving.",
+                     "Añade a mi CLAUDE.md una regla corta: filtrar la salida de los comandos (tail, grep, --quiet) y que los "
+                     "scripts impriman un resumen, nunca logs enteros. Enséñame el diff antes de guardar."),
+    }
+
+
+def price_of(prices):
+    """Per-model price lookup in Python, with the same matching as cost_terms (longest name first)."""
+    default = {"input": 4, "output": 20, "cache_read": 0.2, "cache_write_5m": 5, "cache_write_1h": 8, **prices.get("_default", {})}
+    models = sorted(((m, {**default, **p}) for m, p in prices.items() if not m.startswith("_") and isinstance(p, dict)),
+                    key=lambda x: -len(x[0]))
+    return lambda model: next((p for m, p in models if m in (model or "")), default)
+
+
+def ttl_rec(con, chain, prices, cfg):
+    """Which cache duration pays off, measured on the user's own pauses. A 1-hour cache costs more to write but keeps
+    the conversation warm through pauses of 5 to 60 minutes; a 5-minute one is cheaper to write and is rebuilt after
+    each such pause. Sessions are split by the duration they used; the other one is simulated on the same requests,
+    and only the tokens the previous request had in context are counted as kept or rebuilt."""
+    price = price_of(prices)
+    one = {"extra": 0.0, "kept": 0.0, "pauses": 0, "sessions": set(), "days": set()}
+    five = {"extra": 0.0, "lost": 0.0, "pauses": 0, "sessions": set(), "days": set()}
+    for rows in chain.values():
+        h1 = sum(r["cw1h"] for r in rows) > sum(r["cw5"] for r in rows)
+        d = one if h1 else five
+        for r in rows:
+            p = price(r["model"])
+            d["extra"] += r["cw"] * (p["cache_write_1h"] - p["cache_write_5m"]) / 1e6
+        for prev, r in zip(rows, rows[1:]):
+            if not (prev["t"] and r["t"]) or not 300 < (r["t"] - prev["t"]).total_seconds() <= 3600:
+                continue
+            p = price(r["model"])
+            if h1:
+                one["kept"] += min(r["cr"], prev["ctx"]) * (p["cache_write_5m"] - p["cache_read"]) / 1e6
+            else:
+                five["lost"] += min(r["cw"], prev["ctx"]) * (p["cache_write_1h"] - p["cache_read"]) / 1e6
+            d["pauses"] += 1
+            d["sessions"].add(r["session"])
+            d["days"].add(r["day"])
+    done = {r["id"]: r["day"] for r in q(con, "SELECT id, day FROM applied WHERE id IN ('ttl-1h', 'ttl-5m')")}
+    to5 = one["extra"] - one["kept"] if one["extra"] > one["kept"] and cfg.get("promptCacheTtl") != "5m" else 0
+    to1 = five["lost"] - five["extra"] if five["lost"] > five["extra"] and cfg.get("promptCacheTtl") != "1h" else 0
+    if not (to5 or to1 or done):
+        return None
+    rid = "ttl-5m" if (to5 >= to1 if (to5 or to1) else "ttl-5m" in done) else "ttl-1h"
+    save = to5 if rid == "ttl-5m" else to1
+    d = one if rid == "ttl-5m" else five
+    status = "todo" if not done.get(rid) else ("warn" if save else "ok")
+    if rid == "ttl-5m":
+        evidence = tr(f"Your sessions use the 1-hour cache: writing it cost {money(one['extra'], 1)} more than a 5-minute one, and it "
+                      f"only saved {money(one['kept'], 1)} across {one['pauses']} pause(s) of 5 to 60 minutes. Net: {money(save, 1)} lost.",
+                      f"Tus sesiones usan la caché de 1 hora: escribirla costó {money(one['extra'], 1)} más que la de 5 minutos, y solo "
+                      f"ahorró {money(one['kept'], 1)} en {one['pauses']} pausa(s) de 5 a 60 minutos. Neto: {money(save, 1)} perdidos.")
+        action = tr('Set "promptCacheTtl": "5m": you rarely stop between 5 and 60 minutes, so the longer cache doesn\'t pay for itself.',
+                    'Pon "promptCacheTtl": "5m": casi nunca paras entre 5 y 60 minutos, así que la caché larga no compensa.')
+    else:
+        evidence = tr(f"Your sessions use the 5-minute cache and were rebuilt after {five['pauses']} pause(s) of 5 to 60 minutes: "
+                      f"{money(five['lost'], 1)}. A 1-hour cache would have cost {money(five['extra'], 1)} more to write. Net: {money(save, 1)} lost.",
+                      f"Tus sesiones usan la caché de 5 minutos y se rehicieron tras {five['pauses']} pausa(s) de 5 a 60 minutos: "
+                      f"{money(five['lost'], 1)}. La de 1 hora habría costado {money(five['extra'], 1)} más de escribir. Neto: {money(save, 1)} perdidos.")
+        action = tr('Set "promptCacheTtl": "1h": you often stop for a few minutes, and each time the whole conversation is written again.',
+                    'Pon "promptCacheTtl": "1h": paras a menudo unos minutos y cada vez se vuelve a escribir toda la conversación.')
+    if done.get(rid):
+        evidence = tr(f"Applied on {done[rid]}. ", f"Aplicado el {done[rid]}. ") + (evidence if save else tr(
+            "The sessions in this period no longer lose money on the cache duration.",
+            "Las sesiones de este periodo ya no pierden dinero por la duración de la caché."))
+    return {
+        "id": rid, "title": tr("The cache duration doesn't fit how you pause", "La duración de la caché no encaja con tus pausas"),
+        "status": status, "impact": save,
+        "impact_note": tr("simulated on your own requests with the other duration, at prices.json",
+                          "simulado sobre tus propias peticiones con la otra duración, con prices.json"),
+        "confidence": tr("high", "alta"),
+        "evidence": evidence, "action": action,
+        "verify": tr("A week later this card no longer finds a net loss.", "Una semana después esta tarjeta ya no encuentra pérdida neta."),
+        "tradeoff": tr("On a subscription this changes how fast you use your limits, not a bill. Subagents have their own "
+                       "setting (subagentPromptCacheTtl), and the CLAUDE_CODE_PROMPT_CACHE_TTL variable wins over this one.",
+                       "Con suscripción esto cambia lo rápido que gastas tus límites, no una factura. Los subagentes tienen su "
+                       "propio ajuste (subagentPromptCacheTtl), y la variable CLAUDE_CODE_PROMPT_CACHE_TTL manda sobre este."),
+        "metric": round(save, 2), "metric_money": True, "metric_label": tr(f"{sym()} lost net", f"{sym()} perdidos netos"),
+        "sample": {"sessions": len(d["sessions"]), "days": len(d["days"])} if not done.get(rid) else None,
+        "tools": [], "prompt": "",
+    }
+
+
+def error_loops_rec(con, w, a, C):
+    """A tool that fails three or more times in a row in the same conversation: each retry is a full request.
+    Counted on the main conversation; the cost is that of the requests that issued the retries (not the first try)."""
+    rows = q(con, f"""SELECT t.session, t.name, t.is_error, t.day, {C.replace('model', 'm.model')} cost FROM tools t
+        JOIN msgs m ON m.id = t.msg_id WHERE t.sidechain=0 AND {w.replace('day', 't.day').replace('client', 't.client')}
+        ORDER BY t.session, m.ts""", a)
+    loops = {}
+    run = []
+
+    def close():
+        if len(run) >= 3:
+            b = loops.setdefault(run[0]["name"], {"n": 0, "tries": 0, "cost": 0.0, "sessions": set(), "days": set()})
+            b["n"] += 1
+            b["tries"] += len(run)
+            b["cost"] += sum(x["cost"] or 0 for x in run[1:])
+            b["sessions"].add(run[0]["session"])
+            b["days"].add(run[0]["day"])
+    for r in rows:
+        if run and (r["session"] != run[-1]["session"] or r["name"] != run[-1]["name"] or not r["is_error"]):
+            close()
+            run = []
+        if r["is_error"]:
+            run.append(r)
+    close()
+    if not loops:
+        return None
+    total = sum(b["cost"] for b in loops.values())
+    n = sum(b["n"] for b in loops.values())
+    top = sorted(loops.items(), key=lambda x: -x[1]["cost"])[:3]
+    parts = "; ".join(f"{k}: {b['n']} ({b['tries']} tries, {money(b['cost'], 2)})" for k, b in top)
+    parts_es = "; ".join(f"{k}: {b['n']} ({b['tries']} intentos, {money(b['cost'], 2)})" for k, b in top)
+    sessions = set().union(*(b["sessions"] for b in loops.values()))
+    days = set().union(*(b["days"] for b in loops.values()))
+    return {
+        "id": "error-loops", "title": tr("A tool kept failing and was retried again and again",
+                                         "Una herramienta fallaba y se reintentaba una y otra vez"),
+        "status": "todo", "impact": total,
+        "impact_note": tr("measured: the requests that issued the retries, not the first try",
+                          "medido: las peticiones de los reintentos, sin contar el primer intento"),
+        "confidence": tr("high for the amount, medium for how much is avoidable", "alta en el importe, media en cuánto se puede evitar"),
+        "evidence": tr(f"{n} run(s) of 3 or more failures in a row in {len(sessions)} session(s): {money(total, 2)}. {parts}.",
+                       f"{n} racha(s) de 3 o más fallos seguidos en {len(sessions)} sesión(es): {money(total, 2)}. {parts_es}."),
+        "action": tr("When the same tool fails twice, stop and change the approach: read the error, check the path, the options or "
+                     "the environment, or ask. For scripts and browser automation, keep the ones that work and reuse them.",
+                     "Cuando la misma herramienta falla dos veces, para y cambia de enfoque: lee el error, revisa la ruta, las "
+                     "opciones o el entorno, o pregunta. Con scripts y automatización del navegador, guarda los que funcionan y reutilízalos."),
+        "verify": tr("This card's runs and amount drop.", "Las rachas y el importe de esta tarjeta bajan."),
+        "tradeoff": tr("None to speak of.", "Ninguna relevante."),
+        "metric": n, "metric_label": tr("runs of 3+ failures", "rachas de 3+ fallos"),
+        "sample": {"sessions": len(sessions), "days": len(days)},
+        "tools": [],
+        "prompt": tr("Add to my ~/.claude/CLAUDE.md a short rule: if the same tool fails twice in a row, stop, explain the error and "
+                     "change the approach instead of retrying. Show me the diff before saving.",
+                     "Añade a mi ~/.claude/CLAUDE.md una regla corta: si la misma herramienta falla dos veces seguidas, parar, explicar "
+                     "el error y cambiar de enfoque en vez de reintentar. Enséñame el diff antes de guardar."),
+    }
+
+
+def claude_md_rec(fx):
+    """The global CLAUDE.md (with its @imports) is read on every turn of every session. Above ~2.5K tokens, the part
+    over 2K is what could move to skills or files read on demand; half of it is counted, to stay on the safe side."""
+    md = next((p["tokens"] for p in fx["parts"] if p["k"] == "claude_md"), 0)
+    if md <= 2500 or not fx["base"]:
+        return None
+    save = fx["cost"] * (md - 2000) / fx["base"] * 0.5
+    return {
+        "id": "claude-md", "title": tr("Your CLAUDE.md is read on every single turn", "Tu CLAUDE.md se lee en cada turno"),
+        "status": "todo", "impact": save,
+        "impact_note": tr("its share of the fixed cost, only the part over 2K tokens, halved",
+                          "su parte del coste fijo, solo lo que pasa de 2K tokens, a la mitad"),
+        "confidence": tr("medium", "media"),
+        "evidence": tr(f"~/.claude/CLAUDE.md and its @imports take ~{fmt_tok(md)} tokens and go into every request of "
+                       f"{fx['sessions']} session(s). Trimming it to ~2K would save about {money(save, 2)} in the period.",
+                       f"~/.claude/CLAUDE.md y sus @imports ocupan ~{fmt_tok(md)} tokens y van en cada petición de "
+                       f"{fx['sessions']} sesión(es). Dejarlo en ~2K ahorraría unos {money(save, 2)} en el periodo."),
+        "action": tr("Keep in CLAUDE.md only what applies to almost every task. Move procedures and long reference to skills "
+                     "(loaded only when used) or to files you point to, and import project-specific files only in that project.",
+                     "Deja en CLAUDE.md solo lo que aplica a casi todas las tareas. Pasa procedimientos y referencias largas a "
+                     "skills (se cargan solo al usarlas) o a ficheros que se citen, e importa lo de cada proyecto solo en ese proyecto."),
+        "verify": tr("The fixed cost card shows CLAUDE.md smaller.", "La tarjeta de coste fijo muestra CLAUDE.md más pequeño."),
+        "tradeoff": tr("An instruction moved to a skill is only followed when the skill loads.",
+                       "Una instrucción que pasa a una skill solo se sigue cuando la skill se carga."),
+        "metric": md, "metric_label": tr("tokens in CLAUDE.md", "tokens en CLAUDE.md"),
+        "tools": [],
+        "prompt": tr("Read my ~/.claude/CLAUDE.md and its @imports and propose, section by section, what to keep, what to move to "
+                     "a skill and what to drop, aiming at under 2K tokens. Don't change anything until I approve the diff.",
+                     "Lee mi ~/.claude/CLAUDE.md y sus @imports y propón, sección a sección, qué dejar, qué pasar a una skill y qué "
+                     "quitar, para que quede por debajo de 2K tokens. No cambies nada hasta que apruebe el diff."),
+    }
+
+
 # Recommendations the dashboard can apply itself: always a fixed change decided here, never a value sent by the page
 APPLY = {
     "ctx": {"autoCompactWindow": 300000},
     "subagent-model": {"env.CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
+    "ttl-5m": {"promptCacheTtl": "5m"},
+    "ttl-1h": {"promptCacheTtl": "1h"},
 }
 _ABSENT = {"__tokenometro__": "absent"}
 
@@ -1080,6 +1409,7 @@ def read_config():
     except Exception:
         st = {}
     cfg["autoCompactWindow"] = st.get("autoCompactWindow")
+    cfg["promptCacheTtl"] = st.get("promptCacheTtl")
     hooks = st.get("hooks") or {}
     hook_sets = [hooks]
     for key, on in (st.get("enabledPlugins") or {}).items():
@@ -1417,6 +1747,81 @@ def snapshot_recs():
     con.commit()
     con.close()
     write_recs_file(r["recs"], r["kpi_range"])
+
+
+STUDY_DAYS, STUDY_SESSIONS, STUDY_SHARE, STUDY_FLOOR, STUDY_CAP = 3, 3, 0.01, 0.25, 2.0
+
+
+def funnel(con, recs, span, week_cost):
+    """A pending card is only recommended once it holds up: seen on STUDY_DAYS of the last 7 daily snapshots, saving
+    at least STUDY_SHARE of this user's weekly spend (between STUDY_FLOOR and STUDY_CAP USD a week), and, when the
+    detector says how many sessions it saw, in at least STUDY_SESSIONS of them on two different days. Relative so a
+    light user still gets advice; capped so a heavy user isn't told that 8 USD a month is too little to matter. What falls short waits under «Under study» saying what
+    is missing. Applied cards are always shown: they are being tracked. A dismissed card stays hidden until its
+    weekly cost doubles."""
+    week = (date.today() - timedelta(days=6)).isoformat()
+    seen = dict(con.execute("""SELECT id, COUNT(*) FROM recs_hist WHERE day >= ? AND status IN ('todo', 'warn')
+                               GROUP BY id""", [week]).fetchall())
+    last = dict(con.execute("""SELECT id, impact FROM recs_hist h WHERE day = (SELECT MAX(day) FROM recs_hist
+                               WHERE id = h.id)""").fetchall())
+    gone = dict(con.execute("SELECT id, impact FROM dismissed").fetchall())
+    floor = max(STUDY_FLOOR, min(STUDY_SHARE * week_cost, STUDY_CAP))
+    for x in recs:
+        x["missing"], x["stage"] = [], "shown"
+        if x["status"] != "todo":
+            continue
+        if x["id"] in gone:
+            was, now = gone[x["id"]], last.get(x["id"])
+            if not (was and now and now >= 2 * was):
+                x["stage"] = "dismissed"
+                continue
+            con.execute("DELETE FROM dismissed WHERE id=?", (x["id"],))
+            con.commit()
+        n = seen.get(x["id"], 0)
+        if n < STUDY_DAYS:
+            x["missing"].append(tr(f"seen on {n} of the last 7 days; needs {STUDY_DAYS}",
+                                   f"vista {n} de los últimos 7 días; necesita {STUDY_DAYS}"))
+        if x["impact"] is not None:
+            wk = x["impact"] / span * 7
+            if wk < floor:
+                x["missing"].append(tr(f"saves about {money(wk, 2)}/week; needs {money(floor, 2)}/week for your spend",
+                                       f"ahorra unos {money(wk, 2)}/semana; con tu gasto necesita {money(floor, 2)}/semana"))
+        smp = x.get("sample") or {}
+        if smp.get("sessions") is not None and (smp["sessions"] < STUDY_SESSIONS or smp.get("days", 0) < 2):
+            x["missing"].append(tr(f"found in {smp['sessions']} session(s) on {smp.get('days', 0)} day(s); needs {STUDY_SESSIONS} on 2 days",
+                                   f"encontrada en {smp['sessions']} sesión(es) y {smp.get('days', 0)} día(s); necesita {STUDY_SESSIONS} en 2 días"))
+        if x["missing"]:
+            x["stage"] = "study"
+    return recs
+
+
+def _rec_id(rid):
+    if not re.fullmatch(r"[a-z0-9-]{1,40}", str(rid)):
+        raise ValueError("unknown recommendation")
+    return str(rid)
+
+
+def dismiss_rec(rid):
+    """«Not for me»: hidden until its cost doubles; the last snapshot's impact is the reference."""
+    rid = _rec_id(rid)
+    con = connect()
+    try:
+        row = con.execute("SELECT impact FROM recs_hist WHERE id=? ORDER BY day DESC LIMIT 1", (rid,)).fetchone()
+        con.execute("INSERT OR REPLACE INTO dismissed VALUES (?, ?, ?)",
+                    (rid, date.today().isoformat(), row[0] if row else None))
+        con.commit()
+    finally:
+        con.close()
+
+
+def restore_rec(rid):
+    rid = _rec_id(rid)
+    con = connect()
+    try:
+        con.execute("DELETE FROM dismissed WHERE id=?", (rid,))
+        con.commit()
+    finally:
+        con.close()
 
 
 def attach_history(con, recs):
@@ -1887,6 +2292,16 @@ header.top{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:flex-end;justif
 h1{font:600 26px/1.1 var(--fd);margin:0;letter-spacing:.01em}
 #gen{margin:4px 0 0;color:var(--mut);font-size:12px}
 header.top>div:first-child{flex:1 1 320px;min-width:0}
+.topbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-bottom:1px solid transparent;transition:border-color .2s}
+.topbar.stuck{border-bottom-color:var(--line)}
+.topbar-in{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center;justify-content:space-between;padding:10px 28px;max-width:1680px;margin:0 auto}
+.nav{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none;min-width:0;flex:1 1 420px}.nav::-webkit-scrollbar{display:none}
+.nav a{flex:none;color:var(--mut);text-decoration:none;font-weight:600;font-size:13px;padding:6px 10px;border-radius:8px;display:inline-flex;align-items:center;gap:6px;transition:color .15s,background .15s}
+.nav a:hover{color:var(--fg);background:var(--sunk)}
+.nav a[aria-current]{color:var(--fg);background:var(--card);box-shadow:inset 0 -2px 0 var(--a)}
+.nav .n{font-size:11px;line-height:1;padding:3px 6px;border-radius:9px;background:var(--a);color:var(--reel)}
+main>section{scroll-margin-top:calc(var(--barh,56px) + 12px)}
+@media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
 .ctl{display:flex;gap:8px;flex-wrap:wrap}
 select,button,input[type=date]{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font:inherit;font-size:13px}
 button{cursor:pointer;font-weight:600;transition:border-color .15s,background .15s}button:hover{border-color:var(--a)}
@@ -2002,6 +2417,13 @@ th.s:focus-visible,tr.click:focus-visible{outline:2px solid var(--c);outline-off
 .rec .cp,.rec .ap{font:600 12px var(--fb);border:1px solid var(--line);background:var(--card);color:inherit;border-radius:8px;padding:3px 10px;cursor:pointer}
 .rec .cp:hover,.rec .ap:hover{border-color:var(--a)}.rec .ap:not([data-u]){background:var(--a);border-color:var(--a);color:var(--card)}.rec .ap:disabled{opacity:.5;cursor:wait}.rec .cp.ok{border-color:var(--b);color:var(--b)}
 .rec.chg{animation:chg 2.4s var(--ease)}@keyframes chg{0%,30%{box-shadow:0 0 0 2px var(--a)}100%{box-shadow:0 0 0 0 transparent}}
+.rec .dm{position:absolute;right:14px;bottom:9px;font:12px var(--fb);background:none;border:0;color:var(--mut);cursor:pointer;padding:2px 4px;border-radius:6px}
+.rec .dm:hover{color:var(--f)}.rec .dm:disabled,#recs_more .rs:disabled{opacity:.5;cursor:wait}
+#recs_more details.more{margin-top:12px;border:1px solid var(--line);border-radius:12px;padding:8px 14px;font-size:13px}
+#recs_more summary{cursor:pointer;font-weight:600}#recs_more p{margin:6px 0;font-size:12px}
+#recs_more ul{margin:4px 0 2px;padding-left:18px;display:flex;flex-direction:column;gap:6px}
+#recs_more .rs{font:600 12px var(--fb);border:1px solid var(--line);background:var(--card);color:inherit;border-radius:8px;padding:2px 9px;cursor:pointer;margin-left:6px}
+#recs_more .rs:hover{border-color:var(--a)}
 .rec details summary{cursor:pointer;color:var(--mut);font-size:12px;margin-top:8px}.rec details[open] dl{animation:fade .3s var(--ease)}
 @keyframes fade{from{opacity:0;transform:translateY(-3px)}}
 
@@ -2014,45 +2436,47 @@ svg.grow rect{transform-box:fill-box;transform-origin:50% 100%;animation:grow .8
 .cmp td:nth-child(4){font-weight:600}
 ul{margin:0;padding-left:18px}li{margin:4px 0}
 
-@media (max-width:820px){.hero{grid-template-columns:1fr}.odo{font-size:48px}header.top,main{padding-left:16px;padding-right:16px}}
+@media (max-width:820px){.hero{grid-template-columns:1fr}.odo{font-size:48px}header.top,main,.topbar-in{padding-left:16px;padding-right:16px}.topbar .ctl{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;flex:1 1 100%}.topbar .ctl>*{flex:none}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style></head><body>
-<header class="top"><div><h1 data-i18n="title">Tokenometro</h1><p id="gen"></p><div id="alerts" class="chips" role="status" aria-live="polite"></div></div>
+<header class="top"><div><h1 data-i18n="title">Tokenometro</h1><p id="gen"></p><div id="alerts" class="chips" role="status" aria-live="polite"></div></div></header>
+<div class="topbar" id="topbar"><div class="topbar-in"><nav class="nav" id="nav" data-i18n-aria="nav_label" aria-label="Sections">
+<a href="#s-now" data-i18n="nav_now">Now</a><a href="#plancard" id="nav_plan" hidden data-i18n="nav_plan">Plan</a><a href="#s-summary" data-i18n="nav_summary">Summary</a><a href="#s-recs"><span data-i18n="nav_recs">Improvements</span><span class="n" id="nav_recs_n" hidden></span></a><a href="#s-daily" data-i18n="nav_daily">By day</a><a href="#s-ba" data-i18n="nav_ba">Before/after</a><a href="#s-breakdown" data-i18n="nav_breakdown">Breakdown</a><a href="#s-sessions" data-i18n="nav_sessions">Sessions</a></nav>
 <div class="ctl"><select id="days" data-i18n-aria="period" aria-label="Period"><option value="1" data-i18n="today">Today</option><option value="7" selected data-i18n="d7">7 days</option><option value="30" data-i18n="d30">30 days</option><option value="90" data-i18n="d90">90 days</option></select>
 <select id="client" data-i18n-aria="client" aria-label="Client"><option value="all" data-i18n="allclients">All clients</option></select>
 <select id="cur" data-i18n-aria="currency" aria-label="Currency"><option value="EUR">€</option><option value="USD">$</option></select>
 <select id="lang" data-i18n-aria="language" aria-label="Language"><option value="en">EN</option><option value="es">ES</option></select>
 <select id="theme" data-i18n-aria="theme" aria-label="Theme"><option value="system" data-i18n="th_system">Auto</option><option value="light" data-i18n="th_light">Light</option><option value="dark" data-i18n="th_dark">Dark</option></select>
-<button id="re" data-i18n="refresh">Refresh</button></div></header>
+<button id="re" data-i18n="refresh">Refresh</button></div></div></div>
 <main>
-<section class="hero">
+<section class="hero" id="s-now">
  <div class="meter"><p class="lbl" data-i18n="spent_today">Spent today, at API rates</p><div class="odo" id="odo" role="img"></div><p class="sub" id="todaysub"></p>
   <div class="spark" id="spark" data-i18n-aria="spark_aria" aria-label="Spend today by hour"></div><div class="spark-x"><span>0 h</span><span>6 h</span><span>12 h</span><span>18 h</span><span>23 h</span></div></div>
  <div class="now"><h2><span data-i18n="right_now">Right now</span> <span class="pulse" id="pulse" data-i18n-title="active_title" title="There are active sessions"></span></h2><p class="mut" id="livehint"></p><div id="live"></div></div>
 </section>
 <section class="card wide" id="plancard" hidden><h2><span data-i18n="your_plan">Your plan</span> <span class="badge" id="planage"></span></h2><div class="plan" id="plan"></div>
 <p class="mut" style="font-size:12px;margin:8px 0 0" data-i18n="plan_note"></p></section>
-<section class="card wide"><h2 data-i18n="summary">Period summary</h2><div class="kpis" id="kpis"></div>
+<section class="card wide" id="s-summary"><h2 data-i18n="summary">Period summary</h2><div class="kpis" id="kpis"></div>
 <p class="note"><span id="eqn"></span> <span data-i18n="eq_rest"></span></p></section>
-<section class="card wide"><h2><span data-i18n="recs_title">Recommended improvements</span> <span class="badge" data-i18n="recs_badge"></span></h2><div class="recs" id="recs"></div>
+<section class="card wide" id="s-recs"><h2><span data-i18n="recs_title">Recommended improvements</span> <span class="badge" data-i18n="recs_badge"></span></h2><div class="recs" id="recs"></div><div id="recs_more"></div>
 <p class="mut" style="font-size:12px;margin:8px 0 0" data-i18n="recs_legend"></p></section>
-<section class="card wide"><h2 data-i18n="daily_title"></h2><div class="leg" id="leg"></div><div id="daily"></div>
+<section class="card wide" id="s-daily"><h2 data-i18n="daily_title"></h2><div class="leg" id="leg"></div><div id="daily"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="daily_note"></p></section>
-<section class="card wide"><h2><span data-i18n="before_after"></span> <input type="date" id="cut" data-i18n-aria="cut_label"></h2><div id="cmp"></div>
+<section class="card wide" id="s-ba"><h2><span data-i18n="before_after"></span> <input type="date" id="cut" data-i18n-aria="cut_label"></h2><div id="cmp"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="ba_note"></p></section>
-<section class="card"><h2 data-i18n="by_model"></h2><div id="models"></div></section>
+<section class="card" id="s-breakdown"><h2 data-i18n="by_model"></h2><div id="models"></div></section>
 <section class="card"><h2 data-i18n="by_client"></h2><div id="clients"></div>
 <div class="csv"><span class="mut" data-i18n="csv_hint"></span><span class="csvc"><input type="month" id="month" data-i18n-aria="month_label"><a class="btn" id="csv_s" data-i18n="csv_sessions"></a><a class="btn" id="csv_c" data-i18n="csv_clients"></a></span></div></section>
 <section class="card"><h2><span data-i18n="by_branch"></span> <span class="badge" data-i18n="branch_badge"></span></h2><div id="branches"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="branch_note"></p></section>
 <section class="card"><h2 data-i18n="fixed_title"></h2><div id="fixed"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="fixed_note"></p></section>
-<section class="card wide"><h2><span data-i18n="costliest_sessions"></span> <span class="badge" data-i18n="sess_badge"></span></h2><div class="leg" id="sleg"></div><div id="sessions"></div></section>
+<section class="card wide" id="s-sessions"><h2><span data-i18n="costliest_sessions"></span> <span class="badge" data-i18n="sess_badge"></span></h2><div class="leg" id="sleg"></div><div id="sessions"></div></section>
 <section class="card wide"><h2 data-i18n="costliest_agents"></h2><div id="agents"></div></section>
 </main>
 <script>
 const I18N={
-en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',d90:'90 days',client:'Client',allclients:'All clients',others:'Others',currency:'Currency',language:'Language',theme:'Theme',th_system:'◐ Auto (system)',th_light:'☀ Light',th_dark:'☾ Dark',
+en:{title:'Tokenometro',nav_label:'Sections',nav_now:'Now',nav_plan:'Plan',nav_summary:'Summary',nav_recs:'Improvements',nav_daily:'By day',nav_ba:'Before/after',nav_breakdown:'Breakdown',nav_sessions:'Sessions',period:'Period',today:'Today',d7:'7 days',d30:'30 days',d90:'90 days',client:'Client',allclients:'All clients',others:'Others',currency:'Currency',language:'Language',theme:'Theme',th_system:'◐ Auto (system)',th_light:'☀ Light',th_dark:'☾ Dark',
  refresh:'Refresh',refreshing:'Refreshing…',spent_today:'Spent today, at API prices (equivalent cost)',spark_aria:'Spend today by hour',right_now:'Right now',active_title:'There are active sessions',
  your_plan:'Your plan',plan_note:'The % is calculated by Claude Code and includes what you use in claude.ai. The ceiling is an estimate: what you have spent here divided by the % used.',
  summary:'Period summary',eq_rest:'With a subscription (Pro, Max, Team…) you do not pay this amount, but it lets you compare periods and habits; with the API it is roughly your real bill.',
@@ -2079,10 +2503,10 @@ en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',
  session:'Session',best_model:'Cost-effective model',went_on:'Went on',top_tool:'Top tool',messages_h:'Messages',compact_h:'Compact.',
  st_todo:'Pending',st_warn:'Applied · review',st_ok:'Applied · working',st_info:'Informational',pending_since:'pending since {d}',fine_since:'fine since {d}',current_since:'current since {d}',
  same_as:'same as {d}',trend:'{a} → {b} since {d}',short_sample:'short sample: {n} day(s) since the cut, 7 needed',hist_start:'history starts today',observing:'Under observation',before_approx:'before ≈',
- evidence:'Evidence',what_to_do:'What to do',with_:'With',check:'Check',tradeoff_h:'Trade-off, calculation and confidence',tradeoff:'Trade-off',calc:'Calculation',confidence:'Confidence',nothing:'Nothing to recommend in this period.',
+ evidence:'Evidence',what_to_do:'What to do',with_:'With',check:'Check',tradeoff_h:'Trade-off, calculation and confidence',tradeoff:'Trade-off',calc:'Calculation',confidence:'Confidence',nothing:'Nothing to recommend in this period.',nothing_yet:'Nothing proven yet: {n} under study, below.',study_h:'Under study ({n})',study_hint:'Found in your data but not proven yet. They move up on their own once they repeat on 3 days and save enough for you.',dismissed_h:'Dismissed ({n})',dismissed_hint:'Hidden by you. The ones with an amount come back on their own if it doubles.',dismiss:'Not for me',dismiss_tip:'Hide this card; it comes back if its cost doubles',restore:'Restore',
  cost_day:'Cost per day',cost_msg:'Cost per message',turns_msg:'Turns per message',avg_ctx:'Average context',change:'Change',short_warn:'Short sample: {n} day(s) per side. Inconclusive (it depends a lot on the type of task).',
  win_cap:'You have used <b>{c}</b> eq. ({tok} tokens) of the ≈<b>{cap}</b> this window seems to allow; ≈<b>{left}</b> left{now}.',win_now:' (≈{n} % if counted up to this minute)',win_nocap:'You have used <b>{c}</b> eq. ({tok} tokens) in this window. The allowance is only estimated once you pass 10 % of the plan.',period_sub:'{n} tokens in total',help_period:'Total equivalent cost of the selected period, and the tokens (pieces of text) processed.',help_msg:'Average cost of each message you send. A turn is one reply of the model; a message can trigger several.',help_sub:'Subagents are helper agents Claude launches on its own (searching, reviewing…). Their cost is part of the total.',help_cw:'Cache write: saving the conversation so it is cheap to resend. It is paid on a new session, after a compaction, when switching model and after a long pause.',help_over:'Context over {n}: when a conversation grows past that size, every reply resends the excess. A compaction is Claude summarising the chat to shrink it.',help_best:'Cheapest model that would have been enough given what the session did; the figure is the estimated saving.',help_went:'What most of the cost of this session went to.',help_compact:'Times Claude summarised the conversation because it was too long.',help_msgs:'Messages you sent in the session.',daily_note:'Cache read: resending the conversation from the cache (cheap per token). Cache write: saving new context (pricier). Uncached input: new text sent without caching. Output: what the model writes, including its reasoning (thinking).',odo_eur:'euros today',odo_usd:'dollars today',h_title:'{h} h: {v}'},
-es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días',d90:'90 días',client:'Cliente',allclients:'Todos los clientes',others:'Otros',currency:'Moneda',language:'Idioma',theme:'Tema',th_system:'◐ Auto (sistema)',th_light:'☀ Claro',th_dark:'☾ Oscuro',
+es:{title:'Tokenómetro',nav_label:'Secciones',nav_now:'Ahora',nav_plan:'Plan',nav_summary:'Resumen',nav_recs:'Mejoras',nav_daily:'Por día',nav_ba:'Antes/después',nav_breakdown:'Desglose',nav_sessions:'Sesiones',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días',d90:'90 días',client:'Cliente',allclients:'Todos los clientes',others:'Otros',currency:'Moneda',language:'Idioma',theme:'Tema',th_system:'◐ Auto (sistema)',th_light:'☀ Claro',th_dark:'☾ Oscuro',
  refresh:'Actualizar',refreshing:'Actualizando…',spent_today:'Gastado hoy, a precios de API (coste equivalente)',spark_aria:'Gasto de hoy por horas',right_now:'Ahora mismo',active_title:'Hay sesiones activas',
  your_plan:'Tu plan',plan_note:'El % lo calcula Claude Code e incluye lo que uses en claude.ai. El techo es una estimación: lo que llevas gastado dividido entre el % usado.',
  summary:'Resumen del periodo',eq_rest:'Con suscripción (Pro, Max, Team…) no pagas esta cantidad, pero sirve para comparar periodos y hábitos; con la API es, aproximadamente, tu factura real.',
@@ -2109,7 +2533,7 @@ es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días
  session:'Sesión',best_model:'Modelo rentable',went_on:'Se fue en',top_tool:'Herramienta top',messages_h:'Mensajes',compact_h:'Compact.',
  st_todo:'Pendiente',st_warn:'Aplicada · revisar',st_ok:'Aplicada · funciona',st_info:'Informativa',pending_since:'pendiente desde el {d}',fine_since:'bien desde el {d}',current_since:'vigente desde el {d}',
  same_as:'igual que el {d}',trend:'{a} → {b} desde el {d}',short_sample:'muestra corta: {n} día(s) desde el corte, hacen falta 7',hist_start:'el historial empieza hoy',observing:'En observación',before_approx:'antes ≈',
- evidence:'Evidencia',what_to_do:'Qué hacer',with_:'Con qué',check:'Comprobar',tradeoff_h:'Contrapartida, cálculo y confianza',tradeoff:'Contrapartida',calc:'Cálculo',confidence:'Confianza',nothing:'Nada que recomendar en este periodo.',
+ evidence:'Evidencia',what_to_do:'Qué hacer',with_:'Con qué',check:'Comprobar',tradeoff_h:'Contrapartida, cálculo y confianza',tradeoff:'Contrapartida',calc:'Cálculo',confidence:'Confianza',nothing:'Nada que recomendar en este periodo.',nothing_yet:'Nada probado todavía: {n} en estudio, aquí debajo.',study_h:'En estudio ({n})',study_hint:'Detectadas en tus datos pero aún sin probar. Suben solas cuando se repiten 3 días y ahorran lo suficiente para ti.',dismissed_h:'Descartadas ({n})',dismissed_hint:'Ocultadas por ti. Las que tienen importe vuelven solas si se duplica.',dismiss:'No aplica',dismiss_tip:'Oculta esta tarjeta; vuelve si su coste se duplica',restore:'Recuperar',
  cost_day:'Coste por día',cost_msg:'Coste por mensaje',turns_msg:'Turnos por mensaje',avg_ctx:'Contexto medio',change:'Cambio',short_warn:'Muestra corta: {n} día(s) por lado. No concluyente (depende mucho del tipo de tarea).',
  win_cap:'Llevas <b>{c}</b> eq. ({tok} tokens) de unos <b>{cap}</b> que parece permitir esta ventana; te quedan ≈<b>{left}</b>{now}.',win_now:' (≈{n} % contando hasta este minuto)',win_nocap:'Llevas <b>{c}</b> eq. ({tok} tokens) en esta ventana. El límite solo se estima cuando pasas del 10 % del plan.',period_sub:'{n} tokens en total',help_period:'Coste equivalente total del periodo elegido y los tokens (trozos de texto) procesados.',help_msg:'Coste medio de cada mensaje que envías. Un turno es una respuesta del modelo; un mensaje puede provocar varios.',help_sub:'Los subagentes son agentes auxiliares que Claude lanza solo (buscar, revisar…). Su coste forma parte del total.',help_cw:'Escritura de caché: guardar la conversación para reenviarla barato. Se paga al abrir sesión, tras compactar, al cambiar de modelo y tras una pausa larga.',help_over:'Contexto sobre {n}: cuando la conversación pasa de ese tamaño, cada respuesta reenvía el exceso. Compactar es que Claude resuma la charla para reducirla.',help_best:'Modelo más barato que habría bastado según lo que hizo la sesión; la cifra es el ahorro estimado.',help_went:'En qué se fue la mayor parte del coste de esta sesión.',help_compact:'Veces que Claude resumió la conversación por ser demasiado larga.',help_msgs:'Mensajes que enviaste en la sesión.',daily_note:'Lectura de caché: reenviar la conversación desde la caché (barato por token). Escritura de caché: guardar contexto nuevo (más caro). Input sin caché: texto nuevo enviado sin cachear. Salida: lo que escribe el modelo, incluido su razonamiento (thinking).',odo_eur:'euros hoy',odo_usd:'dólares hoy',h_title:'{h} h: {v}'}};
 let LANGSEL='';try{LANGSEL=localStorage.getItem('tk-lang')||''}catch(e){}
@@ -2173,7 +2597,7 @@ function gauges(el,live,L){if(!live.length){el.innerHTML='<p class="empty">'+t('
 let FIRST=true,PREV={},RECS=[];
 const hm=m=>m<60?m+' min':m<1440?Math.floor(m/60)+' h '+(m%60)+' min':Math.floor(m/1440)+' d '+Math.floor(m%1440/60)+' h';
 const roll=w=>'<div class="pl"><div class="gh"><b>'+(w.kind=='five_hour'?t('last5h'):t('last7d'))+'</b><span class="v">'+usd(w.cost)+'</span></div><div class="gm">'+t('plan_nopct',{n:tok(w.tokens)})+'</div></div>';
-function plan(p){const c=$('plancard');c.hidden=!p;if(!p)return;
+function plan(p){const c=$('plancard');c.hidden=!p;$('nav_plan').hidden=!p;if(!p)return;
  if(!p.source){$('planage').textContent=t('plan_nolecture');$('plan').innerHTML=p.windows.map(roll).join('');return}
  $('planage').textContent=t('plan_src',{src:p.source,at:p.at})+(p.age_min>5?t('plan_ago',{t:hm(p.age_min)}):'');
  $('plan').innerHTML=p.windows.map(w=>{if(w.pct==null)return roll(w);const n=w.kind=='five_hour'?t('five_h'):t('week'),lv=w.pct>=90?' red':w.pct>=75?' amb':'';
@@ -2185,6 +2609,10 @@ const PTOK='__PAGETOKEN__';
 document.addEventListener('click',async e=>{const b=e.target.closest('.ap');if(!b)return;e.preventDefault();e.stopPropagation();
  if(b.dataset.u&&!confirm(t('undo_confirm')))return;
  b.disabled=true;let res;try{res=await fetch(b.dataset.u?'/api/undo':'/api/apply',{method:'POST',headers:{'Content-Type':'application/json','X-Tokenometro-Page':PTOK},body:JSON.stringify({id:b.dataset.id})});res=await res.json()}catch(_){res={ok:false}}
+ if(!res.ok){b.disabled=false;alert(t('apply_failed')+(res.error?': '+res.error:''));return}
+ load()});
+document.addEventListener('click',async e=>{const b=e.target.closest('.dm,.rs');if(!b)return;e.preventDefault();e.stopPropagation();
+ b.disabled=true;let res;try{res=await fetch(b.classList.contains('dm')?'/api/dismiss':'/api/restore',{method:'POST',headers:{'Content-Type':'application/json','X-Tokenometro-Page':PTOK},body:JSON.stringify({id:b.dataset.id})});res=await res.json()}catch(_){res={ok:false}}
  if(!res.ok){b.disabled=false;alert(t('apply_failed')+(res.error?': '+res.error:''));return}
  load()});
 document.addEventListener('click',async e=>{const b=e.target.closest('.cp');if(!b)return;e.preventDefault();e.stopPropagation();
@@ -2259,11 +2687,13 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
  tbl($('sessions'),r.sessions,[{h:t('session'),v:x=>x,f:(x)=>'<b>'+esc(x.title||x.session.slice(0,8))+'</b><br><span class="mut">'+short(x.project)+' · '+esc((x.first||'').slice(0,16).replace('T',' '))+'</span>'},
   {h:t('cost'),v:x=>x,s:x=>x.cost,f:sbar,bar:false},{h:t('best_model'),help:t('help_best'),v:x=>x,s:x=>x.fit?x.fit.save:-1,f:fit},{h:t('went_on'),help:t('help_went'),v:x=>x,f:fue},{h:t('top_tool'),v:x=>x,f:tt},{h:t('messages_h'),help:t('help_msgs'),v:x=>x.prompts,f:v=>v},{h:t('max_ctx'),v:x=>x.peak_ctx,f:tok},{h:t('over_k',{n:tok(L.ctx)}),help:t('help_over',{n:tok(L.ctx)}),v:x=>x.over,f:v=>v>0.5?'~'+usd(v):'-'},{h:t('compact_h'),help:t('help_compact'),v:x=>x.compacts,f:v=>v},{h:t('subagents'),v:x=>x,s:x=>x.cost?x.sub_cost/x.cost:0,f:x=>x.cost?(100*x.sub_cost/x.cost).toFixed(0)+'%':'-'}],{click:openSession});
  const stl={todo:t('st_todo'),warn:t('st_warn'),ok:t('st_ok'),info:t('st_info')};
- const openK=new Set([...document.querySelectorAll('#recs details[open]')].map(d=>d.dataset.k));
+ const openK=new Set([...document.querySelectorAll('#recs details[open],#recs_more details[open]')].map(d=>d.dataset.k));
  const dm=d=>d?d.slice(8,10)+'-'+d.slice(5,7):'';
  const fm=v=>v==null?'-':(Math.round(v*10)/10).toLocaleString(LOC());
  RECS=r.recs;const FILE=(r.recs_file||'').replace(/^\/home\/[^/]+/,'~');
- $('recs').innerHTML=r.recs.map((x,ix)=>{const sig=x.status+'|'+Math.round(x.impact||0)+'|'+x.metric;const chg=PREV[x.id]!=null&&PREV[x.id]!=sig;PREV[x.id]=sig;
+ const SH=r.recs.filter(x=>x.stage!='study'&&x.stage!='dismissed'),ST=r.recs.filter(x=>x.stage=='study'),DM=r.recs.filter(x=>x.stage=='dismissed');
+ const npend=SH.filter(x=>x.status=='todo'||x.status=='warn').length;$('nav_recs_n').textContent=npend;$('nav_recs_n').hidden=!npend;
+ $('recs').innerHTML=SH.map(x=>{const ix=r.recs.indexOf(x);const sig=x.status+'|'+Math.round(x.impact||0)+'|'+x.metric;const chg=PREV[x.id]!=null&&PREV[x.id]!=sig;PREV[x.id]=sig;
   const pend=x.status=='todo'||x.status=='warn';const short=x.sample_days!=null&&x.sample_days<7&&x.status!='todo';
   const hist=(x.hist||[]).map(e=>'<i class="h-'+e.s+'" title="'+dm(e.d)+' · '+stl[e.s]+'"></i>').join('');
   const since=x.since?t(pend?'pending_since':x.status=='ok'?'fine_since':'current_since',{d:dm(x.since)}):'';
@@ -2276,7 +2706,10 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
   (x.can_apply?'<div class="pr ap-row"><span>'+t('apply_hint',{c:'<code>'+esc(x.change)+'</code>'})+'</span><button type="button" class="ap" data-id="'+esc(x.id)+'">'+t('apply')+'</button></div>':'')+
   (x.applied?'<div class="pr ap-row"><span>'+t('applied_on',{d:dm(x.applied.day),c:'<code>'+esc(x.change||'')+'</code>'})+(x.applied.before!=null&&x.applied.after!=null&&x.applied.days>0?' '+t('applied_ba',{a:fm(x.metric_money?x.applied.before*CUR.rate:x.applied.before),b:fm(x.metric_money?x.applied.after*CUR.rate:x.applied.after),n:x.applied.days}):' '+t('applied_wait'))+'</span><button type="button" class="ap" data-u="1" data-id="'+esc(x.id)+'">'+t('undo')+'</button></div>':'')+
   (x.prompt?'<div class="pr"><span>'+t('prompt_for')+' <code>'+esc(FILE)+'</code></span><button type="button" class="cp" data-i="'+ix+'">'+t('copy_prompt')+'</button></div>':'')+
-  '<details data-k="d-'+x.id+'"'+(openK.has('d-'+x.id)?' open':'')+'><summary>'+t('tradeoff_h')+'</summary><dl><dt>'+t('tradeoff')+'</dt><dd>'+esc(x.tradeoff)+'</dd>'+(x.impact_note?'<dt>'+t('calc')+'</dt><dd>'+esc(x.impact_note)+'</dd>':'')+'<dt>'+t('confidence')+'</dt><dd>'+esc(x.confidence)+'</dd></dl></details></div>'}).join('')||'<p class="mut">'+t('nothing')+'</p>';
+  '<details data-k="d-'+x.id+'"'+(openK.has('d-'+x.id)?' open':'')+'><summary>'+t('tradeoff_h')+'</summary><dl><dt>'+t('tradeoff')+'</dt><dd>'+esc(x.tradeoff)+'</dd>'+(x.impact_note?'<dt>'+t('calc')+'</dt><dd>'+esc(x.impact_note)+'</dd>':'')+'<dt>'+t('confidence')+'</dt><dd>'+esc(x.confidence)+'</dd></dl></details>'+(x.status=='todo'?'<button type="button" class="dm" data-id="'+esc(x.id)+'" title="'+esc(t('dismiss_tip'))+'">'+t('dismiss')+'</button>':'')+'</div>'}).join('')||'<p class="mut">'+(ST.length?t('nothing_yet',{n:ST.length}):t('nothing'))+'</p>';
+ const mo=(k,h,hint,list,row)=>list.length?'<details class="more" data-k="'+k+'"'+(openK.has(k)?' open':'')+'><summary>'+h+'</summary><p class="mut">'+hint+'</p><ul>'+list.map(row).join('')+'</ul></details>':'';
+ $('recs_more').innerHTML=mo('m-study',t('study_h',{n:ST.length}),t('study_hint'),ST,x=>'<li><b>'+esc(x.title)+'</b>'+(x.impact?' <span class="mut">≈'+usd(x.impact)+'</span>':'')+'<br><span class="mut">'+esc((x.missing||[]).join(' · '))+'</span></li>')+
+  mo('m-dismissed',t('dismissed_h',{n:DM.length}),t('dismissed_hint'),DM,x=>'<li><b>'+esc(x.title)+'</b> <button type="button" class="rs" data-id="'+esc(x.id)+'">'+t('restore')+'</button></li>');
  const B=r.compare.before,A=r.compare.after;
  const dl=(a,b,good)=>{if(!b)return '';const v=100*(a-b)/b;return '<span style="color:'+css(Math.abs(v)<0.5?'--mut':((v<0)==good)?'--b':'--f')+'">'+(v>0?'+':'')+v.toFixed(0)+'%</span>'};
  const cr=[[t('cost_day'),x=>x.cost_day,usd,1],[t('cost_msg'),x=>x.cost_per_prompt,usd,1],[t('turns_msg'),x=>x.turns_per_prompt,v=>num(v,1),1],
@@ -2295,6 +2728,15 @@ $('lang').onchange=()=>{LANGSEL=$('lang').value;LANG=LANGSEL;try{localStorage.se
 applyI18n();
 {const d=new Date();$('month').value=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');$('month').max=$('month').value;$('month').onchange=csvLinks}
 fetch('/api/clients').then(r=>r.json()).then(cs=>cs.forEach(c=>$('client').insertAdjacentHTML('beforeend','<option value="'+esc(c)+'">'+esc(c)+'</option>'))).catch(()=>{}).then(()=>{applyI18n();load()});
+// sticky bar: shadow line once it sticks, and the section you are reading marked in it
+{const bar=$('topbar'),links=[...document.querySelectorAll('#nav a')];let tick=0;
+ const mark=()=>{tick=0;const h=bar.offsetHeight;document.documentElement.style.setProperty('--barh',h+'px');
+  bar.classList.toggle('stuck',bar.getBoundingClientRect().top<=0&&scrollY>0);
+  let cur=links[0];for(const a of links){const s=a.hidden?null:document.querySelector(a.getAttribute('href'));if(s&&!s.hidden&&s.getBoundingClientRect().top<=h+40)cur=a}
+  if(innerHeight+scrollY>=document.documentElement.scrollHeight-4)cur=links.filter(a=>!a.hidden).pop();
+  links.forEach(a=>a===cur?a.setAttribute('aria-current','true'):a.removeAttribute('aria-current'));
+  if(cur){const n=$('nav'),l=cur.offsetLeft-n.offsetLeft;if(l<n.scrollLeft||l+cur.offsetWidth>n.scrollLeft+n.clientWidth)n.scrollLeft=l-16}};
+ const ask=()=>{if(!tick)tick=requestAnimationFrame(mark)};addEventListener('scroll',ask,{passive:true});addEventListener('resize',ask);mark()}
 // the minute refresh waits while you have a session open or are moving through a table with the keyboard
 setInterval(()=>{const a=document.activeElement;if(!document.querySelector('tr.det')&&!(a&&a.closest&&a.closest('table,.pager')))load()},60000);
 </script></body></html>"""
@@ -2325,7 +2767,7 @@ class H(BaseHTTPRequestHandler):
         return True
 
     def do_POST(self):
-        """Apply or undo a recommendation. Needs the token embedded in our own page: another site can't read
+        """Apply, undo, dismiss or restore a recommendation. Needs the token embedded in our own page: another site can't read
         that page, and can't send the custom header without a CORS preflight we never answer."""
         if not self._local():
             return
@@ -2334,12 +2776,13 @@ class H(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if not ok or (origin and urlparse(origin).hostname not in ("127.0.0.1", "localhost", "::1")):
             return self.send_error(403)
-        if u.path not in ("/api/apply", "/api/undo"):
+        act = {"/api/apply": apply_rec, "/api/undo": undo_rec, "/api/dismiss": dismiss_rec, "/api/restore": restore_rec}
+        if u.path not in act:
             return self.send_error(404)
         try:
             n = min(int(self.headers.get("Content-Length") or 0), 4096)
             rid = json.loads(self.rfile.read(n) or b"{}").get("id")
-            (apply_rec if u.path == "/api/apply" else undo_rec)(str(rid))
+            act[u.path](str(rid))
             self._send(json.dumps({"ok": True}), "application/json")
         except (ValueError, OSError, AttributeError) as e:
             self.send_response(400)

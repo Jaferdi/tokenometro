@@ -67,7 +67,7 @@ def stop(d, port):
 
 
 def sync(src, dest):
-    """Plugin mode: keep the code in dest up to date; prices and clients are the user's, only seeded once.
+    """Plugin mode: keep the code in dest up to date; prices are the user's, only seeded once.
     Returns True if tracker.py changed."""
     os.makedirs(dest, exist_ok=True)
     changed = False
@@ -78,8 +78,6 @@ def sync(src, dest):
             changed = changed or f == "tracker.py"
     if not os.path.exists(os.path.join(dest, "prices.json")):
         copy(os.path.join(src, "prices.json"), os.path.join(dest, "prices.json"))
-    if not any(os.path.exists(os.path.join(dest, f)) for f in ("clients.json", "clientes.json")):
-        copy(os.path.join(src, "clients.example.json"), os.path.join(dest, "clients.json"))
     return changed
 
 

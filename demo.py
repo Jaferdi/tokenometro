@@ -218,6 +218,21 @@ def plan_reading(app):
             {"kind": "seven_day", "percentUsed": 61, "resetsAt": z(now + timedelta(days=2, hours=5))}]}, f)
 
 
+# A real install builds this hourly; the demo fakes a week of it so the cards have passed the study,
+# except the cheapest one, left under study to show what that looks like.
+SEED_HISTORY = """
+import tracker
+from datetime import date, timedelta
+recs = sorted(tracker.data(7, tracker.ALL)["recs"], key=lambda x: x["impact"] or 0)
+con = tracker.connect()
+for i, x in enumerate(recs):
+    for d in range(1 if i == 0 and len(recs) > 1 else 7):
+        con.execute("INSERT OR REPLACE INTO recs_hist VALUES(?,?,?,?,?)",
+                    ((date.today() - timedelta(days=d)).isoformat(), x["id"], x["status"], x["impact"], x.get("metric")))
+con.commit()
+"""
+
+
 def main():
     ap = argparse.ArgumentParser(description="Tokenometro with made-up data")
     ap.add_argument("--port", type=int, default=7879)
@@ -247,6 +262,7 @@ def main():
         del env[k]
     subprocess.run([sys.executable, os.path.join(app, "tracker.py"), "ingest"], env=env,
                    stdout=subprocess.DEVNULL, check=True)
+    subprocess.run([sys.executable, "-c", SEED_HISTORY], env=env, cwd=app, stdout=subprocess.DEVNULL, check=True)
     print(f"Demo with {n} made-up sessions: http://127.0.0.1:{a.port}  (Ctrl+C to stop; nothing is kept)")
     p = subprocess.Popen([sys.executable, os.path.join(app, "tracker.py"), "serve"], env=env)
     # stopped with Ctrl+C or kill: stop the server too and delete the made-up data

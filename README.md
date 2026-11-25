@@ -125,9 +125,10 @@ Each card comes from a rule that crosses your data for the period with your actu
 - **Before / after**: some rules compare against the cut-off date. Until there are 7 days since the cut-off the card shows "Under observation", because with fewer days the kind of task weighs more than the change.
 - **With what**: existing tools or settings that are worth it to fix it.
 - **Apply**: when the fix is a single setting (`autoCompactWindow`, `CLAUDE_CODE_SUBAGENT_MODEL`), the card has an *Apply* button. It saves a dated backup of `~/.claude/settings.json`, changes only that key and, from the next day on, shows the card's metric before and after. *Undo* puts back the previous value, unless you changed it by hand since.
+- **Only what holds up**: a finding is recommended once it shows up on 3 of the last 7 days and saves enough for *your* spend (1% of it a week, between 0.25 and 2 USD). Until then it waits under *Under study*, saying what it is missing. *Not for me* hides a card until its cost doubles; *Restore* brings it back.
 - **Prompt**: the text to ask Claude to do it is saved to `~/.claude/reports/improvements-YYYY-MM-DD.md` (`mejoras-…` in Spanish) and copied with "Copy prompt".
 
-Current rules: oversized context and compactions, resuming sessions after long pauses (rewrites the cache), subagents running on Opus, reading huge files, showing context in the status line (only if you don't already have a statusLine or a plugin showing it), model output (only above 25% of cost) and cost-effective model.
+Current rules: oversized context and compactions, resuming sessions after long pauses (rewrites the cache), subagents running on Opus, reading huge files, showing context in the status line (only if you don't already have a statusLine or a plugin showing it), model output (only above 25% of cost), cost-effective model, MCP servers loaded but barely used, the cache rebuilt without a pause (by cause: model switch, context trimmed near the limit, or no visible cause) huge tool outputs carried turn after turn, whether the 5-minute or the 1-hour cache pays off for how you pause (simulated on your own requests, can be applied with one click), a tool failing three or more times in a row, and a global CLAUDE.md that is too heavy for something read on every turn.
 
 Limits: these are heuristics over your logs. They can't tell whether a session really needed more context or a bigger model; they tell you where to look.
 
@@ -167,7 +168,7 @@ Everything lives in `~/.local/share/tokenometro/`. Restart after editing (see be
 
 ### `clients.json`
 
-Groups sessions by client based on the folder you worked in (the first matching path wins). Start from `clients.example.json`:
+Groups sessions by client based on the folder you worked in (the first matching path wins). It is optional and only you create it: copy `clients.example.json` to `clients.json` and edit it. Without it every session counts as «others».
 
 - `clients`: name → list of path fragments.
 - `cut` (optional): YYYY-MM-DD date of the change you want to measure in "Before / after". Defaults to 7 days ago.

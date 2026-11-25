@@ -391,6 +391,202 @@ class PausesCardTest(Base):
         con.close()
 
 
+class FunnelTest(Base):
+    """Only studied cards are recommended; the bar is relative to each user's own spend."""
+
+    def hist(self, rid, days, impact=10.0, status="todo"):
+        con = self.t.connect()
+        con.executemany("INSERT OR REPLACE INTO recs_hist VALUES(?,?,?,?,?)",
+                        [((datetime.now() - timedelta(days=d)).strftime("%Y-%m-%d"), rid, status, impact, 1) for d in range(days)])
+        con.commit()
+        return con
+
+    def run_funnel(self, recs, span=7, week_cost=100.0):
+        con = self.t.connect()
+        self.t.funnel(con, recs, span, week_cost)
+        con.close()
+        return {x["id"]: (x["stage"], x["missing"]) for x in recs}
+
+    def rec(self, rid, impact=5.0, status="todo", **kw):
+        return dict({"id": rid, "status": status, "impact": impact}, **kw)
+
+    def test_new_findings_wait_until_they_repeat_on_three_days(self):
+        self.hist("a", 2).close()
+        self.hist("b", 3).close()
+        got = self.run_funnel([self.rec("a"), self.rec("b"), self.rec("c")])
+        self.assertEqual(got["a"][0], "study")
+        self.assertIn("2", got["a"][1][0])
+        self.assertEqual(got["b"], ("shown", []))
+        self.assertEqual(got["c"][0], "study")
+
+    def test_the_bar_is_relative_to_each_users_spend(self):
+        self.hist("x", 7).close()
+        light = self.run_funnel([self.rec("x", impact=0.5)], week_cost=20)       # 0.5 $/week on 20 $/week: worth it
+        heavy = self.run_funnel([self.rec("x", impact=0.5)], week_cost=1000)     # same 0.5 $ on 1000 $/week: not yet
+        tiny = self.run_funnel([self.rec("x", impact=0.05)], week_cost=2)        # under the 0.25 $ floor
+        capped = self.run_funnel([self.rec("x", impact=3)], week_cost=1000)     # 3 $/week always counts, whatever the spend
+        self.assertEqual(light["x"][0], "shown")
+        self.assertEqual(heavy["x"][0], "study")
+        self.assertEqual(tiny["x"][0], "study")
+        self.assertEqual(capped["x"][0], "shown")
+
+    def test_cards_without_an_amount_only_need_to_repeat(self):
+        self.hist("q", 4).close()
+        self.assertEqual(self.run_funnel([self.rec("q", impact=None)])["q"], ("shown", []))
+
+    def test_a_detector_can_ask_for_enough_sessions(self):
+        self.hist("s", 7).close()
+        got = self.run_funnel([self.rec("s", sample={"sessions": 2, "days": 1}),
+                               self.rec("s2", sample={"sessions": 5, "days": 3})])
+        self.assertEqual(got["s"][0], "study")
+        self.hist("s2", 7).close()
+        got = self.run_funnel([self.rec("s2", sample={"sessions": 5, "days": 3})])
+        self.assertEqual(got["s2"][0], "shown")
+
+    def test_applied_cards_are_always_shown(self):
+        got = self.run_funnel([self.rec("w", status="warn"), self.rec("o", status="ok")])
+        self.assertEqual((got["w"][0], got["o"][0]), ("shown", "shown"))
+
+    def test_dismissed_until_its_cost_doubles(self):
+        self.hist("d", 7, impact=10).close()
+        self.t.dismiss_rec("d")
+        self.assertEqual(self.run_funnel([self.rec("d")])["d"][0], "dismissed")
+        self.hist("d", 1, impact=19).close()
+        self.assertEqual(self.run_funnel([self.rec("d")])["d"][0], "dismissed")
+        self.hist("d", 1, impact=25).close()
+        self.assertEqual(self.run_funnel([self.rec("d")])["d"][0], "shown")
+        self.t.dismiss_rec("d")
+        self.t.restore_rec("d")
+        self.assertEqual(self.run_funnel([self.rec("d")])["d"][0], "shown")
+
+    def test_only_plain_ids_can_be_dismissed(self):
+        for bad in ("", "../x", "A B", "x" * 41):
+            with self.assertRaises(ValueError):
+                self.t.dismiss_rec(bad)
+
+    def test_the_dashboard_data_carries_the_stage(self):
+        self.write("a.jsonl", paused("s1", 3))
+        recs = self.t.data(30, self.t.ALL)["recs"]
+        self.assertTrue(recs)
+        self.assertTrue(all(x["stage"] in ("shown", "study", "dismissed") and isinstance(x["missing"], list) for x in recs))
+
+
+def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=(), h1=False):
+    """One main-conversation request: `ctx` tokens of context, `cw` of them written to the cache (for 1 hour if h1),
+    the rest read."""
+    d = json.loads(record(sid, now_ts(minutes_ago), mid, model=model, inp=10, cr=max(ctx - cw - 10, 0)))
+    d["message"]["usage"]["cache_creation_input_tokens"] = cw
+    if h1:
+        d["message"]["usage"]["cache_creation"] = {"ephemeral_1h_input_tokens": cw, "ephemeral_5m_input_tokens": 0}
+    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
+    return json.dumps(d)
+
+
+def result(tool_id, chars, error=False):
+    return json.dumps({"type": "user", "sessionId": "x", "timestamp": now_ts(), "cwd": "/work/demo",
+                       "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id,
+                                                                "content": "x" * chars, "is_error": error}]}})
+
+
+class ClientsFileTest(Base):
+    def load(self, cfg):
+        with open(self.t.CLIENTS_FILE, "w") as f:
+            json.dump(cfg, f)
+        return self.t._load_groups()[0]
+
+    def test_made_up_clients_from_earlier_installs_are_ignored_but_real_ones_kept(self):
+        cfg = {"clients": {"company-a": ["/work/company-a"], "company-b": ["/work/company-b", "/clients/b"],
+                           "acme": ["/work/acme"], "company-c": ["/work/company-a", "/x"]}}
+        self.assertEqual(set(self.load(cfg)), {"acme", "company-c"})
+
+
+class NewDetectorsTest(Base):
+    def rec(self, rid):
+        return next((r for r in self.t.data(30, self.t.ALL)["recs"] if r["id"] == rid), None)
+
+    def test_cache_rebuilt_without_a_pause_is_found_with_its_cause(self):
+        self.write("a.jsonl", [
+            req("s1", "a1", 30, 200_000, 2_000), req("s1", "a2", 29, 205_000, 5_000, model="claude-sonnet-5-5"),   # model switch
+            req("s2", "b1", 30, 800_000, 2_000), req("s2", "b2", 29, 700_000, 690_000),                          # trimmed
+            req("s3", "c1", 30, 100_000, 2_000), req("s3", "c2", 29, 101_000, 100_000),                          # no cause
+            req("s4", "d1", 30, 800_000, 2_000), req("s4", "d2", 29, 50_000, 45_000),                            # compaction: no
+            req("s5", "e1", 300, 100_000, 2_000), req("s5", "e2", 200, 101_000, 100_000),                        # pause: no
+            req("s6", "f1", 30, 100_000, 2_000), req("s6", "f2", 29, 103_000, 3_000),                            # normal turn: no
+        ])
+        r = self.rec("cache-miss")
+        self.assertEqual(r["metric"], 2)       # trimmed + no cause; the model switch wrote 5K only, under 20K
+        self.assertEqual(r["sample"], {"sessions": 2, "days": 1})
+        self.assertGreater(r["impact"], 0)
+
+    def test_switching_model_is_named_as_the_cause(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 200_000, 2_000), req("s1", "a2", 29, 205_000, 200_000, model="claude-sonnet-5-5")])
+        r = self.rec("cache-miss")
+        self.assertEqual(r["metric"], 1)
+        self.assertIn("model", r["evidence"])
+
+    def test_huge_tool_outputs_are_priced_by_the_turns_that_carry_them(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 50_000, 1_000, tools=("Bash", "Read")), result("a1_0", 80_000), result("a1_1", 80_000)]
+                   + [req("s1", f"a{i}", 30 - i, 70_000 + i, 1_000) for i in range(2, 12)])
+        r = self.rec("tool-output")
+        self.assertEqual(r["metric"], 1)        # Read has its own card
+        self.assertIn("Bash", r["evidence"])
+        self.assertGreater(r["impact"], 0)
+        self.assertTrue(r["tools"])              # no bashOutputMaxChars in settings: suggest it
+
+    def test_nothing_to_say_when_outputs_are_small(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 50_000, 1_000, tools=("Bash",)), result("a1_0", 3_000),
+                               req("s1", "a2", 29, 51_000, 1_000)])
+        self.assertIsNone(self.rec("tool-output"))
+        self.assertIsNone(self.rec("cache-miss"))
+
+    def test_five_minute_cache_rebuilt_after_short_pauses_suggests_one_hour(self):
+        rows = []
+        for s in range(3):  # every turn 20 minutes after the last: each one writes the whole context again
+            rows += [req(f"s{s}", f"s{s}_{i}", 200 - 20 * i, 300_000 + i, 300_000 if i else 2_000) for i in range(5)]
+        self.write("a.jsonl", rows)
+        r = self.rec("ttl-1h")
+        self.assertEqual((r["status"], r["sample"]["sessions"]), ("todo", 3))
+        self.assertGreater(r["impact"], 0)
+        self.assertEqual(self.t.APPLY["ttl-1h"], {"promptCacheTtl": "1h"})
+
+    def test_one_hour_cache_without_pauses_suggests_five_minutes(self):
+        rows = [req("s1", f"a{i}", 100 - i, 100_000 + 1_000 * i, 20_000, h1=True) for i in range(20)]
+        self.write("a.jsonl", rows)
+        r = self.rec("ttl-5m")
+        self.assertEqual(r["status"], "todo")
+        self.assertIn("1-hour", r["evidence"])
+        self.assertIsNone(self.rec("ttl-1h"))
+
+    def test_one_hour_cache_that_pays_off_says_nothing(self):
+        rows = []
+        for s in range(3):
+            rows += [req(f"s{s}", f"s{s}_{i}", 200 - 20 * i, 300_000 + i, 2_000, h1=True) for i in range(5)]
+        self.write("a.jsonl", rows)
+        self.assertIsNone(self.rec("ttl-5m"))
+        self.assertIsNone(self.rec("ttl-1h"))
+
+    def test_runs_of_three_failures_of_the_same_tool_are_counted(self):
+        rows = []
+        for i in range(4):  # Bash fails four times in a row, then works
+            rows += [req("s1", f"a{i}", 30 - i, 50_000, 1_000, tools=("Bash",)), result(f"a{i}_0", 100, error=i < 4)]
+        rows += [req("s1", "b0", 20, 50_000, 1_000, tools=("Bash",)), result("b0_0", 100)]
+        for i in range(2):  # two failures only: not a loop
+            rows += [req("s2", f"c{i}", 30 - i, 50_000, 1_000, tools=("Read",)), result(f"c{i}_0", 100, error=True)]
+        self.write("a.jsonl", rows)
+        r = self.rec("error-loops")
+        self.assertEqual((r["metric"], r["sample"]), (1, {"sessions": 1, "days": 1}))
+        self.assertIn("Bash: 1 (4 tries", r["evidence"])
+        self.assertNotIn("Read", r["evidence"])
+
+    def test_heavy_global_claude_md_is_flagged_and_light_one_is_not(self):
+        fx = {"parts": [{"k": "claude_md", "tokens": 6_000}], "base": 30_000, "cost": 30.0, "sessions": 10}
+        r = self.t.claude_md_rec(fx)
+        self.assertAlmostEqual(r["impact"], 30.0 * 4_000 / 30_000 * 0.5)
+        self.assertEqual(r["metric"], 6_000)
+        fx["parts"][0]["tokens"] = 2_000
+        self.assertIsNone(self.t.claude_md_rec(fx))
+
+
 class UpdateTest(Base):
     def save(self, name, value):
         with open(os.path.join(self.app, name), "w") as f:
@@ -701,8 +897,9 @@ class InstallerTest(unittest.TestCase):
         import start
         dest = os.path.join(self.tmp, "data")
         self.assertTrue(start.sync(ROOT, dest))
-        for f in ("tracker.py", "statusline.py", "prices.json", "clients.json"):
+        for f in ("tracker.py", "statusline.py", "prices.json"):
             self.assertTrue(os.path.exists(os.path.join(dest, f)), f)
+        self.assertFalse(os.path.exists(os.path.join(dest, "clients.json")))  # only the user creates it
         with open(os.path.join(dest, "prices.json"), "w", encoding="utf-8") as f:
             f.write("{}")
         self.assertFalse(start.sync(ROOT, dest))

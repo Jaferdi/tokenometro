@@ -125,9 +125,10 @@ Cada tarjeta sale de una regla que cruza tus datos del periodo con tu configurac
 - **Antes / después**: algunas reglas comparan con la fecha de corte. Hasta tener 7 días desde el corte la tarjeta sale «En observación», porque con menos días el tipo de tarea pesa más que el cambio.
 - **Con qué**: herramientas o ajustes que existen y compensan para resolverlo.
 - **Aplicar**: cuando el arreglo es un solo ajuste (`autoCompactWindow`, `CLAUDE_CODE_SUBAGENT_MODEL`), la tarjeta trae un botón *Aplicar*. Guarda una copia fechada de `~/.claude/settings.json`, cambia solo esa clave y, desde el día siguiente, enseña la métrica de la tarjeta antes y después. *Deshacer* devuelve el valor anterior, salvo que lo hayas cambiado a mano después.
+- **Solo lo que se sostiene**: un hallazgo se recomienda cuando aparece 3 de los últimos 7 días y ahorra lo suficiente para *tu* gasto (el 1 % semanal, entre 0,25 y 2 USD). Mientras, espera en *En estudio* diciendo qué le falta. *No aplica* oculta una tarjeta hasta que su coste se duplica; *Recuperar* la devuelve.
 - **Prompt**: el texto para pedírselo a Claude se guarda en `~/.claude/reports/mejoras-AAAA-MM-DD.md` (`improvements-…` en inglés) y se copia con «Copiar prompt».
 
-Reglas actuales: contexto demasiado grande y compactaciones, retomar sesiones tras pausas largas (reescribe la caché), subagentes con Opus, lecturas de ficheros enormes, ver el contexto en la barra de estado (solo si no tienes ya statusLine o un plugin que lo enseñe), salida del modelo (solo si pasa del 25 % del coste) y modelo rentable.
+Reglas actuales: contexto demasiado grande y compactaciones, retomar sesiones tras pausas largas (reescribe la caché), subagentes con Opus, lecturas de ficheros enormes, ver el contexto en la barra de estado (solo si no tienes ya statusLine o un plugin que lo enseñe), salida del modelo (solo si pasa del 25 % del coste), modelo rentable, servidores MCP cargados y casi sin uso, la caché rehecha sin pausa (por causa: cambio de modelo, contexto recortado cerca del límite o sin causa visible) salidas enormes de herramientas que se arrastran turno tras turno, si te compensa la caché de 5 minutos o la de 1 hora según cómo pausas (simulado sobre tus propias peticiones, se aplica con un clic), una herramienta que falla tres o más veces seguidas y un CLAUDE.md global demasiado pesado para algo que se lee en cada turno.
 
 Límites: son heurísticas sobre tus registros. No saben si una sesión necesitaba de verdad más contexto o un modelo mayor; dicen dónde mirar.
 
@@ -167,7 +168,7 @@ Todo vive en `~/.local/share/tokenometro/`. Tras editar algo, reinicia (ver más
 
 ### `clients.json`
 
-Agrupa sesiones por cliente según la carpeta donde trabajaste (gana la primera ruta que coincida). Parte de `clients.example.json`:
+Agrupa sesiones por cliente según la carpeta donde trabajaste (gana la primera ruta que coincida). Es opcional y solo lo creas tú: copia `clients.example.json` a `clients.json` y edítalo. Sin él, todas las sesiones cuentan como «otros».
 
 - `clients`: nombre → lista de fragmentos de ruta.
 - `cut` (opcional): fecha AAAA-MM-DD del cambio que quieres medir en «Antes / después». Por defecto, hace 7 días.
