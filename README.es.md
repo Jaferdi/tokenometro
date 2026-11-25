@@ -125,6 +125,7 @@ Cada tarjeta sale de una regla que cruza tus datos del periodo con tu configurac
 - **Antes / después**: algunas reglas comparan con la fecha de corte. Hasta tener 7 días desde el corte la tarjeta sale «En observación», porque con menos días el tipo de tarea pesa más que el cambio.
 - **Con qué**: herramientas o ajustes que existen y compensan para resolverlo.
 - **Aplicar**: cuando el arreglo es un solo ajuste (`autoCompactWindow`, `CLAUDE_CODE_SUBAGENT_MODEL`), la tarjeta trae un botón *Aplicar*. Guarda una copia fechada de `~/.claude/settings.json`, cambia solo esa clave y, desde el día siguiente, enseña la métrica de la tarjeta antes y después. *Deshacer* devuelve el valor anterior, salvo que lo hayas cambiado a mano después.
+- **Solo lo que se sostiene**: un hallazgo se recomienda cuando aparece 3 de los últimos 7 días y ahorra lo suficiente para *tu* gasto (el 1 % semanal, entre 0,25 y 2 USD). Mientras, espera en *En estudio* diciendo qué le falta. *No aplica* oculta una tarjeta hasta que su coste se duplica; *Recuperar* la devuelve.
 - **Prompt**: el texto para pedírselo a Claude se guarda en `~/.claude/reports/mejoras-AAAA-MM-DD.md` (`improvements-…` en inglés) y se copia con «Copiar prompt».
 
 Reglas actuales: contexto demasiado grande y compactaciones, retomar sesiones tras pausas largas (reescribe la caché), subagentes con Opus, lecturas de ficheros enormes, ver el contexto en la barra de estado (solo si no tienes ya statusLine o un plugin que lo enseñe), salida del modelo (solo si pasa del 25 % del coste) y modelo rentable.
