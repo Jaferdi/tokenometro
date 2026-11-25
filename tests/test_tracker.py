@@ -335,6 +335,60 @@ class StatuslineForecastTest(unittest.TestCase):
         self.assertEqual(self.s.label("seven_day", 20, None), "week 20%")
 
 
+class UpdateTest(Base):
+    def save(self, name, value):
+        with open(os.path.join(self.app, name), "w") as f:
+            json.dump(value, f)
+
+    def test_versions_agree(self):
+        self.assertEqual(read(os.path.join(ROOT, ".claude-plugin", "plugin.json"))["version"], self.t.VERSION)
+        self.assertIn(f'version = "{self.t.VERSION}"', read_text(os.path.join(ROOT, "pyproject.toml")))
+
+    def test_newer_release_shows_the_command_for_how_it_was_installed(self):
+        self.save("update.json", {"checked": time.time(), "latest": "99.0.0", "url": "https://example.test/r"})
+        info = self.t.update_info()
+        self.assertEqual((info["latest"], info["how"]), ("99.0.0", "git pull && python3 install.py"))
+        self.save("install.json", {"via": "plugin"})
+        self.assertEqual(self.t.update_info()["how"], "claude plugin update tokenometro@tokenometro")
+        self.save("update.json", {"checked": time.time(), "latest": self.t.VERSION})
+        self.assertIsNone(self.t.update_info())
+
+    def test_check_asks_github_once_a_day_and_can_be_turned_off(self):
+        calls = []
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n):
+                return b'{"tag_name": "v99.1.0", "html_url": "https://example.test/r"}'
+
+        real = self.t.urllib.request.urlopen
+        self.t.urllib.request.urlopen = lambda req, timeout: calls.append(req.full_url) or Resp()
+        try:
+            os.environ["TOKENOMETRO_UPDATE_CHECK"] = "0"
+            self.t.check_update()
+            self.assertEqual(calls, [])
+            del os.environ["TOKENOMETRO_UPDATE_CHECK"]
+            self.t.check_update()
+            self.t.check_update()
+            self.assertEqual(calls, ["https://api.github.com/repos/Jaferdi/tokenometro/releases/latest"])
+            self.assertEqual(self.t.update_info()["latest"], "99.1.0")
+        finally:
+            self.t.urllib.request.urlopen = real
+            os.environ.pop("TOKENOMETRO_UPDATE_CHECK", None)
+
+
+class CliTest(unittest.TestCase):
+    def test_help_and_unknown_command(self):
+        import cli
+        self.assertEqual(cli.main(["help"]), 0)
+        self.assertEqual(cli.main(["nope"]), 2)
+
+
 class I18nTest(unittest.TestCase):
     def test_same_keys_in_both_languages(self):
         src = read_text(os.path.join(ROOT, "tracker.py"))
@@ -566,6 +620,8 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(len(hooks), 2)
         self.assertIn("echo mine", hooks)
         self.assertTrue(any("start.py" in h and "--port 7998" in h for h in hooks))
+        dest = os.path.join(self.home, "AppData", "tokenometro") if os.name == "nt" else os.path.join(self.home, ".local", "share", "tokenometro")
+        self.assertEqual(read(os.path.join(dest, "install.json")), {"via": "git"})  # picks the update command
         self.assertEqual(read(self.settings)["statusLine"]["command"], "mybar")  # someone else's: untouched
         self.assertIn("--tee", r.stdout)
         r = self.install("--uninstall")
