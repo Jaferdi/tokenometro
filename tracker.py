@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -46,6 +47,19 @@ def _env(name, default):
 
 
 PORT = int(_env("PORT", "7878"))
+VERSION = "0.3.0"
+REPO = "Jaferdi/tokenometro"
+UPDATE_FILE = os.path.join(BASE, "update.json")
+
+
+def _small_json(path):
+    """A small file of ours that may not exist yet or be half-written: never an error, an empty dict."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
 INGEST_EVERY = 60
 CTX_LIMIT = 300_000  # if autoCompactWindow is set in settings.json, the recommendations use that value
 LIVE_MIN = 20
@@ -743,6 +757,7 @@ def data(days, client, cut=CUT_DEFAULT):
     order = {"todo": 0, "warn": 1, "info": 2, "ok": 3}
     res["recs"].sort(key=lambda x: (order[x["status"]], -(x["impact"] or 0)))
     res["currency"] = currency()
+    res["update"] = update_info()
     res["lang"] = lang()
     attach_history(con, res["recs"])
     attach_applied(con, res["recs"])
@@ -1995,7 +2010,7 @@ en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',
  plan_nopct:'{n} tokens. The plan % only exists with a subscription (with the API there is no 5 h or weekly limit) and Claude Code only gives it to the statusLine and plugins: enable statusline.py (see README) or the sub-meter plugin and the % and the estimated cap will show up here.',
  plan_src:'Your plan usage (from {src}, read at {at})',plan_ago:', {t} ago',five_h:'5 hours',week:'Week',
  eta:'At the current pace you reach 100 % on {eta}, before it resets.',noeta:'At the current pace you will not run out before it resets ({reset}).',resets:'resets in {t} ({at})',
- copied:'Copied',apply:'Apply',undo:'Undo',apply_hint:'Tokenometro can do it for you: sets {c} in ~/.claude/settings.json (a backup is saved first).',applied_on:'Applied from here on {d} ({c}).',applied_ba:'Before: {a} · after: {b} ({n} day(s)).',applied_wait:'The before/after appears from tomorrow.',undo_confirm:'Put back the previous value in ~/.claude/settings.json?',apply_failed:'Could not change settings.json',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
+ copied:'Copied',al_update:'v{n} available',al_update_tip:'You have {c} and {n} is out. To update: {h}',apply:'Apply',undo:'Undo',apply_hint:'Tokenometro can do it for you: sets {c} in ~/.claude/settings.json (a backup is saved first).',applied_on:'Applied from here on {d} ({c}).',applied_ba:'Before: {a} · after: {b} ({n} day(s)).',applied_wait:'The before/after appears from tomorrow.',undo_confirm:'Put back the previous value in ~/.claude/settings.json?',apply_failed:'Could not change settings.json',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
  al_unp:'{n} model(s) without a price',
  al_unpriced:'Estimated prices for <code>{m}</code>: not in prices.json, so they are valued at the <code>_default</code> price. Add them to prices.json for exact figures.',
  csv_hint:'Monthly report to share or bill: tokens and cost per session or per client.',csv_sessions:'CSV by session',csv_clients:'CSV by client',month_label:'Month of the CSV report',
@@ -2025,7 +2040,7 @@ es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días
  plan_nopct:'{n} tokens. El % del plan solo existe con suscripción (con API no hay límite de 5 h ni semanal) y Claude Code solo se lo da a la statusLine y a los plugins: activa statusline.py (ver README) o el plugin sub-meter y aquí saldrá el % y el techo estimado.',
  plan_src:'Uso de tu plan (dato de {src}, leído a las {at})',plan_ago:', hace {t}',five_h:'5 horas',week:'Semana',
  eta:'Al ritmo actual llegarás al 100 % el {eta}, antes de que se reinicie.',noeta:'Al ritmo actual no lo agotarás antes de que se reinicie ({reset}).',resets:'se reinicia en {t} ({at})',
- copied:'Copiado',apply:'Aplicar',undo:'Deshacer',apply_hint:'Tokenometro puede hacerlo por ti: pone {c} en ~/.claude/settings.json (antes guarda una copia).',applied_on:'Aplicada desde aquí el {d} ({c}).',applied_ba:'Antes: {a} · después: {b} ({n} día(s)).',applied_wait:'El antes/después sale a partir de mañana.',undo_confirm:'¿Volver a poner el valor anterior en ~/.claude/settings.json?',apply_failed:'No se pudo cambiar settings.json',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
+ copied:'Copiado',al_update:'v{n} disponible',al_update_tip:'Tienes la {c} y ya está la {n}. Para actualizar: {h}',apply:'Aplicar',undo:'Deshacer',apply_hint:'Tokenometro puede hacerlo por ti: pone {c} en ~/.claude/settings.json (antes guarda una copia).',applied_on:'Aplicada desde aquí el {d} ({c}).',applied_ba:'Antes: {a} · después: {b} ({n} día(s)).',applied_wait:'El antes/después sale a partir de mañana.',undo_confirm:'¿Volver a poner el valor anterior en ~/.claude/settings.json?',apply_failed:'No se pudo cambiar settings.json',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
  al_unp:'{n} modelo(s) sin precio',
  al_unpriced:'Precios estimados para <code>{m}</code>: no están en prices.json y se valoran al precio de <code>_default</code>. Añádelos a prices.json para tener cifras exactas.',
  csv_hint:'Informe mensual para compartir o repercutir: tokens y coste por sesión o por cliente.',csv_sessions:'CSV por sesión',csv_clients:'CSV por cliente',month_label:'Mes del informe CSV',
@@ -2144,14 +2159,19 @@ async function openSession(x,tr,n){const nx=tr.nextElementSibling;if(nx&&nx.clas
 function alerts(r){const a=[];
  if(r.unpriced&&r.unpriced.length){const tip=t('al_unpriced',{m:r.unpriced.map(m=>m.model).join(', ')}).replace(/<[^>]+>/g,'');
   a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_unp',{n:r.unpriced.length})+'</span>')}
+ if(r.update){const tip=t('al_update_tip',{c:r.update.current,n:r.update.latest,h:r.update.how});
+  a.push('<a class="chip" href="'+esc(r.update.url)+'" target="_blank" rel="noopener" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_update',{n:esc(r.update.latest)})+'</a>')}
  $('alerts').innerHTML=a.join('')}
 function csvLinks(){const d=new Date(),m=$('month').value||d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'),c=$('client').value;
  const u=by=>'/api/report.csv?month='+m+'&by='+by+'&client='+encodeURIComponent(c)+'&cur='+CUR.code+'&lang='+LANG;$('csv_s').href=u('session');$('csv_c').href=u('client')}
 let SEQ=0;
 async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r;
  // only the newest request draws: a slow older answer must not overwrite a newer one
- try{const res=await fetch('/api/data?days='+d+'&client='+encodeURIComponent(c)+'&cut='+encodeURIComponent($('cut').value||'')+'&cur='+CURSEL+'&lang='+LANGSEL);if(!res.ok)throw new Error(res.status);r=await res.json()}
+ // a server that stopped or restarted mid-request must not leave "Updating..." on screen forever
+ const ac=new AbortController(),tm=setTimeout(()=>ac.abort(),60000);
+ try{const res=await fetch('/api/data?days='+d+'&client='+encodeURIComponent(c)+'&cut='+encodeURIComponent($('cut').value||'')+'&cur='+CURSEL+'&lang='+LANGSEL,{signal:ac.signal});if(!res.ok)throw new Error(res.status);r=await res.json()}
  catch(e){if(my===SEQ)$('gen').textContent=t('load_err');return}
+ finally{clearTimeout(tm)}
  if(my!==SEQ)return;
  if(!LANGSEL&&r.lang&&r.lang!=LANG){LANG=r.lang;applyI18n()}
  CUR=r.currency||CUR;$('cur').value=CUR.code;$('eqn').textContent=CUR.code=='EUR'?t('eq_eur',{rate:num(CUR.eur_rate,2)})+(CUR.eur_date?' ('+CUR.eur_date+')':'')+'.':t('eq_usd');$('cur').querySelector('[value=EUR]').disabled=!(CUR.eur_rate>0);
@@ -2332,6 +2352,50 @@ class H(BaseHTTPRequestHandler):
             self.send_error(500, str(e)[:200])
 
 
+def _ver(v):
+    return tuple(int(x) for x in re.findall(r"[0-9]+", v or "")[:3])
+
+
+def check_update(force=False):
+    """Once a day, ask GitHub which release is the latest. Only that request leaves your machine, with no data
+    of yours; TOKENOMETRO_UPDATE_CHECK=0 turns it off. Failures are remembered too, so it never insists."""
+    if _env("UPDATE_CHECK", "1") == "0":
+        return
+    c = _small_json(UPDATE_FILE)
+    if not force and time.time() - (c.get("checked") or 0) < 86400:
+        return
+    c["checked"] = time.time()
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                     headers={"User-Agent": f"tokenometro/{VERSION}", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            d = json.loads(r.read(65536).decode("utf-8"))
+        if isinstance(d.get("tag_name"), str) and _ver(d["tag_name"]):
+            c.update(latest=d["tag_name"].lstrip("v"), url=d.get("html_url") or f"https://github.com/{REPO}/releases")
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(UPDATE_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(c, f)
+        os.replace(UPDATE_FILE + ".tmp", UPDATE_FILE)
+    except OSError:
+        pass
+
+
+def update_info():
+    """A newer release, and how to get it for the way this copy was installed."""
+    if _env("UPDATE_CHECK", "1") == "0":
+        return None
+    c = _small_json(UPDATE_FILE)
+    if _ver(c.get("latest")) <= _ver(VERSION):
+        return None
+    via = _small_json(os.path.join(BASE, "install.json")).get("via") or "git"
+    how = {"plugin": "claude plugin update tokenometro@tokenometro",
+           "pipx": "pipx upgrade tokenometro && tokenometro install",
+           "git": "git pull && python3 install.py"}.get(via, "git pull && python3 install.py")
+    return {"latest": c["latest"], "current": VERSION, "url": c.get("url") or f"https://github.com/{REPO}/releases", "how": how}
+
+
 def loop():
     last_snap = 0
     while True:
@@ -2349,6 +2413,7 @@ def loop():
                 write_digest()
             except Exception as e:
                 print("digest error:", e, file=sys.stderr)
+            check_update()
         time.sleep(INGEST_EVERY)
 
 

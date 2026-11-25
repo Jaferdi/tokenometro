@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenometro"
+version = "0.3.0"
+description = "Local dashboard of what your Claude Code sessions cost and what to change to spend less"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Jaferdi"}]
+requires-python = ">=3.8"
+keywords = ["claude-code", "tokens", "cost", "dashboard", "usage"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Environment :: Web Environment",
+]
+
+[project.urls]
+Homepage = "https://github.com/Jaferdi/tokenometro"
+Issues = "https://github.com/Jaferdi/tokenometro/issues"
+
+[project.scripts]
+tokenometro = "tokenometro.cli:main"
+
+# The repo root is the package: the same files work cloned, as a plugin and installed with pipx.
+[tool.setuptools]
+packages = ["tokenometro"]
+package-dir = {"tokenometro" = "."}
+include-package-data = false
+
+[tool.setuptools.package-data]
+tokenometro = ["prices.json", "clients.example.json", "start.sh", "install.sh", "README.md", "README.es.md", "LICENSE"]

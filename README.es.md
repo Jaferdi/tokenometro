@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>Mira cuánto cuestan tus sesiones de Claude Code, en qué se van los tokens y qué cambiar para gastar menos.</b><br>
-  Un solo fichero de Python · sin dependencias · nada sale de tu equipo · inglés y español · claro y oscuro
+  Un solo fichero de Python · sin dependencias · tus datos no salen de tu equipo · inglés y español · claro y oscuro
 </p>
 
 <p align="center">
@@ -88,6 +88,17 @@ python3 install.py --statusline  # además usa statusline.py para ver el % del p
 2. Añade en `~/.claude/settings.json` un hook `SessionStart` que levanta el panel al abrir Claude Code. Antes guarda una copia: `settings.json.bak-tokenometro-<fecha>`.
 3. Lee el histórico (la primera vez tarda un poco) y abre el servidor en http://127.0.0.1:7878.
 
+**Con pipx**:
+
+```bash
+pipx install git+https://github.com/Jaferdi/tokenometro
+tokenometro install              # igual que install.py; añade --statusline para el % del plan
+```
+
+El comando `tokenometro` también hace `open`, `restart`, `report`, `digest`, `demo` y `uninstall` (`tokenometro help`).
+
+**Actualizaciones**: cuando sale una versión nueva, el panel muestra *vX.Y disponible* junto al título, con el comando según cómo lo instalaste: `claude plugin update tokenometro@tokenometro`, `git pull && python3 install.py` o `pipx upgrade tokenometro && tokenometro install`. Para enterarte por correo, en GitHub *Watch → Custom → Releases*.
+
 Si ya tenías la versión anterior en `~/.local/share/claude-tokens`, copia datos y configuración y cambia el hook.
 
 Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quita el hook y la statusLine propia; los datos se quedan hasta que borres la carpeta).
@@ -96,7 +107,8 @@ Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quit
 
 - Solo lee `~/.claude/projects/**/*.jsonl` (y, si existe, la última lectura del plugin sub-meter).
 - Escucha en `127.0.0.1`: el panel no es accesible desde fuera de tu equipo.
-- No se conecta a internet ni envía nada. Todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
+- Tus datos no salen de tu equipo: todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
+- Su única petición a internet: una vez al día pregunta a GitHub cuál es la última versión (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`), sin enviar nada tuyo. GitHub ve tu IP, como en cualquier visita. Se apaga con `TOKENOMETRO_UPDATE_CHECK=0`.
 - En «Llamadas más gordas» enmascara lo que parezca un secreto, pero el panel muestra trozos de tus comandos y rutas: no lo compartas en capturas sin mirarlo.
 
 ## Qué significa «€ eq.»
@@ -183,6 +195,7 @@ El tipo de cambio se actualiza a mano: el tokenómetro no se conecta a nada. Si 
 | `TOKENOMETRO_CUT` | Fecha de corte de «Antes / después» | la de `clients.json` o hace 7 días |
 | `TOKENOMETRO_CURRENCY` | `EUR` o `USD` por defecto | la de `prices.json` |
 | `TOKENOMETRO_LANG` | `en` o `es` por defecto | `en` |
+| `TOKENOMETRO_UPDATE_CHECK` | `0` para no preguntar nunca a GitHub por versiones nuevas | `1` |
 | `TOKENOMETRO_NO_START` | `1` para que el instalador no lo arranque | |
 
 Siguen valiendo los nombres antiguos `CLAUDE_TOKENS_*`.
@@ -223,6 +236,7 @@ python3 ~/.local/share/tokenometro/start.py --restart
 | `install.py` | Instalar, actualizar y desinstalar (`install.sh` lo llama) |
 | `.claude-plugin/`, `hooks/` | Plugin de Claude Code |
 | `demo.py` | Probarlo con datos inventados, sin instalar nada |
+| `cli.py`, `pyproject.toml` | El comando `tokenometro` cuando se instala con pipx |
 | `usage.db` | Datos (se regenera desde los registros si lo borras) |
 | `plan.json` | Última lectura del plan de `statusline.py` |
 | `tracker.log` | Log del servidor |

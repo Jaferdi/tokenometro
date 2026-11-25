@@ -6,7 +6,7 @@
   python3 install.py --uninstall   -> remove the hook and our statusLine (keeps files and data)
 
 On Windows use `py install.py` (or `python install.py`). It only reads ~/.claude/projects and listens on
-127.0.0.1: nothing leaves your machine.
+127.0.0.1: your data never leaves your machine.
 """
 import json
 import os
@@ -158,6 +158,8 @@ def copy_files():
             shutil.copy2(os.path.join(SRC, "prices.json"), DEST)
     if not any(os.path.exists(os.path.join(DEST, f)) for f in ("clients.json", "clientes.json")):
         shutil.copy2(os.path.join(SRC, "clients.example.json"), os.path.join(DEST, "clients.json"))
+    if os.path.realpath(SRC) != os.path.realpath(DEST):  # reinstalling from the installed copy keeps the original origin
+        start.mark(DEST, "pipx" if "site-packages" in SRC else "git")
     if not WIN:
         for f in ("start.py", "start.sh", "tracker.py", "install.py", "install.sh", "statusline.py"):
             p = os.path.join(DEST, f)

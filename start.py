@@ -90,6 +90,22 @@ def copy(s, d):
     os.replace(tmp, d)
 
 
+def mark(d, via):
+    """Remember how this copy was installed, so the update notice shows the right command."""
+    p = os.path.join(d, "install.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            if json.load(f).get("via") == via:
+                return
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"via": via}, f)
+    except OSError:
+        pass
+
+
 def take_lock(d):
     """Two sessions opening at once: only the one that creates the lock starts it. A lock older than a minute
     is stale (whoever held it died); it is removed and taken again, so only one racer wins it."""
@@ -147,6 +163,8 @@ def main(args):
     # the lock covers the plugin copy too: two sessions opening at once must not both rewrite tracker.py
     locked = take_lock(d)
     try:
+        if "--plugin" in args and locked:
+            mark(d, "plugin")
         if "--plugin" in args and locked and sync(HERE, d):  # plugin updated: restart the old server
             stopped = stop(d, port) == "stopped"
         if "--restart" in args:
