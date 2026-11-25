@@ -73,7 +73,7 @@ def _env(name, default):
 
 
 PORT = int(_env("PORT", "7878"))
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 REPO = "Jaferdi/tokenometro"
 UPDATE_FILE = os.path.join(BASE, "update.json")
 LITELLM_FILE = os.path.join(BASE, "prices.litellm.json")
