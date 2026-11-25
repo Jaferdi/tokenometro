@@ -48,8 +48,8 @@ def load_tracker(tmp, clients=None):
             json.dump(clients, f)
     old = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
     os.environ["HOME"] = os.environ["USERPROFILE"] = home  # Windows reads ~ from USERPROFILE
-    for k in [k for k in os.environ if k.startswith(("TOKENOMETRO_", "CLAUDE_TOKENS_")) or k == "CLAUDE_CONFIG_DIR"]:
-        del os.environ[k]
+    for k in [k for k in os.environ if k.startswith(("TOKENOMETRO_", "CLAUDE_TOKENS_")) or k in ("CLAUDE_CONFIG_DIR", "WSL_DISTRO_NAME", "WSL_INTEROP")]:
+        del os.environ[k]  # a developer's own WSL must not add their Windows logs to the tests
     try:
         spec = importlib.util.spec_from_file_location(f"tracker_{abs(hash(tmp))}", os.path.join(app, "tracker.py"))
         mod = importlib.util.module_from_spec(spec)
@@ -221,6 +221,30 @@ class ClaudeConfigDirTest(Base):
         os.makedirs(empty)
         os.environ["CLAUDE_CONFIG_DIR"] = f"{a}, {empty} ,{b}"
         self.assertEqual(self.t._claude_dirs(), [a, b])
+
+    def wsl_root(self, *users):
+        root = os.path.join(self.tmp, "mnt")
+        for u in users:
+            os.makedirs(os.path.join(root, "c", "Users", u, ".claude", "projects"), exist_ok=True)
+        os.makedirs(os.path.join(root, "c", "Users", "Public"), exist_ok=True)
+        return root
+
+    def test_wsl_also_reads_the_windows_folder(self):
+        root = self.wsl_root("ana")
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        try:
+            self.assertEqual(self.t._windows_dirs_from_wsl(root), [os.path.join(root, "c", "Users", "ana", ".claude")])
+        finally:
+            os.environ.pop("WSL_DISTRO_NAME")
+
+    def test_wsl_skips_windows_when_several_users_have_claude_or_not_in_wsl(self):
+        root = self.wsl_root("ana", "luis")
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        try:
+            self.assertEqual(self.t._windows_dirs_from_wsl(root), [])
+        finally:
+            os.environ.pop("WSL_DISTRO_NAME")
+        self.assertEqual(self.t._windows_dirs_from_wsl(self.wsl_root("ana")), [])  # not WSL: never looks
 
     def test_ingest_reads_every_folder(self):
         other = os.path.join(self.tmp, "other", "projects", "-work-other")

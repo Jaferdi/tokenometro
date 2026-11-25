@@ -33,8 +33,18 @@ def _claude_dirs():
     count, so an empty leftover folder does not hide the real one."""
     env = os.environ.get("CLAUDE_CONFIG_DIR", "")
     dirs = [os.path.expanduser(p.strip()) for p in env.split(",") if p.strip()] or \
-        [os.path.join(HOME, ".config", "claude"), os.path.join(HOME, ".claude")]
+        [os.path.join(HOME, ".config", "claude"), os.path.join(HOME, ".claude")] + _windows_dirs_from_wsl()
     return [d for d in dirs if os.path.isdir(os.path.join(d, "projects"))] or dirs[-1:]
+
+
+def _windows_dirs_from_wsl(root="/mnt"):
+    """Inside WSL, Claude Code may also run on the Windows side (C:\\Users\\<you>\\.claude, seen as
+    /mnt/c/Users/<you>/.claude). Only taken when exactly one Windows user has it, so a shared PC never mixes
+    someone else's usage in; otherwise CLAUDE_CONFIG_DIR says which one."""
+    if not (os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
+        return []
+    found = glob.glob(os.path.join(root, "*", "Users", "*", ".claude", "projects"))
+    return [os.path.dirname(found[0])] if len(found) == 1 else []
 
 
 CLAUDE_DIRS = _claude_dirs()
