@@ -837,7 +837,7 @@ def data(days, client, cut=CUT_DEFAULT):
     chain = main_chain(con, w, a, T)
     cfg = read_config()
     for rec in (cache_miss_rec(con, chain), tool_output_rec(con, w, a, chain, cfg), ttl_rec(con, chain, prices, cfg),
-                error_loops_rec(con, w, a, C), claude_md_rec(res["fixed"])):
+                error_loops_rec(con, w, a, C), claude_md_rec(res["fixed"]), reread_rec(con, w, a, chain)):
         if rec:
             res["recs"].append(rec)
 
@@ -1188,6 +1188,78 @@ def tool_output_rec(con, w, a, chain, cfg):
                      "summary, never whole logs. Show me the diff before saving.",
                      "Añade a mi CLAUDE.md una regla corta: filtrar la salida de los comandos (tail, grep, --quiet) y que los "
                      "scripts impriman un resumen, nunca logs enteros. Enséñame el diff antes de guardar."),
+    }
+
+
+_NOT_TEXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".ipynb")
+
+
+def reread_rec(con, w, a, chain):
+    """The same file Read again in the same stretch of a conversation (no compaction, no edit of that file in
+    between): the second copy adds nothing new but is carried, like the first, on every later turn. Images and
+    PDFs are left out (screenshots are overwritten and re-read on purpose). Offset/limit are not stored, so two
+    different ranges of a file look the same: only the part up to the largest earlier read counts, and half of it."""
+    after, seg = {}, {}
+    for rows in chain.values():
+        nxt, part = len(rows), 0
+        for i in range(len(rows) - 1, -1, -1):
+            if i + 1 < len(rows) and rows[i + 1]["ctx"] < 0.6 * rows[i]["ctx"]:
+                nxt = i + 1
+            after[rows[i]["id"]] = (nxt - i - 1, rows[i]["crp"] or 0)
+        for i, r in enumerate(rows):
+            if i and r["ctx"] < 0.6 * rows[i - 1]["ctx"]:
+                part += 1
+            seg[r["id"]] = (part, i)
+    seen, by_file = {}, {}
+    n, tokens, cost, sessions, days = 0, 0.0, 0.0, set(), set()
+    calls = [r for r in q(con, f"""SELECT id, name, msg_id, session, day, input_head f, result_chars ch FROM tools
+            WHERE sidechain=0 AND name IN ('Read', 'Edit', 'Write', 'MultiEdit') AND COALESCE(input_head, '') != ''
+            AND {w}""", a) if r["msg_id"] in seg and not r["f"].lower().endswith(_NOT_TEXT)]
+    calls.sort(key=lambda r: (r["session"], seg[r["msg_id"]][1], r["id"]))
+    for r in calls:
+        key = (r["session"], seg[r["msg_id"]][0], r["f"])
+        if r["name"] != "Read":
+            seen.pop(key, None)  # the file changed: reading it again is how you see the change
+            continue
+        prev = seen.get(key, 0)
+        seen[key] = max(prev, r["ch"] or 0)
+        if not prev or (r["ch"] or 0) < 4000:
+            continue
+        turns, price = after.get(r["msg_id"], (0, 0))
+        tk = min(r["ch"], prev) / 4
+        n += 1
+        tokens += tk
+        cost += tk * turns * price * 0.5
+        sessions.add(r["session"])
+        days.add(r["day"])
+        by_file[r["f"]] = by_file.get(r["f"], 0) + 1
+    if n < 3:
+        return None
+    top = ", ".join(f"{os.path.basename(f)} ×{k + 1}" for f, k in sorted(by_file.items(), key=lambda x: -x[1])[:3])
+    return {
+        "id": "reread", "title": tr("The same file is read again in the same conversation", "Se vuelve a leer el mismo fichero en la misma conversación"),
+        "status": "todo", "impact": cost,
+        "impact_note": tr("estimate: repeated tokens (up to the largest earlier read) × later turns until a compaction × cache read price, halved",
+                          "estimación: tokens repetidos (hasta la mayor lectura anterior) × turnos siguientes hasta compactar × precio de lectura de caché, a la mitad"),
+        "confidence": tr("medium: the range read (offset/limit) is not logged", "media: el tramo leído (offset/limit) no queda registrado"),
+        "evidence": tr(f"{n} time(s) a file already in the context was read again, with no edit or compaction in between, "
+                       f"in {len(sessions)} session(s): ~{fmt_tok(tokens)} tokens carried twice, ~{money(cost, 2)}. Most repeated: {top}.",
+                       f"{n} vez/veces se volvió a leer un fichero que ya estaba en el contexto, sin edición ni compactación entre medias, "
+                       f"en {len(sessions)} sesión(es): ~{fmt_tok(tokens)} tokens acarreados dos veces, ~{money(cost, 2)}. Los más repetidos: {top}."),
+        "action": tr("Before opening a file already read in this conversation again, use what is already in the context; if you need "
+                     "another part, ask only for that range (offset/limit) or find it with Grep.",
+                     "Antes de volver a abrir un fichero ya leído en esta conversación, usa lo que ya está en el contexto; si necesitas "
+                     "otra parte, pide solo ese rango (offset/limit) o búscala con Grep."),
+        "verify": tr("This card's count and amount drop.", "El número y el importe de esta tarjeta bajan."),
+        "tradeoff": tr("After a long detour the model may need the file fresh; then reading it again is right.",
+                       "Tras un desvío largo el modelo puede necesitar el fichero fresco; entonces releerlo es lo correcto."),
+        "metric": n, "metric_label": tr("repeated reads", "relecturas"),
+        "sample": {"sessions": len(sessions), "days": len(days)},
+        "tools": [],
+        "prompt": tr("Add to my CLAUDE.md a short rule: don't read again a file already read in this conversation unless it "
+                     "changed; for another part use offset/limit or Grep. Show me the diff before saving.",
+                     "Añade a mi CLAUDE.md una regla corta: no volver a leer un fichero ya leído en esta conversación salvo que "
+                     "haya cambiado; para otra parte, offset/limit o Grep. Enséñame el diff antes de guardar."),
     }
 
 
