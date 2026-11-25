@@ -212,7 +212,7 @@ python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur E
 python3 ~/.local/share/tokenometro/tracker.py digest 2026-11-17   # weekly summary of the week holding that day
 ```
 
-`report` takes `[YYYY-MM]` (this month by default), `--by session|client`, `--client NAME` and `--cur USD|EUR`. The same CSV is in the dashboard, in the *By client* card. `digest` prints the Markdown summary of a week (Monday to Sunday; last week by default). The server also writes last week's one by itself, once, as `~/.claude/reports/tokenometro-week-YYYY-Www.md` (`tokenometro-semana-…` in Spanish).
+`report` takes `[YYYY-MM]` (this month by default), `--by session|client`, `--client NAME`, `--cur USD|EUR` and `--json` (the same rows as JSON, for scripts). The same CSV is in the dashboard, in the *By client* card. `digest` prints the Markdown summary of a week (Monday to Sunday; last week by default), or JSON with `--json`. The server also writes last week's one by itself, once, as `~/.claude/reports/tokenometro-week-YYYY-Www.md` (`tokenometro-semana-…` in Spanish).
 
 Restart the server (it only stops it if it is Tokenometro):
 

@@ -16,7 +16,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -944,6 +944,25 @@ class ReportTest(Base):
         by_client = list(csv.DictReader(io.StringIO(self.t.report(month, "client"))))
         self.assertEqual([r["client"] for r in by_client], ["acme"])
         self.assertEqual(self.t.report("1999-01", "session").count("\n"), 1)  # header only
+
+    def test_json_report_and_digest(self):
+        month = datetime.now().strftime("%Y-%m")
+        self.t.set_currency("EUR")
+        r = json.loads(self.t.report(month, "session", as_json=True))
+        self.assertEqual(r["month"], month)
+        self.assertEqual(len(r["rows"]), 1)
+        row = r["rows"][0]
+        self.assertEqual(row["client"], "acme")
+        self.assertGreater(row["cost_usd"], 0)
+        self.assertIn("cost_eur", row)
+        self.assertEqual(row["input_tokens"], 1_000_010)
+        self.assertEqual(json.loads(self.t.report("1999-01", "client", as_json=True))["rows"], [])
+        today = date.today()
+        d = json.loads(self.t.digest(today - timedelta(days=today.weekday()), as_json=True))
+        self.assertGreater(d["cost_usd"], 0)
+        self.assertEqual(d["sessions"], 1)
+        self.assertEqual(d["unpriced_models"], ["claude-future-9"])
+        self.assertEqual(d["top_sessions"][0]["session"], "11111111-1111-4111-a111-111111111111")
 
     def test_csv_cells_are_never_formulas(self):
         self.assertEqual(self.t._cell('=HYPERLINK("http://x")'), '\'=HYPERLINK("http://x")')

@@ -18,8 +18,8 @@ USAGE = """usage: tokenometro <command> [options]
   uninstall                           remove the hook and our statusLine (keeps your data)
   open                                open the dashboard in the browser
   restart                             restart the dashboard
-  report [YYYY-MM] [--by client] [--client NAME] [--cur EUR]   monthly CSV to stdout
-  digest [YYYY-MM-DD]                 weekly Markdown summary to stdout
+  report [YYYY-MM] [--by client] [--client NAME] [--cur EUR] [--json]   monthly CSV (or JSON) to stdout
+  digest [YYYY-MM-DD] [--json]        weekly Markdown (or JSON) summary to stdout
   ingest                              read new logs and print a short summary
   demo [--lang es] [--currency EUR]   try it with made-up data, without installing anything
 """
