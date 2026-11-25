@@ -471,17 +471,21 @@ class FunnelTest(Base):
         self.assertTrue(all(x["stage"] in ("shown", "study", "dismissed") and isinstance(x["missing"], list) for x in recs))
 
 
-def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=()):
-    """One main-conversation request: `ctx` tokens of context, `cw` of them written to the cache, the rest read."""
+def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=(), h1=False):
+    """One main-conversation request: `ctx` tokens of context, `cw` of them written to the cache (for 1 hour if h1),
+    the rest read."""
     d = json.loads(record(sid, now_ts(minutes_ago), mid, model=model, inp=10, cr=max(ctx - cw - 10, 0)))
     d["message"]["usage"]["cache_creation_input_tokens"] = cw
+    if h1:
+        d["message"]["usage"]["cache_creation"] = {"ephemeral_1h_input_tokens": cw, "ephemeral_5m_input_tokens": 0}
     d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
     return json.dumps(d)
 
 
-def result(tool_id, chars):
+def result(tool_id, chars, error=False):
     return json.dumps({"type": "user", "sessionId": "x", "timestamp": now_ts(), "cwd": "/work/demo",
-                       "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "x" * chars}]}})
+                       "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id,
+                                                                "content": "x" * chars, "is_error": error}]}})
 
 
 class NewDetectorsTest(Base):
@@ -522,6 +526,53 @@ class NewDetectorsTest(Base):
                                req("s1", "a2", 29, 51_000, 1_000)])
         self.assertIsNone(self.rec("tool-output"))
         self.assertIsNone(self.rec("cache-miss"))
+
+    def test_five_minute_cache_rebuilt_after_short_pauses_suggests_one_hour(self):
+        rows = []
+        for s in range(3):  # every turn 20 minutes after the last: each one writes the whole context again
+            rows += [req(f"s{s}", f"s{s}_{i}", 200 - 20 * i, 300_000 + i, 300_000 if i else 2_000) for i in range(5)]
+        self.write("a.jsonl", rows)
+        r = self.rec("ttl-1h")
+        self.assertEqual((r["status"], r["sample"]["sessions"]), ("todo", 3))
+        self.assertGreater(r["impact"], 0)
+        self.assertEqual(self.t.APPLY["ttl-1h"], {"promptCacheTtl": "1h"})
+
+    def test_one_hour_cache_without_pauses_suggests_five_minutes(self):
+        rows = [req("s1", f"a{i}", 100 - i, 100_000 + 1_000 * i, 20_000, h1=True) for i in range(20)]
+        self.write("a.jsonl", rows)
+        r = self.rec("ttl-5m")
+        self.assertEqual(r["status"], "todo")
+        self.assertIn("1-hour", r["evidence"])
+        self.assertIsNone(self.rec("ttl-1h"))
+
+    def test_one_hour_cache_that_pays_off_says_nothing(self):
+        rows = []
+        for s in range(3):
+            rows += [req(f"s{s}", f"s{s}_{i}", 200 - 20 * i, 300_000 + i, 2_000, h1=True) for i in range(5)]
+        self.write("a.jsonl", rows)
+        self.assertIsNone(self.rec("ttl-5m"))
+        self.assertIsNone(self.rec("ttl-1h"))
+
+    def test_runs_of_three_failures_of_the_same_tool_are_counted(self):
+        rows = []
+        for i in range(4):  # Bash fails four times in a row, then works
+            rows += [req("s1", f"a{i}", 30 - i, 50_000, 1_000, tools=("Bash",)), result(f"a{i}_0", 100, error=i < 4)]
+        rows += [req("s1", "b0", 20, 50_000, 1_000, tools=("Bash",)), result("b0_0", 100)]
+        for i in range(2):  # two failures only: not a loop
+            rows += [req("s2", f"c{i}", 30 - i, 50_000, 1_000, tools=("Read",)), result(f"c{i}_0", 100, error=True)]
+        self.write("a.jsonl", rows)
+        r = self.rec("error-loops")
+        self.assertEqual((r["metric"], r["sample"]), (1, {"sessions": 1, "days": 1}))
+        self.assertIn("Bash: 1 (4 tries", r["evidence"])
+        self.assertNotIn("Read", r["evidence"])
+
+    def test_heavy_global_claude_md_is_flagged_and_light_one_is_not(self):
+        fx = {"parts": [{"k": "claude_md", "tokens": 6_000}], "base": 30_000, "cost": 30.0, "sessions": 10}
+        r = self.t.claude_md_rec(fx)
+        self.assertAlmostEqual(r["impact"], 30.0 * 4_000 / 30_000 * 0.5)
+        self.assertEqual(r["metric"], 6_000)
+        fx["parts"][0]["tokens"] = 2_000
+        self.assertIsNone(self.t.claude_md_rec(fx))
 
 
 class UpdateTest(Base):

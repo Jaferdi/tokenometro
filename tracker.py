@@ -750,7 +750,9 @@ def data(days, client, cut=CUT_DEFAULT):
     if mcp:
         res["recs"].append(mcp)
     chain = main_chain(con, w, a, T)
-    for rec in (cache_miss_rec(con, chain), tool_output_rec(con, w, a, chain, read_config())):
+    cfg = read_config()
+    for rec in (cache_miss_rec(con, chain), tool_output_rec(con, w, a, chain, cfg), ttl_rec(con, chain, prices, cfg),
+                error_loops_rec(con, w, a, C), claude_md_rec(res["fixed"])):
         if rec:
             res["recs"].append(rec)
 
@@ -943,7 +945,7 @@ def main_chain(con, w, a, T):
     read price per token, for the detectors that follow a session turn by turn."""
     loss = f"({T['cw']} - {T['cr'].replace('cr*', '(cw5+cw1h)*')})"
     by = {}
-    for r in q(con, f"""SELECT id, session, ts, day, model, inp+cw5+cw1h+cr ctx, cw5+cw1h cw, {loss} loss,
+    for r in q(con, f"""SELECT id, session, ts, day, model, inp+cw5+cw1h+cr ctx, cw5+cw1h cw, cw5, cw1h, cr, {loss} loss,
             {T['cr'].replace('cr*', '1*')} crp FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a):
         r["t"] = local(r["ts"])
         by.setdefault(r["session"], []).append(r)
@@ -1080,10 +1082,181 @@ def tool_output_rec(con, w, a, chain, cfg):
     }
 
 
+def price_of(prices):
+    """Per-model price lookup in Python, with the same matching as cost_terms (longest name first)."""
+    default = {"input": 4, "output": 20, "cache_read": 0.2, "cache_write_5m": 5, "cache_write_1h": 8, **prices.get("_default", {})}
+    models = sorted(((m, {**default, **p}) for m, p in prices.items() if not m.startswith("_") and isinstance(p, dict)),
+                    key=lambda x: -len(x[0]))
+    return lambda model: next((p for m, p in models if m in (model or "")), default)
+
+
+def ttl_rec(con, chain, prices, cfg):
+    """Which cache duration pays off, measured on the user's own pauses. A 1-hour cache costs more to write but keeps
+    the conversation warm through pauses of 5 to 60 minutes; a 5-minute one is cheaper to write and is rebuilt after
+    each such pause. Sessions are split by the duration they used; the other one is simulated on the same requests,
+    and only the tokens the previous request had in context are counted as kept or rebuilt."""
+    price = price_of(prices)
+    one = {"extra": 0.0, "kept": 0.0, "pauses": 0, "sessions": set(), "days": set()}
+    five = {"extra": 0.0, "lost": 0.0, "pauses": 0, "sessions": set(), "days": set()}
+    for rows in chain.values():
+        h1 = sum(r["cw1h"] for r in rows) > sum(r["cw5"] for r in rows)
+        d = one if h1 else five
+        for r in rows:
+            p = price(r["model"])
+            d["extra"] += r["cw"] * (p["cache_write_1h"] - p["cache_write_5m"]) / 1e6
+        for prev, r in zip(rows, rows[1:]):
+            if not (prev["t"] and r["t"]) or not 300 < (r["t"] - prev["t"]).total_seconds() <= 3600:
+                continue
+            p = price(r["model"])
+            if h1:
+                one["kept"] += min(r["cr"], prev["ctx"]) * (p["cache_write_5m"] - p["cache_read"]) / 1e6
+            else:
+                five["lost"] += min(r["cw"], prev["ctx"]) * (p["cache_write_1h"] - p["cache_read"]) / 1e6
+            d["pauses"] += 1
+            d["sessions"].add(r["session"])
+            d["days"].add(r["day"])
+    done = {r["id"]: r["day"] for r in q(con, "SELECT id, day FROM applied WHERE id IN ('ttl-1h', 'ttl-5m')")}
+    to5 = one["extra"] - one["kept"] if one["extra"] > one["kept"] and cfg.get("promptCacheTtl") != "5m" else 0
+    to1 = five["lost"] - five["extra"] if five["lost"] > five["extra"] and cfg.get("promptCacheTtl") != "1h" else 0
+    if not (to5 or to1 or done):
+        return None
+    rid = "ttl-5m" if (to5 >= to1 if (to5 or to1) else "ttl-5m" in done) else "ttl-1h"
+    save = to5 if rid == "ttl-5m" else to1
+    d = one if rid == "ttl-5m" else five
+    status = "todo" if not done.get(rid) else ("warn" if save else "ok")
+    if rid == "ttl-5m":
+        evidence = tr(f"Your sessions use the 1-hour cache: writing it cost {money(one['extra'], 1)} more than a 5-minute one, and it "
+                      f"only saved {money(one['kept'], 1)} across {one['pauses']} pause(s) of 5 to 60 minutes. Net: {money(save, 1)} lost.",
+                      f"Tus sesiones usan la caché de 1 hora: escribirla costó {money(one['extra'], 1)} más que la de 5 minutos, y solo "
+                      f"ahorró {money(one['kept'], 1)} en {one['pauses']} pausa(s) de 5 a 60 minutos. Neto: {money(save, 1)} perdidos.")
+        action = tr('Set "promptCacheTtl": "5m": you rarely stop between 5 and 60 minutes, so the longer cache doesn\'t pay for itself.',
+                    'Pon "promptCacheTtl": "5m": casi nunca paras entre 5 y 60 minutos, así que la caché larga no compensa.')
+    else:
+        evidence = tr(f"Your sessions use the 5-minute cache and were rebuilt after {five['pauses']} pause(s) of 5 to 60 minutes: "
+                      f"{money(five['lost'], 1)}. A 1-hour cache would have cost {money(five['extra'], 1)} more to write. Net: {money(save, 1)} lost.",
+                      f"Tus sesiones usan la caché de 5 minutos y se rehicieron tras {five['pauses']} pausa(s) de 5 a 60 minutos: "
+                      f"{money(five['lost'], 1)}. La de 1 hora habría costado {money(five['extra'], 1)} más de escribir. Neto: {money(save, 1)} perdidos.")
+        action = tr('Set "promptCacheTtl": "1h": you often stop for a few minutes, and each time the whole conversation is written again.',
+                    'Pon "promptCacheTtl": "1h": paras a menudo unos minutos y cada vez se vuelve a escribir toda la conversación.')
+    if done.get(rid):
+        evidence = tr(f"Applied on {done[rid]}. ", f"Aplicado el {done[rid]}. ") + (evidence if save else tr(
+            "The sessions in this period no longer lose money on the cache duration.",
+            "Las sesiones de este periodo ya no pierden dinero por la duración de la caché."))
+    return {
+        "id": rid, "title": tr("The cache duration doesn't fit how you pause", "La duración de la caché no encaja con tus pausas"),
+        "status": status, "impact": save,
+        "impact_note": tr("simulated on your own requests with the other duration, at prices.json",
+                          "simulado sobre tus propias peticiones con la otra duración, con prices.json"),
+        "confidence": tr("high", "alta"),
+        "evidence": evidence, "action": action,
+        "verify": tr("A week later this card no longer finds a net loss.", "Una semana después esta tarjeta ya no encuentra pérdida neta."),
+        "tradeoff": tr("On a subscription this changes how fast you use your limits, not a bill. Subagents have their own "
+                       "setting (subagentPromptCacheTtl), and the CLAUDE_CODE_PROMPT_CACHE_TTL variable wins over this one.",
+                       "Con suscripción esto cambia lo rápido que gastas tus límites, no una factura. Los subagentes tienen su "
+                       "propio ajuste (subagentPromptCacheTtl), y la variable CLAUDE_CODE_PROMPT_CACHE_TTL manda sobre este."),
+        "metric": round(save, 2), "metric_money": True, "metric_label": tr(f"{sym()} lost net", f"{sym()} perdidos netos"),
+        "sample": {"sessions": len(d["sessions"]), "days": len(d["days"])} if not done.get(rid) else None,
+        "tools": [], "prompt": "",
+    }
+
+
+def error_loops_rec(con, w, a, C):
+    """A tool that fails three or more times in a row in the same conversation: each retry is a full request.
+    Counted on the main conversation; the cost is that of the requests that issued the retries (not the first try)."""
+    rows = q(con, f"""SELECT t.session, t.name, t.is_error, t.day, {C.replace('model', 'm.model')} cost FROM tools t
+        JOIN msgs m ON m.id = t.msg_id WHERE t.sidechain=0 AND {w.replace('day', 't.day').replace('client', 't.client')}
+        ORDER BY t.session, m.ts""", a)
+    loops = {}
+    run = []
+
+    def close():
+        if len(run) >= 3:
+            b = loops.setdefault(run[0]["name"], {"n": 0, "tries": 0, "cost": 0.0, "sessions": set(), "days": set()})
+            b["n"] += 1
+            b["tries"] += len(run)
+            b["cost"] += sum(x["cost"] or 0 for x in run[1:])
+            b["sessions"].add(run[0]["session"])
+            b["days"].add(run[0]["day"])
+    for r in rows:
+        if run and (r["session"] != run[-1]["session"] or r["name"] != run[-1]["name"] or not r["is_error"]):
+            close()
+            run = []
+        if r["is_error"]:
+            run.append(r)
+    close()
+    if not loops:
+        return None
+    total = sum(b["cost"] for b in loops.values())
+    n = sum(b["n"] for b in loops.values())
+    top = sorted(loops.items(), key=lambda x: -x[1]["cost"])[:3]
+    parts = "; ".join(f"{k}: {b['n']} ({b['tries']} tries, {money(b['cost'], 2)})" for k, b in top)
+    parts_es = "; ".join(f"{k}: {b['n']} ({b['tries']} intentos, {money(b['cost'], 2)})" for k, b in top)
+    sessions = set().union(*(b["sessions"] for b in loops.values()))
+    days = set().union(*(b["days"] for b in loops.values()))
+    return {
+        "id": "error-loops", "title": tr("A tool kept failing and was retried again and again",
+                                         "Una herramienta fallaba y se reintentaba una y otra vez"),
+        "status": "todo", "impact": total,
+        "impact_note": tr("measured: the requests that issued the retries, not the first try",
+                          "medido: las peticiones de los reintentos, sin contar el primer intento"),
+        "confidence": tr("high for the amount, medium for how much is avoidable", "alta en el importe, media en cuánto se puede evitar"),
+        "evidence": tr(f"{n} run(s) of 3 or more failures in a row in {len(sessions)} session(s): {money(total, 2)}. {parts}.",
+                       f"{n} racha(s) de 3 o más fallos seguidos en {len(sessions)} sesión(es): {money(total, 2)}. {parts_es}."),
+        "action": tr("When the same tool fails twice, stop and change the approach: read the error, check the path, the options or "
+                     "the environment, or ask. For scripts and browser automation, keep the ones that work and reuse them.",
+                     "Cuando la misma herramienta falla dos veces, para y cambia de enfoque: lee el error, revisa la ruta, las "
+                     "opciones o el entorno, o pregunta. Con scripts y automatización del navegador, guarda los que funcionan y reutilízalos."),
+        "verify": tr("This card's runs and amount drop.", "Las rachas y el importe de esta tarjeta bajan."),
+        "tradeoff": tr("None to speak of.", "Ninguna relevante."),
+        "metric": n, "metric_label": tr("runs of 3+ failures", "rachas de 3+ fallos"),
+        "sample": {"sessions": len(sessions), "days": len(days)},
+        "tools": [],
+        "prompt": tr("Add to my ~/.claude/CLAUDE.md a short rule: if the same tool fails twice in a row, stop, explain the error and "
+                     "change the approach instead of retrying. Show me the diff before saving.",
+                     "Añade a mi ~/.claude/CLAUDE.md una regla corta: si la misma herramienta falla dos veces seguidas, parar, explicar "
+                     "el error y cambiar de enfoque en vez de reintentar. Enséñame el diff antes de guardar."),
+    }
+
+
+def claude_md_rec(fx):
+    """The global CLAUDE.md (with its @imports) is read on every turn of every session. Above ~2.5K tokens, the part
+    over 2K is what could move to skills or files read on demand; half of it is counted, to stay on the safe side."""
+    md = next((p["tokens"] for p in fx["parts"] if p["k"] == "claude_md"), 0)
+    if md <= 2500 or not fx["base"]:
+        return None
+    save = fx["cost"] * (md - 2000) / fx["base"] * 0.5
+    return {
+        "id": "claude-md", "title": tr("Your CLAUDE.md is read on every single turn", "Tu CLAUDE.md se lee en cada turno"),
+        "status": "todo", "impact": save,
+        "impact_note": tr("its share of the fixed cost, only the part over 2K tokens, halved",
+                          "su parte del coste fijo, solo lo que pasa de 2K tokens, a la mitad"),
+        "confidence": tr("medium", "media"),
+        "evidence": tr(f"~/.claude/CLAUDE.md and its @imports take ~{fmt_tok(md)} tokens and go into every request of "
+                       f"{fx['sessions']} session(s). Trimming it to ~2K would save about {money(save, 2)} in the period.",
+                       f"~/.claude/CLAUDE.md y sus @imports ocupan ~{fmt_tok(md)} tokens y van en cada petición de "
+                       f"{fx['sessions']} sesión(es). Dejarlo en ~2K ahorraría unos {money(save, 2)} en el periodo."),
+        "action": tr("Keep in CLAUDE.md only what applies to almost every task. Move procedures and long reference to skills "
+                     "(loaded only when used) or to files you point to, and import project-specific files only in that project.",
+                     "Deja en CLAUDE.md solo lo que aplica a casi todas las tareas. Pasa procedimientos y referencias largas a "
+                     "skills (se cargan solo al usarlas) o a ficheros que se citen, e importa lo de cada proyecto solo en ese proyecto."),
+        "verify": tr("The fixed cost card shows CLAUDE.md smaller.", "La tarjeta de coste fijo muestra CLAUDE.md más pequeño."),
+        "tradeoff": tr("An instruction moved to a skill is only followed when the skill loads.",
+                       "Una instrucción que pasa a una skill solo se sigue cuando la skill se carga."),
+        "metric": md, "metric_label": tr("tokens in CLAUDE.md", "tokens en CLAUDE.md"),
+        "tools": [],
+        "prompt": tr("Read my ~/.claude/CLAUDE.md and its @imports and propose, section by section, what to keep, what to move to "
+                     "a skill and what to drop, aiming at under 2K tokens. Don't change anything until I approve the diff.",
+                     "Lee mi ~/.claude/CLAUDE.md y sus @imports y propón, sección a sección, qué dejar, qué pasar a una skill y qué "
+                     "quitar, para que quede por debajo de 2K tokens. No cambies nada hasta que apruebe el diff."),
+    }
+
+
 # Recommendations the dashboard can apply itself: always a fixed change decided here, never a value sent by the page
 APPLY = {
     "ctx": {"autoCompactWindow": 300000},
     "subagent-model": {"env.CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
+    "ttl-5m": {"promptCacheTtl": "5m"},
+    "ttl-1h": {"promptCacheTtl": "1h"},
 }
 _ABSENT = {"__tokenometro__": "absent"}
 
@@ -1230,6 +1403,7 @@ def read_config():
     except Exception:
         st = {}
     cfg["autoCompactWindow"] = st.get("autoCompactWindow")
+    cfg["promptCacheTtl"] = st.get("promptCacheTtl")
     hooks = st.get("hooks") or {}
     hook_sets = [hooks]
     for key, on in (st.get("enabledPlugins") or {}).items():
