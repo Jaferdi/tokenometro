@@ -152,6 +152,8 @@ def connect():
     )
     if "input_head" not in [r[1] for r in con.execute("PRAGMA table_info(tools)")]:
         con.execute("ALTER TABLE tools ADD COLUMN input_head TEXT")
+    if "head" not in [r[1] for r in con.execute("PRAGMA table_info(files)")]:
+        con.execute("ALTER TABLE files ADD COLUMN head BLOB")
     return con
 
 
@@ -159,6 +161,9 @@ _SECRET = [
     (re.compile(r"(?i)\b(bearer|basic)\s+\S+"), r"\1 ***"),
     (re.compile(r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|authorization|bearer)(\s*[:=]\s*|\s+)\S+"), r"\1\2***"),
     (re.compile(r"(?i)(?<!\S)(--defaults-extra-file=|-p)(?=\S)\S+"), r"\1***"),
+    (re.compile(r"(?i)(://)[^/\s:@]+:[^/\s@]+@"), r"\1***@"),
+    (re.compile(r"(?i)(?<!\S)(-u|--user)(\s+)\S+:\S+"), r"\1\2***"),
+    (re.compile(r"(?i)(cookie|set-cookie)(\s*:\s*)[^'\"]+"), r"\1\2***"),
     (re.compile(r"(?<![/\w+=-])(?=[A-Za-z0-9+_=-]*\d)(?=[A-Za-z0-9+_=-]*[A-Za-z])[A-Za-z0-9+_=-]{32,}"), "***"),
 ]
 
@@ -194,6 +199,11 @@ def _text_len(content):
                 elif b.get("type") == "image":
                     n += 6000  # an image weighs in the thousands of tokens
     return n
+
+
+_FIRST_TYPE = re.compile(rb'\{\s*"type"\s*:\s*"([^"]+)"')
+_WANTED_TYPES = {b"assistant", b"user", b"system", b"custom-title"}
+_WANTED_ANY = re.compile(rb'"type"\s*:\s*"(?:assistant|user)"|"compact_boundary"')
 
 
 def _handle(con, d):
@@ -257,45 +267,73 @@ def _handle(con, d):
                 con.execute("INSERT OR IGNORE INTO prompts VALUES(?,?,?,?,?)", (d.get("uuid"), day, session, cl, len(text)))
 
 
+HEAD_BYTES = 256
+BATCH_LINES = 5000
+
+
+def _ingest_file(con, path, off, size, head):
+    """Read complete lines from off, committing every BATCH_LINES so the write lock is never held for long.
+    The offset only advances together with what was saved, so a database error just retries later."""
+    n = 0
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            pending = 0
+            for line in f:
+                if not line.endswith(b"\n"):
+                    break  # still being written: next time
+                off += len(line)
+                # cheap prefilter: big records (api-request-blob…) embed "type":"user" in their payload,
+                # so when "type" is the first key its value decides; otherwise look for the wanted types
+                m = _FIRST_TYPE.match(line)
+                if m:
+                    if m.group(1) not in _WANTED_TYPES:
+                        continue
+                elif not _WANTED_ANY.search(line):
+                    continue
+                try:
+                    _handle(con, json.loads(line))
+                    n += 1
+                    pending += 1
+                except (ValueError, TypeError, AttributeError, KeyError):
+                    pass  # malformed or unexpected record: skip it
+                if pending >= BATCH_LINES:
+                    con.execute("INSERT OR REPLACE INTO files(path, offset, size, head) VALUES(?,?,?,?)", (path, off, size, head))
+                    con.commit()
+                    pending = 0
+        con.execute("INSERT OR REPLACE INTO files(path, offset, size, head) VALUES(?,?,?,?)", (path, off, size, head))
+        con.commit()
+    except sqlite3.Error:
+        con.rollback()
+    except OSError:
+        pass
+    return n
+
+
 def ingest():
     global _last_ingest
     with _lock:
         con = connect()
-        known = {p: (o, s) for p, o, s in con.execute("SELECT path, offset, size FROM files")}
+        known = {p: (o, h) for p, o, h in con.execute("SELECT path, offset, head FROM files")}
         n_lines = 0
         for root, _dirs, files in os.walk(PROJECTS):
             for fn in files:
                 if not fn.endswith(".jsonl"):
                     continue
                 path = os.path.join(root, fn)
+                off, old_head = known.get(path, (0, None))
                 try:
                     size = os.path.getsize(path)
+                    if size == off:
+                        continue
+                    with open(path, "rb") as f:
+                        head = f.read(HEAD_BYTES)
                 except OSError:
                     continue
-                off, _ = known.get(path, (0, 0))
-                if size == off:
-                    continue
-                if size < off:
+                # transcripts only grow; if it shrank or its start changed, it was rewritten: read it again
+                if size < off or (old_head and head[: len(old_head)] != bytes(old_head)):
                     off = 0
-                with open(path, "rb") as f:
-                    f.seek(off)
-                    data = f.read()
-                end = data.rfind(b"\n")
-                if end < 0:
-                    continue
-                for line in data[: end + 1].splitlines():
-                    if line.startswith(b'{"type":"'):
-                        if not line.startswith(b'{"type":"custom-title"'):
-                            continue
-                    elif not (b'"type":"assistant"' in line or b'"type":"user"' in line or b'"compact_boundary"' in line):
-                        continue
-                    try:
-                        _handle(con, json.loads(line))
-                        n_lines += 1
-                    except Exception:
-                        pass
-                con.execute("INSERT OR REPLACE INTO files VALUES(?,?,?)", (path, off + end + 1, size))
-                con.commit()
+                n_lines += _ingest_file(con, path, off, size, head)
         if n_lines or not _last_ingest:
             reclassify(con)
         con.close()
@@ -412,7 +450,9 @@ def cost_terms(prices):
     """SQL expressions for the equivalent USD cost per token type, by model."""
     default = prices.get("_default", {"input": 4, "output": 20, "cache_read": 0.2, "cache_write_5m": 5, "cache_write_1h": 8})
     # Longest name first: "claude-opus-5-5" before "claude-opus-5"; the %…% match also covers Bedrock/Vertex prefixes.
-    models = sorted(((m, p) for m, p in prices.items() if not m.startswith("_")), key=lambda x: -len(x[0]))
+    # a model missing a field takes it from _default instead of breaking the dashboard
+    models = sorted(((m, {**default, **p}) for m, p in prices.items() if not m.startswith("_") and isinstance(p, dict)),
+                    key=lambda x: -len(x[0]))
     fields = {
         "inp": lambda p: f"inp*{p['input']}",
         "out": lambda p: f"out*{p['output']}",
@@ -599,7 +639,8 @@ def data(days, client, cut=CUT_DEFAULT):
     res["currency"] = currency()
     res["lang"] = lang()
     attach_history(con, res["recs"])
-    res["recs_file"] = recs_file_path()
+    rf = recs_file_path()
+    res["recs_file"] = "~" + rf[len(HOME):] if rf.startswith(HOME + os.sep) else rf
     con.close()
     res["insights"] = insights(res)
     return res
@@ -807,16 +848,17 @@ def plan_info(con, C, tot, live):
         at = datetime.fromtimestamp(d["at"] / 1000, timezone.utc) if d else None
     except Exception:
         d = None
+    def rolling(kind):
+        # no valid plan %: only what was spent in the rolling window, which comes from the transcripts
+        sp = span[kind]
+        r = q(con, f"SELECT COALESCE(SUM({C}),0) c, COALESCE(SUM({tot}),0) t FROM msgs WHERE ts >= ?", [iso(now - sp)])[0]
+        for x in live:
+            sc = q(con, f"SELECT COALESCE(SUM({C}),0) c FROM msgs WHERE session=? AND ts >= ?", [x["session"], iso(now - sp)])[0]["c"]
+            x.setdefault("plan", {})[kind] = {"cost": sc, "pct": None}
+        return {"kind": kind, "pct": None, "cost": r["c"], "tokens": r["t"]}
+
     if not d:
-        # Without sub-meter there is no plan %: only what was spent in rolling windows, which comes from the transcripts
-        res = {"source": None, "windows": []}
-        for kind, sp in span.items():
-            r = q(con, f"SELECT COALESCE(SUM({C}),0) c, COALESCE(SUM({tot}),0) t FROM msgs WHERE ts >= ?", [iso(now - sp)])[0]
-            res["windows"].append({"kind": kind, "pct": None, "cost": r["c"], "tokens": r["t"]})
-            for x in live:
-                sc = q(con, f"SELECT COALESCE(SUM({C}),0) c FROM msgs WHERE session=? AND ts >= ?", [x["session"], iso(now - sp)])[0]["c"]
-                x.setdefault("plan", {})[kind] = {"cost": sc, "pct": None}
-        return res
+        return {"source": None, "windows": [rolling(k) for k in span]}
     res = {"source": "statusLine" if fs[-1] == PLAN_FILE else "sub-meter", "at": at.astimezone().strftime("%H:%M"), "age_min": int((now - at).total_seconds() // 60), "windows": []}
     for lim in d.get("limits") or []:
         kind = lim.get("kind")
@@ -824,13 +866,22 @@ def plan_info(con, C, tot, live):
             continue
         try:
             reset = datetime.fromisoformat(lim["resetsAt"].replace("Z", "+00:00"))
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)
         except Exception:
             continue
         start, pct = reset - span[kind], float(lim.get("percentUsed") or 0)
         at_cost = q(con, f"SELECT COALESCE(SUM({C}),0) c FROM msgs WHERE ts >= ? AND ts <= ?", [iso(start), iso(at) + "Z"])[0]["c"]
-        now_ = q(con, f"SELECT COALESCE(SUM({C}),0) c, COALESCE(SUM({tot}),0) t FROM msgs WHERE ts >= ?", [iso(start)])[0]
-        con.execute("INSERT OR IGNORE INTO plan_hist VALUES(?,?,?,?)", [iso(at), kind, pct, at_cost])
-        con.commit()
+        try:
+            con.execute("INSERT OR IGNORE INTO plan_hist VALUES(?,?,?,?)", [iso(at), kind, pct, at_cost])
+            con.commit()
+        except sqlite3.OperationalError:
+            pass  # database busy (long first ingest): this reading is stored next time
+        if reset <= now:
+            # the reading belongs to a window that already reset: its % no longer says anything about now
+            res["windows"].append(rolling(kind))
+            continue
+        now_ = q(con, f"SELECT COALESCE(SUM({C}),0) c, COALESCE(SUM({tot}),0) t FROM msgs WHERE ts >= ? AND ts < ?", [iso(start), iso(reset)])[0]
         caps = sorted(r[0] * 100 / r[1] for r in con.execute(
             "SELECT cost, pct FROM plan_hist WHERE kind=? AND pct >= 10 AND at >= ? ORDER BY at DESC LIMIT 15",
             [kind, iso(now - timedelta(days=30))]))
@@ -886,7 +937,9 @@ def write_recs_file(recs, kpi):
         lines.append("")
     os.makedirs(REPORTS, exist_ok=True)
     tmp = recs_file_path() + ".tmp"
-    open(tmp, "w").write("\n".join(lines))
+    # it contains project paths and prompts: readable only by you
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write("\n".join(lines))
     os.replace(tmp, recs_file_path())
 
 
@@ -1353,7 +1406,7 @@ tr:last-child>td{border-bottom:0}
 th{color:var(--mut);font-weight:600;font-size:12px;border-bottom-color:color-mix(in srgb,var(--fg) 25%,transparent)}
 td:first-child,th:first-child{text-align:left;white-space:normal;overflow-wrap:anywhere;min-width:110px}
 th.s{cursor:pointer;user-select:none}th.s:hover{color:var(--fg)}
-tr.click{cursor:pointer}tr.click>td{transition:background .15s}tr.click:hover>td{background:color-mix(in srgb,var(--a) 9%,transparent)}
+th.s:focus-visible,tr.click:focus-visible{outline:2px solid var(--c);outline-offset:-2px}tr.click{cursor:pointer}tr.click>td{transition:background .15s}tr.click:hover>td{background:color-mix(in srgb,var(--a) 9%,transparent)}
 .bar{height:6px;background:var(--a);border-radius:3px}
 .sbar{display:flex;width:84px;height:8px;border-radius:4px;overflow:hidden;background:var(--sunk)}.sbar i{display:block;height:100%}
 .code{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-size:12px;text-align:left;white-space:normal;word-break:break-all;max-width:560px}
@@ -1434,7 +1487,7 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 <p class="mut" style="font-size:12px;margin:8px 0 0" data-i18n="recs_legend"></p></section>
 <section class="card wide"><h2 data-i18n="daily_title"></h2><div class="leg" id="leg"></div><div id="daily"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="daily_note"></p></section>
-<section class="card wide"><h2><span data-i18n="before_after"></span> <input type="date" id="cut"></h2><div id="cmp"></div>
+<section class="card wide"><h2><span data-i18n="before_after"></span> <input type="date" id="cut" data-i18n-aria="cut_label"></h2><div id="cmp"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="ba_note"></p></section>
 <section class="card"><h2 data-i18n="by_model"></h2><div id="models"></div></section>
 <section class="card"><h2 data-i18n="by_client"></h2><div id="clients"></div></section>
@@ -1458,6 +1511,7 @@ en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',
  plan_src:'Your plan usage (from {src}, read at {at})',plan_ago:', {t} ago',five_h:'5 hours',week:'Week',
  eta:'At the current pace you reach 100 % on {eta}, before it resets.',noeta:'At the current pace you will not run out before it resets ({reset}).',resets:'resets in {t} ({at})',
  copied:'Copied',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
+ load_err:'Could not refresh: is Tokenometro still running? Showing the last data received.',cut_label:'Cut-off date for before / after',
  tools:'Tools',tool:'Tool',tok_h:'~Tokens',calls:'Calls',errors:'Errors',subagents:'Subagents',subagent:'Subagent',biggest_calls:'Biggest calls',what:'What',tokens:'Tokens',sessions:'Sessions',
  updated:'Updated at {t} · refreshes every minute',live_hint:'Sessions with activity in the last {n} min. The bar is the size of the conversation (context) that is resent on every reply; the mark is the autocompact limit, where Claude summarises it.',
  today_sub:'<b>{tok}</b> tokens and <b>{n}</b> messages today · in the period, <b>{c}</b>',period_k:'Period',per_msg:'Per message of yours',turns_plus:'Each message triggers {a} model replies ("turns") plus {b} from subagents',of_cost:'of the cost goes to subagents, helper agents Claude launches for side tasks',
@@ -1484,6 +1538,7 @@ es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días
  plan_src:'Uso de tu plan (dato de {src}, leído a las {at})',plan_ago:', hace {t}',five_h:'5 horas',week:'Semana',
  eta:'Al ritmo actual llegarás al 100 % el {eta}, antes de que se reinicie.',noeta:'Al ritmo actual no lo agotarás antes de que se reinicie ({reset}).',resets:'se reinicia en {t} ({at})',
  copied:'Copiado',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
+ load_err:'No se pudo actualizar: ¿sigue en marcha Tokenometro? Se muestran los últimos datos recibidos.',cut_label:'Fecha de corte para antes / después',
  tools:'Herramientas',tool:'Herramienta',tok_h:'~Tokens',calls:'Llamadas',errors:'Errores',subagents:'Subagentes',subagent:'Subagente',biggest_calls:'Llamadas más gordas',what:'Qué',tokens:'Tokens',sessions:'Sesiones',
  updated:'Actualizado a las {t} · se refresca cada minuto',live_hint:'Sesiones con actividad en los últimos {n} min. La barra es el tamaño de la conversación (contexto), que se reenvía en cada respuesta; la marca es el límite de autocompact, donde Claude la resume.',
  today_sub:'<b>{tok}</b> tokens y <b>{n}</b> mensajes hoy · en el periodo, <b>{c}</b>',period_k:'Periodo',per_msg:'Por mensaje tuyo',turns_plus:'Cada mensaje provoca {a} respuestas del modelo («turnos») más {b} de subagentes',of_cost:'del coste va a subagentes, agentes auxiliares que Claude lanza para tareas aparte',
@@ -1507,24 +1562,27 @@ function applyI18n(){document.documentElement.lang=LANG;document.title=t('title'
  document.querySelectorAll('[data-i18n-title]').forEach(e=>e.title=t(e.dataset.i18nTitle));
  $('lang').value=LANG;const o=$('client').querySelector('[value=otros]');if(o)o.textContent=t('others')}
 const num=(v,d)=>(v||0).toLocaleString(LOC(),{minimumFractionDigits:d,maximumFractionDigits:d,useGrouping:false});
-const tok=n=>{n=n||0;return n>=1e9?num(n/1e9,1)+'B':n>=1e6?num(n/1e6,1)+'M':n>=1e3?(n/1e3).toFixed(0)+'K':Math.round(n)+''};
+const tok=n=>{n=n||0;return n>=999.95e6?num(n/1e9,1)+'B':n>=999.5e3?num(n/1e6,1)+'M':n>=1e3?num(n/1e3,0)+'K':Math.round(n)+''};
 let CUR={code:'USD',sym:'$',rate:1};
 const usd=n=>{const v=(n||0)*CUR.rate;return num(v,v<10?2:0)+' '+CUR.sym};
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const short=p=>esc((p||'').replace(/^\/home\/[^/]+/,'~'));
+const short=p=>esc((p||'').replace(/^\/(home|Users)\/[^/]+/,'~'));
 const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 function table(rows,cols){if(!rows.length)return '<p class="mut">'+t('no_data')+'</p>';
  const max=Math.max(...rows.map(r=>cols[1].v(r)||0),1);
  return '<table><tr>'+cols.map(c=>'<th>'+c.h+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+cols.map((c,i)=>'<td>'+(i==1&&c.bar!==false?'<div style="display:flex;gap:6px;align-items:center;justify-content:flex-end">'+c.f(c.v(r))+'<div class="bar" style="width:'+Math.max(2,44*(c.v(r)||0)/max)+'px"></div></div>':c.f(c.v(r),r))+'</td>').join('')+'</tr>').join('')+'</table>'}
+const onKey=e=>e.onkeydown=ev=>{if(ev.key=='Enter'||ev.key==' '){ev.preventDefault();e.click()}};
 function tbl(el,rows,cols,opt){opt=opt||{};el._st=el._st||{k:null,d:-1};const PS=opt.page||8;el._pg=el._pg||0;
  const draw=()=>{let rs=rows.slice();const st=el._st;if(st.k!=null){const c=cols[st.k],f=c.s||c.v;rs.sort((a,b)=>{const x=f(a),y=f(b);return (typeof x=='string'?String(x).localeCompare(y):(x||0)-(y||0))*st.d})}
   const np=Math.max(1,Math.ceil(rs.length/PS));if(el._pg>=np)el._pg=np-1;const off=el._pg*PS,vis=rs.slice(off,off+PS);
   el.innerHTML=table(vis,cols)+(np>1?'<div class="pager"><button type="button" data-p="-1"'+(el._pg?'':' disabled')+' aria-label="'+t('prev')+'">‹</button><span>'+(off+1)+'–'+(off+vis.length)+' '+t('of')+' '+rs.length+'</span><button type="button" data-p="1"'+(el._pg<np-1?'':' disabled')+' aria-label="'+t('next')+'">›</button></div>':'');
-  el.querySelectorAll('.pager button').forEach(b=>b.onclick=()=>{el._pg+=+b.dataset.p;draw()});
-  const ths=el.querySelectorAll('th');
-  cols.forEach((c,i)=>{const f=c.s||c.v,t0=rows.length?f(rows[0]):0;if(t0===null||typeof t0!='object'){ths[i].classList.add('s');ths[i].title=(c.help?c.help+' · ':'')+t('sort');
-   if(st.k===i)ths[i].textContent+=st.d<0?' ▾':' ▴';ths[i].onclick=()=>{st.d=st.k===i?-st.d:-1;st.k=i;el._pg=0;draw()}}});
-  if(opt.click)el.querySelectorAll('tr').forEach((tr,i)=>{if(!i)return;tr.classList.add('click');tr.onclick=()=>opt.click(vis[i-1],tr,cols.length)})};
+  el.querySelectorAll('.pager button').forEach(b=>b.onclick=()=>{el._pg+=+b.dataset.p;draw();const n=el.querySelector('.pager button[data-p="'+b.dataset.p+'"]:not([disabled])')||el.querySelector('.pager button:not([disabled])');if(n)n.focus()});
+  const ths=el.querySelectorAll('th');if(!ths.length)return;
+  cols.forEach((c,i)=>{const f=c.s||c.v,t0=f(rows[0]);if(t0===null||typeof t0!='object'){const th=ths[i];th.classList.add('s');th.title=(c.help?c.help+' · ':'')+t('sort');th.tabIndex=0;
+   th.setAttribute('aria-sort',st.k===i?(st.d<0?'descending':'ascending'):'none');
+   if(st.k===i)th.textContent+=st.d<0?' ▾':' ▴';th.onclick=()=>{st.d=st.k===i?-st.d:-1;st.k=i;el._pg=0;draw();const n=el.querySelectorAll('th')[i];if(n)n.focus()};onKey(th)}});
+  if(opt.click)el.querySelectorAll('tr').forEach((tr,i)=>{if(!i)return;tr.classList.add('click');tr.tabIndex=0;tr.setAttribute('aria-expanded','false');
+   tr.onclick=()=>{const nx=tr.nextElementSibling,was=!!(nx&&nx.classList.contains('det'));tr.setAttribute('aria-expanded',was?'false':'true');opt.click(vis[i-1],tr,cols.length)};onKey(tr)})};
  draw()}
 const RM=matchMedia('(prefers-reduced-motion: reduce)').matches;
 function odometer(el,v){const txt=((v||0)*CUR.rate).toFixed(2),sep=LANG=='es'?',':'.';el.setAttribute('aria-label',txt.replace('.',sep)+' '+t(CUR.code=='EUR'?'odo_eur':'odo_usd'));if(el.dataset.cur!=CUR.sym||el.dataset.sep!=sep){el.dataset.len='';el.dataset.cur=CUR.sym;el.dataset.sep=sep}
@@ -1544,10 +1602,11 @@ function gauges(el,live,L){if(!live.length){el.innerHTML='<p class="empty">'+t('
  requestAnimationFrame(()=>requestAnimationFrame(()=>el.querySelectorAll('.gauge').forEach(g=>{g.querySelector('.fill').style.setProperty('--w',g.dataset.w+'%');GW[g.dataset.s]=g.dataset.w})))}
 let FIRST=true,PREV={},RECS=[];
 const hm=m=>m<60?m+' min':m<1440?Math.floor(m/60)+' h '+(m%60)+' min':Math.floor(m/1440)+' d '+Math.floor(m%1440/60)+' h';
+const roll=w=>'<div class="pl"><div class="gh"><b>'+(w.kind=='five_hour'?t('last5h'):t('last7d'))+'</b><span class="v">'+usd(w.cost)+'</span></div><div class="gm">'+t('plan_nopct',{n:tok(w.tokens)})+'</div></div>';
 function plan(p){const c=$('plancard');c.hidden=!p;if(!p)return;
- if(!p.source){$('planage').textContent=t('plan_nolecture');$('plan').innerHTML=p.windows.map(w=>'<div class="pl"><div class="gh"><b>'+(w.kind=='five_hour'?t('last5h'):t('last7d'))+'</b><span class="v">'+usd(w.cost)+'</span></div><div class="gm">'+t('plan_nopct',{n:tok(w.tokens)})+'</div></div>').join('');return}
+ if(!p.source){$('planage').textContent=t('plan_nolecture');$('plan').innerHTML=p.windows.map(roll).join('');return}
  $('planage').textContent=t('plan_src',{src:p.source,at:p.at})+(p.age_min>5?t('plan_ago',{t:hm(p.age_min)}):'');
- $('plan').innerHTML=p.windows.map(w=>{const n=w.kind=='five_hour'?t('five_h'):t('week'),lv=w.pct>=90?' red':w.pct>=75?' amb':'';
+ $('plan').innerHTML=p.windows.map(w=>{if(w.pct==null)return roll(w);const n=w.kind=='five_hour'?t('five_h'):t('week'),lv=w.pct>=90?' red':w.pct>=75?' amb':'';
   const cap=w.cap?t('win_cap',{c:usd(w.cost),tok:tok(w.tokens),cap:usd(w.cap),left:usd(w.left),now:(w.pct_now!=null&&Math.abs(w.pct_now-w.pct)>=3?t('win_now',{n:w.pct_now.toFixed(0)}):'')})+' '+(w.eta?'<span class="w">'+t('eta',{eta:w.eta})+'</span>':t('noeta',{reset:w.reset})):t('win_nocap',{c:usd(w.cost),tok:tok(w.tokens)});
   return '<div class="pl'+lv+'"><div class="gh"><b>'+n+'</b><span class="p">'+t('resets',{t:hm(Math.max(0,w.reset_min)),at:w.reset})+'</span><span class="v">'+w.pct.toFixed(0)+' %</span></div>'+
    '<div class="track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+w.pct+'" aria-label="'+n+'"><i class="fill" style="--w:'+Math.min(100,w.pct)+'%"></i></div>'+
@@ -1567,16 +1626,22 @@ const FITN={opus:'Opus',opusplan:'opusplan',sonnet:'Sonnet',haiku:'Haiku'};
 const fit=x=>{const f=x.fit;if(!f)return '<span class="mut">-</span>';return '<span class="fit fit-'+f.model+'" title="'+esc(f.why)+'">'+FITN[f.model]+'</span>'+(f.save>=0.5?'<br><span class="mut">−'+usd(f.save)+'</span>':'')};
 const sess=(title,id)=>esc(title||(id||'').slice(0,8));
 async function openSession(x,tr,n){const nx=tr.nextElementSibling;if(nx&&nx.classList.contains('det')){const di=nx.querySelector('.detin');di.classList.remove('open');setTimeout(()=>nx.remove(),RM?0:450);return}
- const d=await (await fetch('/api/session?id='+x.session)).json();const tb=(rows,cols)=>table(rows,cols);
+ if(tr._busy)return;tr._busy=true;let d;
+ try{const res=await fetch('/api/session?id='+encodeURIComponent(x.session));if(!res.ok)throw new Error(res.status);d=await res.json()}catch(e){d=null}finally{tr._busy=false}
+ if(!d||!tr.isConnected){tr.setAttribute('aria-expanded','false');return}const tb=(rows,cols)=>table(rows,cols);
  const html='<div class="g"><div><h3>'+t('by_model')+'</h3>'+tb(d.by_model,[{h:t('model'),v:y=>y,f:y=>esc(y.model.replace('claude-',''))+(y.sidechain?' <span class="mut">'+t('subag')+'</span>':'')},{h:t('cost'),v:y=>y.cost,f:usd},{h:t('turns'),v:y=>y.turns,f:v=>v}])+
   '<h3 style="margin-top:10px">'+t('segments')+'</h3>'+tb(d.segments,[{h:t('from'),v:y=>y.from,f:v=>esc(v.slice(5,16).replace('T',' '))},{h:t('cost'),v:y=>y.cost,f:usd},{h:t('turns'),v:y=>y.turns,f:v=>v},{h:t('max_ctx'),v:y=>y.peak,f:tok}])+'</div>'+
   '<div><h3>'+t('tools')+'</h3>'+tb(d.tools,[{h:t('tool'),v:y=>y.name,f:esc},{h:t('tok_h'),v:y=>(y.chars||0)/4,f:tok},{h:t('calls'),v:y=>y.calls,f:v=>v},{h:t('errors'),v:y=>y.errors,f:v=>v}])+
   '<h3 style="margin-top:10px">'+t('subagents')+'</h3>'+tb(d.agents,[{h:t('subagent'),v:y=>y,f:y=>esc(y.description||y.agent.slice(0,10))+' <span class="mut">'+esc(y.type||'')+'</span>'},{h:t('cost'),v:y=>y.cost,f:usd},{h:t('model'),v:y=>y.models,f:v=>esc((v||'').replace(/claude-/g,''))},{h:t('turns'),v:y=>y.turns,f:v=>v}])+'</div>'+
-  '<div><h3>'+t('biggest_calls')+'</h3>'+tb(d.big_calls,[{h:t('what'),v:y=>y,f:y=>'<div class="code"><b>'+esc(y.name)+'</b> '+esc(y.input_head||'')+'</div>'},{h:t('tok_h'),v:y=>(y.result_chars||0)/4,f:tok}])+'</div></div>';
+  '<div><h3>'+t('biggest_calls')+'</h3>'+tb(d.big_calls,[{h:t('what'),v:y=>y,f:y=>'<div class="code"><b>'+esc(y.name)+'</b> '+esc((y.input_head||'').replace(/\/(home|Users)\/[^/\s]+/g,'~'))+'</div>'},{h:t('tok_h'),v:y=>(y.result_chars||0)/4,f:tok}])+'</div></div>';
  tr.insertAdjacentHTML('afterend','<tr class="det"><td colspan="'+n+'"><div class="detin"><div>'+html+'</div></div></td></tr>');
  const di=tr.nextElementSibling.querySelector('.detin');requestAnimationFrame(()=>requestAnimationFrame(()=>di.classList.add('open')))}
-async function load(){const d=$('days').value,c=$('client').value;
- const r=await (await fetch('/api/data?days='+d+'&client='+encodeURIComponent(c)+'&cut='+($('cut').value||'')+'&cur='+CURSEL+'&lang='+LANGSEL)).json();
+let SEQ=0;
+async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r;
+ // only the newest request draws: a slow older answer must not overwrite a newer one
+ try{const res=await fetch('/api/data?days='+d+'&client='+encodeURIComponent(c)+'&cut='+encodeURIComponent($('cut').value||'')+'&cur='+CURSEL+'&lang='+LANGSEL);if(!res.ok)throw new Error(res.status);r=await res.json()}
+ catch(e){if(my===SEQ)$('gen').textContent=t('load_err');return}
+ if(my!==SEQ)return;
  if(!LANGSEL&&r.lang&&r.lang!=LANG){LANG=r.lang;applyI18n()}
  CUR=r.currency||CUR;$('cur').value=CUR.code;$('eqn').textContent=CUR.code=='EUR'?t('eq_eur',{rate:num(CUR.eur_rate,2)})+(CUR.eur_date?' ('+CUR.eur_date+')':'')+'.':t('eq_usd');$('cur').querySelector('[value=EUR]').disabled=!(CUR.eur_rate>0);
  if(!$('cut').value)$('cut').value=r.compare.cut;
@@ -1621,7 +1686,7 @@ async function load(){const d=$('days').value,c=$('client').value;
   (x.prompt?'<div class="pr"><span>'+t('prompt_for')+' <code>'+esc(FILE)+'</code></span><button type="button" class="cp" data-i="'+ix+'">'+t('copy_prompt')+'</button></div>':'')+
   '<details data-k="d-'+x.id+'"'+(openK.has('d-'+x.id)?' open':'')+'><summary>'+t('tradeoff_h')+'</summary><dl><dt>'+t('tradeoff')+'</dt><dd>'+esc(x.tradeoff)+'</dd>'+(x.impact_note?'<dt>'+t('calc')+'</dt><dd>'+esc(x.impact_note)+'</dd>':'')+'<dt>'+t('confidence')+'</dt><dd>'+esc(x.confidence)+'</dd></dl></details></div>'}).join('')||'<p class="mut">'+t('nothing')+'</p>';
  const B=r.compare.before,A=r.compare.after;
- const dl=(a,b,good)=>{if(!b)return '';const v=100*(a-b)/b;return '<span style="color:'+css(((v<0)==good)?'--b':'--f')+'">'+(v>0?'+':'')+v.toFixed(0)+'%</span>'};
+ const dl=(a,b,good)=>{if(!b)return '';const v=100*(a-b)/b;return '<span style="color:'+css(Math.abs(v)<0.5?'--mut':((v<0)==good)?'--b':'--f')+'">'+(v>0?'+':'')+v.toFixed(0)+'%</span>'};
  const cr=[[t('cost_day'),x=>x.cost_day,usd,1],[t('cost_msg'),x=>x.cost_per_prompt,usd,1],[t('turns_msg'),x=>x.turns_per_prompt,v=>num(v,1),1],
   [t('avg_ctx'),x=>x.avg_ctx,tok,1],[t('subagents'),x=>x.sub_pct,pct,1],[t('over_k',{n:tok(L.ctx)}),x=>x.over_pct,pct,1],[t('messages_h'),x=>x.prompts,v=>v,null]];
  $('cmp').innerHTML=(A.days<5?'<p class="warn" style="margin:0 0 6px;font-size:12px">'+t('short_warn',{n:A.days})+'</p>':'')+'<table class="cmp"><tr><th></th><th>'+B.frm.slice(5)+' → '+B.to.slice(5)+'</th><th>'+A.frm.slice(5)+' → '+A.to.slice(5)+'</th><th>'+t('change')+'</th></tr>'+cr.map(m=>'<tr><td>'+m[0]+'</td><td>'+m[2](m[1](B))+'</td><td>'+m[2](m[1](A))+'</td><td>'+(m[3]?dl(m[1](A),m[1](B),true):'')+'</td></tr>').join('')+'</table>';
@@ -1636,8 +1701,9 @@ try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if
 $('lang').onchange=()=>{LANGSEL=$('lang').value;LANG=LANGSEL;try{localStorage.setItem('tk-lang',LANGSEL)}catch(e){};applyI18n();load()};
 ['days','client','cut'].forEach(i=>$(i).onchange=load);$('re').onclick=async()=>{$('re').classList.add('busy');$('re').textContent=t('refreshing');try{await load()}finally{$('re').classList.remove('busy');$('re').textContent=t('refresh')}};
 applyI18n();
-fetch('/api/clients').then(r=>r.json()).then(cs=>{cs.forEach(c=>$('client').insertAdjacentHTML('beforeend','<option value="'+esc(c)+'">'+esc(c)+'</option>'));applyI18n();load()});
-setInterval(load,60000);
+fetch('/api/clients').then(r=>r.json()).then(cs=>cs.forEach(c=>$('client').insertAdjacentHTML('beforeend','<option value="'+esc(c)+'">'+esc(c)+'</option>'))).catch(()=>{}).then(()=>{applyI18n();load()});
+// the minute refresh waits while you have a session open or are moving through a table with the keyboard
+setInterval(()=>{const a=document.activeElement;if(!document.querySelector('tr.det')&&!(a&&a.closest&&a.closest('table,.pager')))load()},60000);
 </script></body></html>"""
 
 
@@ -1655,6 +1721,12 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_GET(self):
+        # a web page that points its own domain at 127.0.0.1 (DNS rebinding) would send its domain as Host
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0] if not (self.headers.get("Host") or "").startswith("[") \
+            else (self.headers.get("Host") or "").split("]")[0] + "]"
+        if host not in ("127.0.0.1", "localhost", "[::1]"):
+            self.send_error(403, "Tokenometro only answers on 127.0.0.1 or localhost")
+            return
         u = urlparse(self.path)
         try:
             if u.path == "/":
@@ -1722,7 +1794,8 @@ def main():
         return
     if cmd == "backfill":
         t0 = time.time()
-        print(tr(f"{backfill()} calls completed in {time.time()-t0:.0f}s", f"{backfill()} llamadas completadas en {time.time()-t0:.0f}s"))
+        n = backfill()
+        print(tr(f"{n} calls completed in {time.time()-t0:.0f}s", f"{n} llamadas completadas en {time.time()-t0:.0f}s"))
         return
     threading.Thread(target=loop, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
