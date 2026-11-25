@@ -391,6 +391,86 @@ class PausesCardTest(Base):
         con.close()
 
 
+class FunnelTest(Base):
+    """Only studied cards are recommended; the bar is relative to each user's own spend."""
+
+    def hist(self, rid, days, impact=10.0, status="todo"):
+        con = self.t.connect()
+        con.executemany("INSERT OR REPLACE INTO recs_hist VALUES(?,?,?,?,?)",
+                        [((datetime.now() - timedelta(days=d)).strftime("%Y-%m-%d"), rid, status, impact, 1) for d in range(days)])
+        con.commit()
+        return con
+
+    def run_funnel(self, recs, span=7, week_cost=100.0):
+        con = self.t.connect()
+        self.t.funnel(con, recs, span, week_cost)
+        con.close()
+        return {x["id"]: (x["stage"], x["missing"]) for x in recs}
+
+    def rec(self, rid, impact=5.0, status="todo", **kw):
+        return dict({"id": rid, "status": status, "impact": impact}, **kw)
+
+    def test_new_findings_wait_until_they_repeat_on_three_days(self):
+        self.hist("a", 2).close()
+        self.hist("b", 3).close()
+        got = self.run_funnel([self.rec("a"), self.rec("b"), self.rec("c")])
+        self.assertEqual(got["a"][0], "study")
+        self.assertIn("2", got["a"][1][0])
+        self.assertEqual(got["b"], ("shown", []))
+        self.assertEqual(got["c"][0], "study")
+
+    def test_the_bar_is_relative_to_each_users_spend(self):
+        self.hist("x", 7).close()
+        light = self.run_funnel([self.rec("x", impact=0.5)], week_cost=20)       # 0.5 $/week on 20 $/week: worth it
+        heavy = self.run_funnel([self.rec("x", impact=0.5)], week_cost=1000)     # same 0.5 $ on 1000 $/week: not yet
+        tiny = self.run_funnel([self.rec("x", impact=0.05)], week_cost=2)        # under the 0.25 $ floor
+        capped = self.run_funnel([self.rec("x", impact=3)], week_cost=1000)     # 3 $/week always counts, whatever the spend
+        self.assertEqual(light["x"][0], "shown")
+        self.assertEqual(heavy["x"][0], "study")
+        self.assertEqual(tiny["x"][0], "study")
+        self.assertEqual(capped["x"][0], "shown")
+
+    def test_cards_without_an_amount_only_need_to_repeat(self):
+        self.hist("q", 4).close()
+        self.assertEqual(self.run_funnel([self.rec("q", impact=None)])["q"], ("shown", []))
+
+    def test_a_detector_can_ask_for_enough_sessions(self):
+        self.hist("s", 7).close()
+        got = self.run_funnel([self.rec("s", sample={"sessions": 2, "days": 1}),
+                               self.rec("s2", sample={"sessions": 5, "days": 3})])
+        self.assertEqual(got["s"][0], "study")
+        self.hist("s2", 7).close()
+        got = self.run_funnel([self.rec("s2", sample={"sessions": 5, "days": 3})])
+        self.assertEqual(got["s2"][0], "shown")
+
+    def test_applied_cards_are_always_shown(self):
+        got = self.run_funnel([self.rec("w", status="warn"), self.rec("o", status="ok")])
+        self.assertEqual((got["w"][0], got["o"][0]), ("shown", "shown"))
+
+    def test_dismissed_until_its_cost_doubles(self):
+        self.hist("d", 7, impact=10).close()
+        self.t.dismiss_rec("d")
+        self.assertEqual(self.run_funnel([self.rec("d")])["d"][0], "dismissed")
+        self.hist("d", 1, impact=19).close()
+        self.assertEqual(self.run_funnel([self.rec("d")])["d"][0], "dismissed")
+        self.hist("d", 1, impact=25).close()
+        self.assertEqual(self.run_funnel([self.rec("d")])["d"][0], "shown")
+        self.t.dismiss_rec("d")
+        self.t.restore_rec("d")
+        self.assertEqual(self.run_funnel([self.rec("d")])["d"][0], "shown")
+
+    def test_only_plain_ids_can_be_dismissed(self):
+        for bad in ("", "../x", "A B", "x" * 41):
+            with self.assertRaises(ValueError):
+                self.t.dismiss_rec(bad)
+
+    def test_the_dashboard_data_carries_the_stage(self):
+        self.write("a.jsonl", paused("s1", 3))
+        recs = self.t.data(30, self.t.ALL)["recs"]
+        self.assertTrue(recs)
+        self.assertTrue(all(x["stage"] in ("shown", "study", "dismissed") and isinstance(x["missing"], list) for x in recs))
+
+
 class UpdateTest(Base):
     def save(self, name, value):
         with open(os.path.join(self.app, name), "w") as f:
