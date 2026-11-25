@@ -81,13 +81,19 @@ def _cfg_get(raw, new, old, default=None):
     return raw[new] if new in raw else raw.get(old, default)
 
 
+# Earlier installs were seeded with these made-up clients as real ones: left untouched they are ignored,
+# so they don't show up in the client selector.
+SAMPLE_CLIENTS = {"company-a": ["/work/company-a"], "company-b": ["/work/company-b", "/clients/b"]}
+
+
 def _load_groups():
     """clients.json: {"clients": {...}, "projects": {...}}. Also accepts the old format (clients at the root)."""
     try:
         raw = read_json(CLIENTS_FILE)
     except Exception:
         raw = {}
-    clean = lambda d: {k: ([v] if isinstance(v, str) else list(v)) for k, v in (d or {}).items() if not k.startswith("_")}
+    clean = lambda d: {k: ([v] if isinstance(v, str) else list(v)) for k, v in (d or {}).items()
+                       if not k.startswith("_") and SAMPLE_CLIENTS.get(k) != v}
     if any(k in raw for k in ("clients", "clientes", "projects", "proyectos")):
         return clean(_cfg_get(raw, "clients", "clientes")), clean(_cfg_get(raw, "projects", "proyectos")), raw
     return clean(raw), {}, {}
