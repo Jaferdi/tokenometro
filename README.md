@@ -34,7 +34,7 @@ The demo runs in a temporary folder with invented data: it doesn't read your log
 | **Your plan** | % of the 5-hour window and of the week, when it resets, the estimated ceiling in $ or €, and whether you'll run out before it resets at your current pace. |
 | **Recommended improvements** | Cards built from *your* data and *your* `settings.json`: what to change, how much it weighs, how to check it worked, and a ready-to-paste prompt for Claude. |
 | **Sessions** | Cost per session split into input, output, cache reads and writes; the cheapest model that would have done the job; segments between compactions, subagents and the biggest tool calls. |
-| **Budget and reports** | Set a daily, weekly or monthly limit and get a warning at 80% and 100% in the dashboard and the status line. Download a monthly CSV per session or per client to share or bill. |
+| **Reports** | A monthly CSV per session or per client, to share or to bill a client, from the dashboard or the command line. |
 | **Before / after** | Pick the date of a change (a new setting, a new habit) and compare cost per message, context and compactions on each side. |
 
 <table>
@@ -54,20 +54,13 @@ The demo runs in a temporary folder with invented data: it doesn't read your log
   </tr>
 </table>
 
+The top bar picks period, client, currency (€ or $), language (English or Spanish) and theme. Click a session for its details.
+
 > Not affiliated with Anthropic. Claude and Claude Code are trademarks of Anthropic.
 
-## Privacy
-
-- It only reads `~/.claude/projects/**/*.jsonl` (and, if present, the last reading of the sub-meter plugin).
-- It listens on `127.0.0.1`: the dashboard is not reachable from outside your machine.
-- It never goes online or sends anything. Everything stays in `~/.local/share/tokenometro/usage.db` (SQLite).
-- "Biggest calls" masks anything that looks like a secret, but the dashboard does show parts of your commands and paths: check before sharing screenshots.
-
-## Requirements
-
-Python 3.8 or later, no dependencies. Linux, macOS, WSL or Windows.
-
 ## Install
+
+Needs Python 3.8 or later and nothing else. Linux, macOS, WSL or Windows.
 
 **As a Claude Code plugin** (any OS), inside Claude Code:
 
@@ -96,18 +89,14 @@ If you had the earlier version in `~/.local/share/claude-tokens`, it copies your
 
 To remove it: `python3 ~/.local/share/tokenometro/install.py --uninstall` (removes the hook and our statusLine; data stays until you delete the folder).
 
-## What the dashboard shows
+## Privacy
 
-- **Today and right now**: today's spend (odometer) and open sessions with their context size, running cost, compactions and, when plan usage is available, how much of the 5-hour window and the week each one took.
-- **Plan**: % used of the 5-hour window and of the week, when it resets, and an estimated ceiling in equivalent € or $ (see below).
-- **Recommended improvements**: cards with what to change, how much it weighs and how to check it worked.
-- **Sessions**: cost per session broken down (input, output, cache reads and cache writes), the most cost-effective model for each, where the spend went and the tool that added the most text. Click a row for details: segments between compactions, subagents and biggest calls.
-- **Budget**: spend against your daily, weekly and monthly limits, with a warning next to the title from 80%.
-- **By model and by client**, with a monthly CSV report per session or per client, and **Before / after** a date to measure whether a settings change helped.
+- It only reads `~/.claude/projects/**/*.jsonl` (and, if present, the last reading of the sub-meter plugin).
+- It listens on `127.0.0.1`: the dashboard is not reachable from outside your machine.
+- It never goes online or sends anything. Everything stays in `~/.local/share/tokenometro/usage.db` (SQLite).
+- "Biggest calls" masks anything that looks like a secret, but the dashboard does show parts of your commands and paths: check before sharing screenshots.
 
-The top bar picks period, client, currency (€ or $), language (English or Spanish) and theme (system, light or dark). Tables are paginated.
-
-### "€ eq." / "$ eq."
+## What "$ eq." means
 
 What those tokens would cost at API rates (`prices.json`). On a subscription you don't pay that, but it lets you compare sessions and see what weighs most. On the API it is roughly your bill: fast mode (twice the price), Batch, and Haiku 5.5 above 100K prompt tokens are not modelled. On Bedrock, Vertex or Foundry each provider sets its own prices: adjust `prices.json`. Calculations are done in dollars, the official rate, and converted to euros for display using the rate in `prices.json`.
 
@@ -165,12 +154,6 @@ Groups sessions by client based on the folder you worked in (the first matching 
 - `clients`: name → list of path fragments.
 - `cut` (optional): YYYY-MM-DD date of the change you want to measure in "Before / after". Defaults to 7 days ago.
 
-- `budget` (optional): limits per `day`, `week` (from Monday) and `month`, in `currency` (`USD` by default, or `EUR`). The dashboard warns from 80% and the status line from `statusline.py` adds "budget today 92%".
-
-```json
-"budget": {"day": 30, "week": 150, "month": 600, "currency": "EUR"}
-```
-
 The Spanish names from earlier versions (`clientes.json`, `clientes`, `corte`) still work.
 
 ### `prices.json`
@@ -214,6 +197,14 @@ Restart the server (it only stops it if it is Tokenometro):
 ```bash
 python3 ~/.local/share/tokenometro/start.py --restart
 ```
+
+## Troubleshooting
+
+- **The dashboard doesn't open.** It starts with each Claude Code session; to start it by hand: `python3 ~/.local/share/tokenometro/start.py`. If it still doesn't answer, look at `tracker.log` in the same folder. If another program uses port 7878, set `TOKENOMETRO_PORT` and reinstall.
+- **"Your plan" is missing.** It needs a reading of plan usage: enable `statusline.py` (see [Plan usage](#plan-usage-5-hours-and-week)) and send one message in Claude Code.
+- **"N model(s) without a price".** A model in your logs is not in `prices.json`, so it is valued at `_default`. Add it to `prices.json` and restart.
+- **The numbers don't match my bill.** On a subscription you pay the plan, not these amounts; on the API, see [what "$ eq." means](#what--eq-means).
+- **I edited `clients.json` or `prices.json` and nothing changed.** Restart: `python3 ~/.local/share/tokenometro/start.py --restart`.
 
 ## Files
 
