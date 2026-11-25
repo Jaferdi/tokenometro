@@ -478,7 +478,8 @@ def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=(), h1=
     d["message"]["usage"]["cache_creation_input_tokens"] = cw
     if h1:
         d["message"]["usage"]["cache_creation"] = {"ephemeral_1h_input_tokens": cw, "ephemeral_5m_input_tokens": 0}
-    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
+    tools = [t if isinstance(t, tuple) else (t, {}) for t in tools]  # "Bash" or ("Read", {"file_path": "a.py"})
+    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": inp} for i, (n, inp) in enumerate(tools)]
     if miss:
         d["message"]["diagnostics"] = {"cache_miss_reason": {"type": miss}}
     return json.dumps(d)
@@ -578,6 +579,37 @@ class NewDetectorsTest(Base):
         r = self.rec("cache-miss")
         self.assertIn("model", r["evidence"])
         self.assertIn("medium", r["confidence"])
+
+    def reads(self, plan, sid="s1"):
+        """plan: list of (tool, path, chars) per turn, or None for a turn without tools; then 10 quiet turns."""
+        rows, ctx = [], 50_000
+        for i, step in enumerate(plan):
+            ctx = step[3] if step and len(step) > 3 else ctx + 1_000
+            if step:
+                rows += [req(sid, f"{sid}_{i}", 60 - i, ctx, 1_000, tools=((step[0], {"file_path": step[1]}),)),
+                         result(f"{sid}_{i}_0", step[2])]
+            else:
+                rows.append(req(sid, f"{sid}_{i}", 60 - i, ctx, 1_000))
+        rows += [req(sid, f"{sid}_q{i}", 40 - i, ctx + 1_000 * i, 1_000) for i in range(10)]
+        return rows
+
+    def test_reading_the_same_file_again_is_priced(self):
+        self.write("a.jsonl", self.reads([("Read", "/w/a.py", 40_000)] * 4))
+        r = self.rec("reread")
+        self.assertEqual(r["metric"], 3)
+        self.assertGreater(r["impact"], 0)
+        self.assertEqual(r["sample"], {"sessions": 1, "days": 1})
+        self.assertIn("a.py ×4", r["evidence"])
+
+    def test_rereads_after_an_edit_a_compaction_of_images_or_small_are_fine(self):
+        self.write("a.jsonl", self.reads([("Read", "/w/a.py", 40_000), ("Edit", "/w/a.py", 100), ("Read", "/w/a.py", 40_000),
+                                          ("Read", "/w/b.py", 40_000, 800_000), ("Read", "/w/b.py", 40_000, 50_000)]
+                                         + [("Read", "/w/shot.png", 6_000)] * 5 + [("Read", "/w/c.py", 1_000)] * 5))
+        self.assertIsNone(self.rec("reread"))
+
+    def test_different_files_are_not_rereads(self):
+        self.write("a.jsonl", self.reads([("Read", f"/w/{i}.py", 40_000) for i in range(6)]))
+        self.assertIsNone(self.rec("reread"))
 
     def test_huge_tool_outputs_are_priced_by_the_turns_that_carry_them(self):
         self.write("a.jsonl", [req("s1", "a1", 30, 50_000, 1_000, tools=("Bash", "Read")), result("a1_0", 80_000), result("a1_1", 80_000)]
