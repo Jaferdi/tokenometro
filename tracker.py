@@ -47,7 +47,7 @@ def _env(name, default):
 
 
 PORT = int(_env("PORT", "7878"))
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 REPO = "Jaferdi/tokenometro"
 UPDATE_FILE = os.path.join(BASE, "update.json")
 
