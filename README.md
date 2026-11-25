@@ -1,8 +1,57 @@
-# Tokenometro
+<h1 align="center">Tokenometro</h1>
 
-*[Leer en español](README.es.md)*
+<p align="center">
+  <b>See what your Claude Code sessions cost, where the tokens go, and what to change to spend less.</b><br>
+  One Python file · no dependencies · nothing leaves your machine · English &amp; Spanish · light &amp; dark
+</p>
 
-A local dashboard that shows what your Claude Code sessions "cost", where that spend goes, and what to change to spend less. It works with any way of using Claude Code (Pro, Max, Team, Enterprise or API): it reads the logs Claude Code already keeps on your machine and prices them at API rates.
+<p align="center">
+  <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-3B55CF"></a>
+  <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-0A7A67">
+  <img alt="No dependencies" src="https://img.shields.io/badge/dependencies-none-8A5C00">
+  <img alt="Linux, macOS and WSL" src="https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20macOS%20%C2%B7%20WSL-6D49D6">
+  <br><a href="README.es.md">Leer en español</a>
+</p>
+
+<p align="center">
+  <img alt="Tokenometro: today's spend rolling up, open sessions with their context size, plan usage and session details" src="docs/demo.gif" width="880">
+</p>
+
+## Try it in 10 seconds
+
+```bash
+git clone https://github.com/Jaferdi/tokenometro.git && cd tokenometro
+python3 demo.py        # opens http://127.0.0.1:7879 with a month of made-up sessions
+```
+
+The demo runs in a temporary folder with invented data: it doesn't read your logs, doesn't touch `~/.claude` and deletes everything when you press Ctrl+C. When you like it, [install it](#install).
+
+## What you get
+
+| | |
+|---|---|
+| **Today and right now** | Today's spend on a rolling odometer, and every open session with its context size, running cost, compactions and the share of your plan it took. |
+| **Your plan** | % of the 5-hour window and of the week, when it resets, the estimated ceiling in $ or €, and whether you'll run out before it resets at your current pace. |
+| **Recommended improvements** | Cards built from *your* data and *your* `settings.json`: what to change, how much it weighs, how to check it worked, and a ready-to-paste prompt for Claude. |
+| **Sessions** | Cost per session split into input, output, cache reads and writes; the cheapest model that would have done the job; segments between compactions, subagents and the biggest tool calls. |
+| **Before / after** | Pick the date of a change (a new setting, a new habit) and compare cost per message, context and compactions on each side. |
+
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/recommendations-dark.png">
+        <img alt="Recommended improvements cards with status, impact, evidence and a prompt to copy" src="docs/recommendations-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/sessions-dark.png">
+        <img alt="Costliest sessions with one expanded: cost by model, segments, tools, subagents and biggest calls" src="docs/sessions-light.png">
+      </picture>
+    </td>
+  </tr>
+</table>
 
 > Not affiliated with Anthropic. Claude and Claude Code are trademarks of Anthropic.
 
@@ -153,6 +202,7 @@ kill $(ss -ltnpH 'sport = :7878' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 | `start.sh` | Starts it in the background unless it's already running |
 | `statusline.py` | Optional statusLine that records plan usage |
 | `install.sh` | Install, update and uninstall |
+| `demo.py` | Try it with made-up data, without installing anything |
 | `usage.db` | Data (rebuilt from the logs if you delete it) |
 | `plan.json` | Last plan reading from `statusline.py` |
 | `tracker.log` | Server log |

@@ -1,10 +1,59 @@
-# Tokenómetro
+<h1 align="center">Tokenómetro</h1>
 
-*[Read in English](README.md)*
+<p align="center">
+  <b>Mira cuánto cuestan tus sesiones de Claude Code, en qué se van los tokens y qué cambiar para gastar menos.</b><br>
+  Un solo fichero de Python · sin dependencias · nada sale de tu equipo · inglés y español · claro y oscuro
+</p>
 
-Panel local que te dice cuánto «cuestan» tus sesiones de Claude Code, en qué se va ese gasto y qué cambiar para gastar menos. Vale para cualquier forma de usar Claude Code (Pro, Max, Team, Enterprise o API): lee los registros que Claude Code ya guarda en tu equipo y los valora a tarifa API.
+<p align="center">
+  <a href="LICENSE"><img alt="Licencia MIT" src="https://img.shields.io/badge/licencia-MIT-3B55CF"></a>
+  <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-0A7A67">
+  <img alt="Sin dependencias" src="https://img.shields.io/badge/dependencias-ninguna-8A5C00">
+  <img alt="Linux, macOS y WSL" src="https://img.shields.io/badge/funciona%20en-Linux%20%C2%B7%20macOS%20%C2%B7%20WSL-6D49D6">
+  <br><a href="README.md">Read in English</a>
+</p>
 
-> No está afiliado a Anthropic. Claude y Claude Code son marcas de Anthropic.
+<p align="center">
+  <img alt="Tokenómetro: el gasto de hoy girando, las sesiones abiertas con su contexto, el uso del plan y el detalle de una sesión" src="docs/demo.gif" width="880">
+</p>
+
+## Pruébalo en 10 segundos
+
+```bash
+git clone https://github.com/Jaferdi/tokenometro.git && cd tokenometro
+python3 demo.py --lang es --currency EUR   # abre http://127.0.0.1:7879 con un mes de sesiones inventadas
+```
+
+La demo funciona en una carpeta temporal con datos inventados: no lee tus registros, no toca `~/.claude` y lo borra todo al pulsar Ctrl+C. Si te convence, [instálalo](#instalación).
+
+## Qué te da
+
+| | |
+|---|---|
+| **Hoy y ahora mismo** | El gasto de hoy en un cuentakilómetros y cada sesión abierta con el tamaño de su contexto, lo que lleva gastado, las compactaciones y la parte del plan que se ha llevado. |
+| **Tu plan** | % de la ventana de 5 horas y de la semana, cuándo se reinician, el tope estimado en € o $ y si al ritmo actual lo agotarás antes de que se reinicie. |
+| **Mejoras recomendadas** | Tarjetas hechas con *tus* datos y *tu* `settings.json`: qué cambiar, cuánto pesa, cómo comprobar que ha funcionado y un prompt listo para pegarle a Claude. |
+| **Sesiones** | Coste de cada sesión separado en entrada, salida, lecturas y escrituras de caché; el modelo más barato que habría bastado; tramos entre compactaciones, subagentes y las llamadas a herramientas más gordas. |
+| **Antes / después** | Elige la fecha de un cambio (un ajuste nuevo, una costumbre nueva) y compara el coste por mensaje, el contexto y las compactaciones a cada lado. |
+
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/recommendations-dark.png">
+        <img alt="Tarjetas de mejoras recomendadas con estado, impacto, evidencia y prompt para copiar" src="docs/recommendations-light.png">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/sessions-dark.png">
+        <img alt="Sesiones más caras con una abierta: coste por modelo, tramos, herramientas, subagentes y llamadas más gordas" src="docs/sessions-light.png">
+      </picture>
+    </td>
+  </tr>
+</table>
+
+> Sin relación con Anthropic. Claude y Claude Code son marcas de Anthropic.
 
 ## Privacidad
 
@@ -153,6 +202,7 @@ kill $(ss -ltnpH 'sport = :7878' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 | `start.sh` | Lo levanta en segundo plano si no está ya corriendo |
 | `statusline.py` | statusLine opcional que guarda el % del plan |
 | `install.sh` | Instalar, actualizar y desinstalar |
+| `demo.py` | Probarlo con datos inventados, sin instalar nada |
 | `usage.db` | Datos (se regenera desde los registros si lo borras) |
 | `plan.json` | Última lectura del plan de `statusline.py` |
 | `tracker.log` | Log del servidor |
