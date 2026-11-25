@@ -8,9 +8,11 @@ dashboard at http://127.0.0.1:7878. No dependencies: standard library only.
   python3 tracker.py ingest     # ingest only (and print a summary)
 """
 import glob
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -24,6 +26,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 PROJECTS = os.path.join(HOME, ".claude", "projects")
 DB = os.path.join(BASE, "usage.db")
 PRICES = os.path.join(BASE, "prices.json")
+CONTROL = os.path.join(BASE, ".control")  # port, pid and the token that lets the installer stop this server
 
 
 def read_json(path):
@@ -543,6 +546,11 @@ def unpriced(models, prices):
     return [m for m in models if m.get("model") not in (None, "", "?") and not any(k in m["model"] for k in keys)]
 
 
+def _cell(v):
+    """A session title comes from a prompt: never let Excel or Sheets run it as a formula."""
+    return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
 def report(month, by="session", client=ALL):
     """CSV for one month (YYYY-MM), by session or by client, in USD and in the selected currency."""
     import csv
@@ -580,7 +588,7 @@ def report(month, by="session", client=ALL):
         r["client"] = tr("others", "otros") if r["client"] == OTHERS else r["client"]
         if "project" in r:
             r["project"] = short_path(r["project"])
-        wr.writerow([r[k] for k in head] + [r["input"], r["cache_write"], r["cache_read"], r["output"], round(r["cost"] or 0, 4)]
+        wr.writerow([_cell(r[k]) for k in head] + [r["input"], r["cache_write"], r["cache_read"], r["output"], round(r["cost"] or 0, 4)]
                     + ([round((r["cost"] or 0) * rate, 4)] if eur else []))
     return out.getvalue()
 
@@ -1048,7 +1056,7 @@ def write_recs_file(recs, kpi):
     os.makedirs(REPORTS, exist_ok=True)
     tmp = recs_file_path() + ".tmp"
     # it contains project paths and prompts: readable only by you
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     os.replace(tmp, recs_file_path())
 
@@ -1779,7 +1787,7 @@ function alerts(r){const a=(r.budget||[]).filter(x=>x.level!='ok').map(x=>{const
  if(r.unpriced&&r.unpriced.length){const tip=t('al_unpriced',{m:r.unpriced.map(m=>m.model).join(', ')}).replace(/<[^>]+>/g,'');
   a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_unp',{n:r.unpriced.length})+'</span>')}
  $('alerts').innerHTML=a.join('')}
-function csvLinks(){const m=$('month').value||new Date().toISOString().slice(0,7),c=$('client').value;
+function csvLinks(){const d=new Date(),m=$('month').value||d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'),c=$('client').value;
  const u=by=>'/api/report.csv?month='+m+'&by='+by+'&client='+encodeURIComponent(c)+'&cur='+CUR.code+'&lang='+LANG;$('csv_s').href=u('session');$('csv_c').href=u('client')}
 let SEQ=0;
 async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r;
@@ -1876,6 +1884,15 @@ class H(BaseHTTPRequestHandler):
             self.send_error(403, "Tokenometro only answers on 127.0.0.1 or localhost")
             return
         u = urlparse(self.path)
+        if u.path == "/api/quit":
+            # a custom header can't be sent cross-origin without a preflight we never answer, so only local tools reach this
+            ok = _TOKEN and hmac.compare_digest((self.headers.get("X-Tokenometro-Token") or "").encode("utf-8", "replace"), _TOKEN.encode())
+            if not ok:
+                self.send_error(403)
+                return
+            self._send("bye", "text/plain; charset=utf-8")
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
         try:
             if u.path == "/":
                 self._send(PAGE.replace("__DEFLANG__", LANG_DEFAULT), "text/html; charset=utf-8")
@@ -1899,7 +1916,7 @@ class H(BaseHTTPRequestHandler):
             elif u.path == "/api/report.csv":
                 qs = parse_qs(u.query)
                 month = qs.get("month", [datetime.now().strftime("%Y-%m")])[0]
-                if not re.fullmatch(r"\d{4}-\d{2}", month):
+                if not re.fullmatch(r"[0-9]{4}-[0-9]{2}", month):
                     return self.send_error(400)
                 by = "client" if qs.get("by", [""])[0] == "client" else "session"
                 client = qs.get("client", [ALL])[0]
@@ -1942,7 +1959,24 @@ def loop():
         time.sleep(INGEST_EVERY)
 
 
+_TOKEN = ""
+
+
+def write_control():
+    global _TOKEN
+    _TOKEN = secrets.token_hex(16)
+    tmp = CONTROL + ".tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+        json.dump({"port": PORT, "pid": os.getpid(), "token": _TOKEN}, f)
+    os.replace(tmp, CONTROL)
+
+
 def main():
+    for stream in (sys.stdout, sys.stderr):  # a Windows console in cp1252 must not crash on € or …
+        try:
+            stream.reconfigure(errors="replace")
+        except AttributeError:
+            pass
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "ingest":
         t0 = time.time()
@@ -1964,19 +1998,31 @@ def main():
         # tracker.py report [YYYY-MM] [--by client] [--client NAME] [--cur EUR]
         args = sys.argv[2:]
         opt = lambda k, d: args[args.index(k) + 1] if k in args and args.index(k) + 1 < len(args) else d
-        month = next((x for x in args if re.fullmatch(r"\d{4}-\d{2}", x)), datetime.now().strftime("%Y-%m"))
+        month = next((x for x in args if re.fullmatch(r"[0-9]{4}-[0-9]{2}", x)), datetime.now().strftime("%Y-%m"))
         set_lang(LANG_DEFAULT)
         set_currency(opt("--cur", "").upper())
         ingest()
-        sys.stdout.write(report(month, opt("--by", "session"), opt("--client", ALL)))
+        sys.stdout.flush()
+        sys.stdout.buffer.write(report(month, opt("--by", "session"), opt("--client", ALL)).encode("utf-8"))  # bytes: no \r\r\n on Windows
         return
     if cmd == "backfill":
         t0 = time.time()
         n = backfill()
         print(tr(f"{n} calls completed in {time.time()-t0:.0f}s", f"{n} llamadas completadas en {time.time()-t0:.0f}s"))
         return
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)  # bind first: a second copy fails here and leaves .control alone
+    write_control()
     threading.Thread(target=loop, daemon=True).start()
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    try:
+        srv.serve_forever()
+    finally:
+        try:
+            with open(CONTROL, encoding="utf-8") as f:
+                mine = json.load(f).get("token") == _TOKEN
+            if mine:
+                os.remove(CONTROL)
+        except (OSError, ValueError):
+            pass
 
 
 if __name__ == "__main__":

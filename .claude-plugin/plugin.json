@@ -1,0 +1,24 @@
+{
+  "name": "tokenometro",
+  "version": "0.2.0",
+  "description": "Local dashboard for what your Claude Code sessions cost, where the tokens go and what to change to spend less. Starts with Claude Code on 127.0.0.1:7878; nothing leaves your machine.",
+  "author": {
+    "name": "Jaferdi"
+  },
+  "homepage": "https://github.com/Jaferdi/tokenometro",
+  "repository": "https://github.com/Jaferdi/tokenometro",
+  "license": "MIT",
+  "keywords": [
+    "cost",
+    "tokens",
+    "usage",
+    "dashboard",
+    "budget"
+  ],
+  "icon": ".claude-plugin/icon.png",
+  "network": {
+    "hosts": [
+      "127.0.0.1"
+    ]
+  }
+}

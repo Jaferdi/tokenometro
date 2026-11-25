@@ -20,13 +20,17 @@ jobs:
           - { os: ubuntu-latest, python: "3.12" }
           - { os: ubuntu-latest, python: "3.13" }
           - { os: macos-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - name: Compile
-        run: python -m py_compile tracker.py statusline.py demo.py
+        run: python -m py_compile tracker.py statusline.py demo.py start.py install.py
       - name: Unit tests
         run: python -W error::ResourceWarning -m unittest discover -s tests -v
       - name: Shell syntax
@@ -45,12 +49,14 @@ jobs:
           TOKENOMETRO_NO_START: "1"
           TOKENOMETRO_PORT: "7999"
         run: |
-          export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME/.claude/projects"
-          bash install.sh
-          python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); assert 'tokenometro/start.sh' in json.dumps(s)"
-          bash "$HOME/.local/share/tokenometro/install.sh" --statusline
-          bash "$HOME/.local/share/tokenometro/install.sh" --uninstall
+          export HOME="$RUNNER_TEMP/home" USERPROFILE="$RUNNER_TEMP/home" LOCALAPPDATA="$RUNNER_TEMP/home/AppData"
+          mkdir -p "$HOME/.claude/projects"
+          python install.py
+          python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); assert 'tokenometro/start.py' in json.dumps(s)"
+          python install.py --statusline
+          python install.py --uninstall
           python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); assert 'tokenometro' not in json.dumps(s)"
+          if [ "$RUNNER_OS" != "Windows" ]; then bash install.sh && bash "$HOME/.local/share/tokenometro/install.sh" --uninstall; fi
 
   prices:
     name: prices.json is valid
@@ -58,3 +64,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -c "import json; json.load(open('prices.json'))"
+
+  plugin:
+    name: Plugin manifests are valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 - <<'PY'
+          import json
+          p = json.load(open(".claude-plugin/plugin.json"))
+          m = json.load(open(".claude-plugin/marketplace.json"))
+          h = json.load(open("hooks/hooks.json"))
+          assert p["name"] == m["plugins"][0]["name"] == "tokenometro"
+          assert "start.py" in h["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+          PY

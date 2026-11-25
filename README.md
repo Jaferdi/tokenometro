@@ -9,7 +9,7 @@
   <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-3B55CF"></a>
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-0A7A67">
   <img alt="No dependencies" src="https://img.shields.io/badge/dependencies-none-8A5C00">
-  <img alt="Linux, macOS and WSL" src="https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20macOS%20%C2%B7%20WSL-6D49D6">
+  <img alt="Linux, macOS, WSL and Windows" src="https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20macOS%20%C2%B7%20WSL%20%C2%B7%20Windows-6D49D6">
   <br><a href="README.es.md">Leer en español</a>
 </p>
 
@@ -65,25 +65,36 @@ The demo runs in a temporary folder with invented data: it doesn't read your log
 
 ## Requirements
 
-Python 3.8 or later, no dependencies. Linux, WSL or macOS.
+Python 3.8 or later, no dependencies. Linux, macOS, WSL or Windows.
 
 ## Install
 
-```bash
-git clone https://github.com/Jaferdi/tokenometro.git && cd tokenometro
-bash install.sh               # installs, registers auto-start and launches it
-bash install.sh --statusline  # also uses statusline.py to see plan usage %
+**As a Claude Code plugin** (any OS), inside Claude Code:
+
+```
+/plugin marketplace add Jaferdi/tokenometro
+/plugin install tokenometro@tokenometro
 ```
 
-The installer:
+The plugin starts the dashboard with every session and keeps its code up to date in the data folder. Plugins can't set the statusLine, so to see plan usage % add it yourself (see [Plan usage](#plan-usage-5-hours-and-week)).
 
-1. Copies the files to `~/.local/share/tokenometro`.
+**With the installer**:
+
+```bash
+git clone https://github.com/Jaferdi/tokenometro.git && cd tokenometro
+python3 install.py               # installs, registers auto-start and launches it (on Windows: py install.py)
+python3 install.py --statusline  # also uses statusline.py to see plan usage %
+```
+
+`bash install.sh` still works and does the same. The installer:
+
+1. Copies the files to `~/.local/share/tokenometro` (on Windows, `%LOCALAPPDATA%\tokenometro`).
 2. Adds a `SessionStart` hook to `~/.claude/settings.json` that starts the dashboard when you open Claude Code. It backs up the file first: `settings.json.bak-tokenometro-<date>`.
 3. Reads your history (the first run takes a while) and starts the server at http://127.0.0.1:7878.
 
 If you had the earlier version in `~/.local/share/claude-tokens`, it copies your data and settings and swaps the hook.
 
-To remove it: `bash ~/.local/share/tokenometro/install.sh --uninstall` (removes the hook and our statusLine; data stays until you delete the folder).
+To remove it: `python3 ~/.local/share/tokenometro/install.py --uninstall` (removes the hook and our statusLine; data stays until you delete the folder).
 
 ## What the dashboard shows
 
@@ -133,7 +144,7 @@ Edits to documentation (`.md`, `.json`, `.yaml`…) don't count as code. The sav
 Plan usage only exists on subscriptions (Pro, Max, Team…): the API has no 5-hour or weekly limits, so this card just shows what was spent. The % is not in the logs. Claude Code receives it from Anthropic and only passes it to the statusLine and to plugins. Tokenometro reads it from:
 
 1. **The sub-meter plugin**, if you have it: it saves its last reading in `~/.claude/plugins/store/sub-meter_*.json`.
-2. **`statusline.py`**, included here: it reads the JSON Claude Code sends to the statusLine (`rate_limits`) and saves it to `~/.local/share/tokenometro/plan.json`. Enable it with `install.sh --statusline`. If you already have a statusLine, chain it:
+2. **`statusline.py`**, included here: it reads the JSON Claude Code sends to the statusLine (`rate_limits`) and saves it to `~/.local/share/tokenometro/plan.json`. Enable it with `install.py --statusline`, or by hand in `~/.claude/settings.json`: `"statusLine": {"type": "command", "command": "python3 \"$HOME/.local/share/tokenometro/statusline.py\""}`. If you already have a statusLine, chain it:
 
    ```
    python3 "$HOME/.local/share/tokenometro/statusline.py" --tee | <your current command>
@@ -183,7 +194,7 @@ Update the rate by hand: Tokenometro never goes online. If your `prices.json` co
 | `TOKENOMETRO_CUT` | "Before / after" cut-off date | the one in `clients.json` or 7 days ago |
 | `TOKENOMETRO_CURRENCY` | Default `EUR` or `USD` | the one in `prices.json` |
 | `TOKENOMETRO_LANG` | Default `en` or `es` | `en` |
-| `TOKENOMETRO_NO_START` | `1` so `install.sh` doesn't start it | |
+| `TOKENOMETRO_NO_START` | `1` so the installer doesn't start it | |
 
 The old `CLAUDE_TOKENS_*` names still work.
 
@@ -198,11 +209,10 @@ python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur E
 
 `report` takes `[YYYY-MM]` (this month by default), `--by session|client`, `--client NAME` and `--cur USD|EUR`. The same CSV is in the dashboard, in the *By client* card.
 
-Restart the server (kills only the process listening on the port):
+Restart the server (it only stops it if it is Tokenometro):
 
 ```bash
-kill $(ss -ltnpH 'sport = :7878' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-~/.local/share/tokenometro/start.sh
+python3 ~/.local/share/tokenometro/start.py --restart
 ```
 
 ## Files
@@ -210,9 +220,10 @@ kill $(ss -ltnpH 'sport = :7878' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 | File | What it is |
 |---|---|
 | `tracker.py` | Reader, database, rules and dashboard (HTML included) |
-| `start.sh` | Starts it in the background unless it's already running |
+| `start.py` | Starts it in the background unless it's already running (`start.sh` calls it) |
 | `statusline.py` | Optional statusLine that records plan usage |
-| `install.sh` | Install, update and uninstall |
+| `install.py` | Install, update and uninstall (`install.sh` calls it) |
+| `.claude-plugin/`, `hooks/` | Claude Code plugin |
 | `demo.py` | Try it with made-up data, without installing anything |
 | `usage.db` | Data (rebuilt from the logs if you delete it) |
 | `plan.json` | Last plan reading from `statusline.py` |
