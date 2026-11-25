@@ -46,8 +46,8 @@ def load_tracker(tmp, clients=None):
     if clients is not None:
         with open(os.path.join(app, "clients.json"), "w") as f:
             json.dump(clients, f)
-    old = os.environ.get("HOME")
-    os.environ["HOME"] = home
+    old = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+    os.environ["HOME"] = os.environ["USERPROFILE"] = home  # Windows reads ~ from USERPROFILE
     for k in [k for k in os.environ if k.startswith(("TOKENOMETRO_", "CLAUDE_TOKENS_"))]:
         del os.environ[k]
     try:
@@ -55,8 +55,11 @@ def load_tracker(tmp, clients=None):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     finally:
-        if old is not None:
-            os.environ["HOME"] = old
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     return mod, home, app
 
 
@@ -339,6 +342,12 @@ class BudgetAndReportTest(Base):
         by_client = list(csv.DictReader(io.StringIO(self.t.report(month, "client"))))
         self.assertEqual([r["client"] for r in by_client], ["acme"])
         self.assertEqual(self.t.report("1999-01", "session").count("\n"), 1)  # header only
+
+    def test_csv_cells_are_never_formulas(self):
+        self.assertEqual(self.t._cell('=HYPERLINK("http://x")'), '\'=HYPERLINK("http://x")')
+        self.assertEqual(self.t._cell("@SUM(A1)"), "'@SUM(A1)")
+        self.assertEqual(self.t._cell("Add refund endpoint"), "Add refund endpoint")
+        self.assertEqual(self.t._cell(-3.5), -3.5)
 
 
 class InstallerTest(unittest.TestCase):

@@ -546,6 +546,11 @@ def unpriced(models, prices):
     return [m for m in models if m.get("model") not in (None, "", "?") and not any(k in m["model"] for k in keys)]
 
 
+def _cell(v):
+    """A session title comes from a prompt: never let Excel or Sheets run it as a formula."""
+    return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
 def report(month, by="session", client=ALL):
     """CSV for one month (YYYY-MM), by session or by client, in USD and in the selected currency."""
     import csv
@@ -583,7 +588,7 @@ def report(month, by="session", client=ALL):
         r["client"] = tr("others", "otros") if r["client"] == OTHERS else r["client"]
         if "project" in r:
             r["project"] = short_path(r["project"])
-        wr.writerow([r[k] for k in head] + [r["input"], r["cache_write"], r["cache_read"], r["output"], round(r["cost"] or 0, 4)]
+        wr.writerow([_cell(r[k]) for k in head] + [r["input"], r["cache_write"], r["cache_read"], r["output"], round(r["cost"] or 0, 4)]
                     + ([round((r["cost"] or 0) * rate, 4)] if eur else []))
     return out.getvalue()
 
@@ -1782,7 +1787,7 @@ function alerts(r){const a=(r.budget||[]).filter(x=>x.level!='ok').map(x=>{const
  if(r.unpriced&&r.unpriced.length){const tip=t('al_unpriced',{m:r.unpriced.map(m=>m.model).join(', ')}).replace(/<[^>]+>/g,'');
   a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_unp',{n:r.unpriced.length})+'</span>')}
  $('alerts').innerHTML=a.join('')}
-function csvLinks(){const m=$('month').value||new Date().toISOString().slice(0,7),c=$('client').value;
+function csvLinks(){const d=new Date(),m=$('month').value||d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'),c=$('client').value;
  const u=by=>'/api/report.csv?month='+m+'&by='+by+'&client='+encodeURIComponent(c)+'&cur='+CUR.code+'&lang='+LANG;$('csv_s').href=u('session');$('csv_c').href=u('client')}
 let SEQ=0;
 async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r;
@@ -1881,7 +1886,7 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/api/quit":
             # a custom header can't be sent cross-origin without a preflight we never answer, so only local tools reach this
-            ok = _TOKEN and hmac.compare_digest(self.headers.get("X-Tokenometro-Token") or "", _TOKEN)
+            ok = _TOKEN and hmac.compare_digest((self.headers.get("X-Tokenometro-Token") or "").encode("utf-8", "replace"), _TOKEN.encode())
             if not ok:
                 self.send_error(403)
                 return
@@ -1911,7 +1916,7 @@ class H(BaseHTTPRequestHandler):
             elif u.path == "/api/report.csv":
                 qs = parse_qs(u.query)
                 month = qs.get("month", [datetime.now().strftime("%Y-%m")])[0]
-                if not re.fullmatch(r"\d{4}-\d{2}", month):
+                if not re.fullmatch(r"[0-9]{4}-[0-9]{2}", month):
                     return self.send_error(400)
                 by = "client" if qs.get("by", [""])[0] == "client" else "session"
                 client = qs.get("client", [ALL])[0]
@@ -1993,7 +1998,7 @@ def main():
         # tracker.py report [YYYY-MM] [--by client] [--client NAME] [--cur EUR]
         args = sys.argv[2:]
         opt = lambda k, d: args[args.index(k) + 1] if k in args and args.index(k) + 1 < len(args) else d
-        month = next((x for x in args if re.fullmatch(r"\d{4}-\d{2}", x)), datetime.now().strftime("%Y-%m"))
+        month = next((x for x in args if re.fullmatch(r"[0-9]{4}-[0-9]{2}", x)), datetime.now().strftime("%Y-%m"))
         set_lang(LANG_DEFAULT)
         set_currency(opt("--cur", "").upper())
         ingest()

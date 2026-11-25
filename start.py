@@ -74,31 +74,47 @@ def sync(src, dest):
     for f in CODE:
         s, d = os.path.join(src, f), os.path.join(dest, f)
         if os.path.isfile(s) and not (os.path.isfile(d) and filecmp.cmp(s, d, shallow=False)):
-            shutil.copy2(s, d)
+            copy(s, d)
             changed = changed or f == "tracker.py"
     if not os.path.exists(os.path.join(dest, "prices.json")):
-        shutil.copy2(os.path.join(src, "prices.json"), dest)
+        copy(os.path.join(src, "prices.json"), os.path.join(dest, "prices.json"))
     if not any(os.path.exists(os.path.join(dest, f)) for f in ("clients.json", "clientes.json")):
-        shutil.copy2(os.path.join(src, "clients.example.json"), os.path.join(dest, "clients.json"))
+        copy(os.path.join(src, "clients.example.json"), os.path.join(dest, "clients.json"))
     return changed
 
 
+def copy(s, d):
+    """Copy aside and swap, so a server starting at that moment never reads half a tracker.py."""
+    tmp = f"{d}.tmp{os.getpid()}"
+    shutil.copy2(s, tmp)
+    os.replace(tmp, d)
+
+
 def take_lock(d):
-    """Two sessions opening at once: only the one that creates the lock starts it. A lock older than a minute is stale."""
+    """Two sessions opening at once: only the one that creates the lock starts it. A lock older than a minute
+    is stale (whoever held it died); it is removed and taken again, so only one racer wins it."""
     lock = os.path.join(d, ".starting")
-    try:
-        os.mkdir(lock)
-        return True
-    except FileExistsError:
+    for _ in range(2):
         try:
-            if time.time() - os.path.getmtime(lock) > 60:
-                os.utime(lock)
-                return True
+            os.mkdir(lock)
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock) <= 60:
+                    return False
+                os.rmdir(lock)
+            except OSError:
+                return False
         except OSError:
-            pass
-        return False
+            return False
+    return False
+
+
+def release_lock(d):
+    try:
+        os.rmdir(os.path.join(d, ".starting"))
     except OSError:
-        return False
+        pass
 
 
 def launch(d, port):
@@ -125,19 +141,26 @@ def launch(d, port):
 
 def main(args):
     port = port_from(args)
-    d = HERE
+    d = data_dir() if "--plugin" in args else HERE
+    os.makedirs(d, exist_ok=True)
     stopped = False
-    if "--plugin" in args:
-        d = data_dir()
-        if sync(HERE, d):  # the plugin was updated: restart the old server so the new code runs
+    # the lock covers the plugin copy too: two sessions opening at once must not both rewrite tracker.py
+    locked = take_lock(d)
+    try:
+        if "--plugin" in args and locked and sync(HERE, d):  # plugin updated: restart the old server
             stopped = stop(d, port) == "stopped"
-    if "--restart" in args:
-        stopped = stop(d, port) == "stopped" or stopped
-    if listening(port):
-        return
-    if not take_lock(d) and not stopped:  # we just stopped it ourselves: the lock of its start doesn't apply
-        return
-    launch(d, port)
+        if "--restart" in args:
+            stopped = stop(d, port) == "stopped" or stopped
+        if listening(port) or not (locked or stopped):
+            return
+        launch(d, port)
+        for _ in range(30):  # hold the lock until it listens, so a session opening now doesn't start a second one
+            if listening(port):
+                break
+            time.sleep(0.1)
+    finally:
+        if locked:
+            release_lock(d)
 
 
 if __name__ == "__main__":
