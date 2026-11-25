@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile tracker.py statusline.py demo.py
+      - name: Unit tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+      - name: Shell syntax
+        run: bash -n install.sh && bash -n start.sh
+      - name: Dashboard script syntax
+        run: |
+          python - <<'PY'
+          src = open("tracker.py", encoding="utf-8").read()
+          page = src[src.index('PAGE = r"""'):]
+          js = page[page.index("<script>", page.index("<body")) + 8:page.index("</script></body>")]
+          open("page.js", "w", encoding="utf-8").write(js)
+          PY
+          node --check page.js
+      - name: Installer in a throwaway HOME
+        env:
+          TOKENOMETRO_NO_START: "1"
+          TOKENOMETRO_PORT: "7999"
+        run: |
+          export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME/.claude/projects"
+          bash install.sh
+          python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); assert 'tokenometro/start.sh' in json.dumps(s)"
+          bash "$HOME/.local/share/tokenometro/install.sh" --statusline
+          bash "$HOME/.local/share/tokenometro/install.sh" --uninstall
+          python -c "import json,os; s=json.load(open(os.path.expanduser('~/.claude/settings.json'))); assert 'tokenometro' not in json.dumps(s)"
+
+  prices:
+    name: prices.json is valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -c "import json; json.load(open('prices.json'))"

@@ -1,0 +1,32 @@
+name: Bug
+description: Something is wrong or broken
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you saw instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0, or the output of git rev-parse --short HEAD
+  - type: dropdown
+    id: os
+    attributes:
+      label: System
+      options: [Linux, macOS, WSL, Windows, Other]
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: python3 --version
+  - type: textarea
+    id: log
+    attributes:
+      label: Last lines of tracker.log, or the browser console error
+      description: ~/.local/share/tokenometro/tracker.log. Check it for paths or names you don't want to share.
+      render: text
