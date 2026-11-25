@@ -224,6 +224,28 @@ class PlanTest(Base):
         self.assertIsNone(w["pct"])
 
 
+class StatuslineForecastTest(unittest.TestCase):
+    def setUp(self):
+        import statusline
+        self.s = statusline
+        self.now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+
+    def test_runs_out_before_the_reset(self):
+        # opened 2h ago, 70% used: 30% more takes ~51 min, the reset is in 3h
+        end = self.s.runs_out(70, self.now + timedelta(hours=3), "five_hour", self.now)
+        self.assertAlmostEqual((end - self.now).total_seconds() / 60, 51.4, places=0)
+
+    def test_lasts_until_the_reset_or_too_early_to_tell(self):
+        self.assertIsNone(self.s.runs_out(30, self.now + timedelta(hours=3), "five_hour", self.now))
+        self.assertIsNone(self.s.runs_out(20, self.now + timedelta(hours=4, minutes=50), "five_hour", self.now))
+        self.assertIsNone(self.s.runs_out(100, self.now + timedelta(hours=1), "five_hour", self.now))
+
+    def test_printed_line(self):
+        end = self.now + timedelta(minutes=30)
+        self.assertTrue(self.s.label("five_hour", 70, end).startswith("5h 70% · runs out "))
+        self.assertEqual(self.s.label("seven_day", 20, None), "week 20%")
+
+
 class I18nTest(unittest.TestCase):
     def test_same_keys_in_both_languages(self):
         src = read_text(os.path.join(ROOT, "tracker.py"))

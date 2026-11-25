@@ -139,6 +139,8 @@ Plan usage only exists on subscriptions (Pro, Max, Team…): the API has no 5-ho
    python3 "$HOME/.local/share/tokenometro/statusline.py" --tee | <your current command>
    ```
 
+On its own, `statusline.py` prints `5h 46%  week 20%`, and adds `· runs out 16:40` when, at the pace since the window opened, you would hit 100% before it resets (`TOKENOMETRO_LANG=es` prints it in Spanish).
+
 It uses whichever reading is newer. With neither, the dashboard only shows what was spent in the last 5 hours and 7 days.
 
 **Estimated ceiling**: each reading is stored together with the spend in that window. The ceiling is the median of *spent × 100 / %* (readings of at least 10%). It's approximate: the % includes what you use on claude.ai or on another machine, and Anthropic doesn't publish how each model is weighted.

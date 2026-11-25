@@ -139,6 +139,8 @@ El % del plan solo existe con suscripción (Pro, Max, Team…): con API no hay l
    python3 "$HOME/.local/share/tokenometro/statusline.py" --tee | <tu comando actual>
    ```
 
+Por sí sola, `statusline.py` muestra `5h 46%  week 20%` y añade `· runs out 16:40` cuando, al ritmo que llevas desde que se abrió la ventana, llegarías al 100 % antes del reinicio (con `TOKENOMETRO_LANG=es` sale en castellano: `semana 20% · se agota jue 16:40`).
+
 Usa la lectura más reciente de las dos. Sin ninguna, el panel enseña solo lo gastado en las últimas 5 horas y 7 días.
 
 **Techo estimado**: cada lectura se guarda junto a lo gastado en esa ventana. El techo es la mediana de *gastado × 100 / %* (lecturas con al menos un 10 %). Es aproximado: el % incluye lo que uses en claude.ai o en otro equipo, y Anthropic no publica cómo pondera cada modelo.
