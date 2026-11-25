@@ -47,7 +47,7 @@ def _env(name, default):
 
 
 PORT = int(_env("PORT", "7878"))
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 REPO = "Jaferdi/tokenometro"
 UPDATE_FILE = os.path.join(BASE, "update.json")
 
@@ -2465,9 +2465,9 @@ th.s:focus-visible,tr.click:focus-visible{outline:2px solid var(--c);outline-off
 
 /* charts and legends */
 .leg{display:flex;flex-wrap:wrap;gap:6px 14px;margin:0 0 8px}
-#leg{gap:6px}#leg .lg{display:inline-flex;align-items:center;gap:6px;font:500 12px var(--fb);color:var(--mut);background:none;border:1px solid transparent;border-radius:999px;padding:3px 10px;cursor:pointer;transition:opacity .15s,border-color .15s,color .15s}
-#leg .lg:hover{border-color:var(--line);color:var(--fg)}#leg .lg[aria-pressed=true]{border-color:var(--line);background:var(--card);color:var(--fg);font-weight:600}
-#leg .lg.off{opacity:.45}#leg .lg.all{color:var(--fg);border-color:var(--line)}#leg i{width:10px;height:10px;border-radius:3px;display:inline-block}
+#leg,#sleg{gap:6px}.leg .lg{display:inline-flex;align-items:center;gap:6px;font:500 12px var(--fb);color:var(--mut);background:none;border:1px solid transparent;border-radius:999px;padding:3px 10px;cursor:pointer;transition:opacity .15s,border-color .15s,color .15s}
+.leg .lg:hover{border-color:var(--line);color:var(--fg)}.leg .lg[aria-pressed=true]{border-color:var(--line);background:var(--card);color:var(--fg);font-weight:600}
+.leg .lg.off{opacity:.45}.leg .lg.all{color:var(--fg);border-color:var(--line)}.leg .lg i{width:10px;height:10px;border-radius:3px;display:inline-block}
 .leg span{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut)}.leg i{width:10px;height:10px;border-radius:3px;display:inline-block}
 svg text{fill:var(--mut);font-size:10px;font-family:var(--fb)}
 svg.grow rect{transform-box:fill-box;transform-origin:50% 100%;animation:grow .8s var(--ease) both}
@@ -2658,11 +2658,10 @@ document.addEventListener('click',async e=>{const b=e.target.closest('.cp');if(!
  const x=(RECS[+b.dataset.i]||{}).prompt||'';try{await navigator.clipboard.writeText(x)}catch(_){const a=document.createElement('textarea');a.value=x;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}
  const o=b.textContent;b.textContent=t('copied');b.classList.add('ok');setTimeout(()=>{b.textContent=o;b.classList.remove('ok')},1600)});
 // daily chart legend: a click shows that cost alone, on its own scale; another click (or "All") shows them all again
-let DSEL=null,DROWS=[],DKEYS=[];
-function drawDaily(){const ks=DSEL?DKEYS.filter(k=>k.k==DSEL):DKEYS;
- $('leg').innerHTML=DKEYS.map(k=>'<button type="button" class="lg'+(DSEL&&DSEL!=k.k?' off':'')+'" data-k="'+k.k+'" aria-pressed="'+(DSEL==k.k)+'" title="'+esc(t(DSEL==k.k?'leg_tip_all':'leg_tip'))+'"><i style="background:'+css(k.c)+'"></i>'+k.n+(DSEL==k.k?' · '+usd(DROWS.reduce((a,r)=>a+(r[k.k]||0),0)):'')+'</button>').join('')
-  +(DSEL?'<button type="button" class="lg all" data-k="">'+t('leg_all')+'</button>':'');
- stacked($('daily'),DROWS,ks)}
+let DSEL=null,DROWS=[],DKEYS=[],SSEL=null,SDRAW=()=>{};
+function legend(el,keys,sel,rows){el.innerHTML=keys.map(k=>'<button type="button" class="lg'+(sel&&sel!=k.k?' off':'')+'" data-k="'+k.k+'" aria-pressed="'+(sel==k.k)+'" title="'+esc(t(sel==k.k?'leg_tip_all':'leg_tip'))+'"><i style="background:'+css(k.c)+'"></i>'+k.n+(sel==k.k?' · '+usd(rows.reduce((a,r)=>a+(r[k.k]||0),0)):'')+'</button>').join('')
+  +(sel?'<button type="button" class="lg all" data-k="">'+t('leg_all')+'</button>':'')}
+function drawDaily(){legend($('leg'),DKEYS,DSEL,DROWS);stacked($('daily'),DROWS,DSEL?DKEYS.filter(k=>k.k==DSEL):DKEYS)}
 function stacked(el,rows,keys){const W=Math.max(el.clientWidth,320),H=180,P=28;
  if(!rows.length){el.innerHTML='<p class="mut">'+t('no_data')+'</p>';return}
  const tot=rows.map(r=>keys.reduce((s,k)=>s+(r[k.k]||0),0)),max=Math.max(...tot,1e-9),bw=(W-P)/rows.length;
@@ -2726,13 +2725,15 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
  fixed($('fixed'),r.fixed);
  tbl($('clients'),r.clients,[{h:t('client'),v:x=>x.client,f:v=>esc(v=='otros'?t('others'):v)},{h:t('cost'),v:x=>x.cost,f:usd},{h:t('tokens'),v:x=>x.tokens,f:tok},{h:t('sessions'),v:x=>x.sessions,f:v=>v}]);
  const sk=[{k:'c_cr',n:t('cache_read'),c:'--b'},{k:'c_cw',n:t('cache_write'),c:'--c'},{k:'c_inp',n:t('input_nc'),c:'--e'},{k:'c_out',n:t('output'),c:'--d'},{k:'c_think',n:t('thinking'),c:'--h'},{k:'sub_cost',n:t('subagents'),c:'--g'}];
- $('sleg').innerHTML=sk.map(k=>'<span><i style="background:'+css(k.c)+'"></i>'+k.n+'</span>').join('');
- const smax=Math.max(...r.sessions.map(x=>x.cost||0),1e-9);
- const sbar=x=>'<div style="display:flex;gap:6px;align-items:center;justify-content:flex-end">'+usd(x.cost)+'<div class="sbar" style="width:'+Math.max(4,84*(x.cost||0)/smax)+'px">'+sk.map(k=>'<i style="width:'+(x.cost?100*(x[k.k]||0)/x.cost:0)+'%;background:'+css(k.c)+'" title="'+k.n+': '+usd(x[k.k])+'"></i>').join('')+'</div></div>';
+ SDRAW=()=>{if(SSEL&&!sk.some(k=>k.k==SSEL))SSEL=null;
+ legend($('sleg'),sk,SSEL,r.sessions);
+ const rows=SSEL?[...r.sessions].sort((a,b)=>(b[SSEL]||0)-(a[SSEL]||0)):r.sessions,vk=SSEL?sk.filter(k=>k.k==SSEL):sk,cv=x=>SSEL?(x[SSEL]||0):(x.cost||0);
+ const smax=Math.max(...rows.map(cv),1e-9);
+ const sbar=x=>'<div style="display:flex;gap:6px;align-items:center;justify-content:flex-end">'+usd(cv(x))+'<div class="sbar" style="width:'+Math.max(4,84*cv(x)/smax)+'px">'+vk.map(k=>'<i style="width:'+(cv(x)?100*(x[k.k]||0)/cv(x):0)+'%;background:'+css(k.c)+'" title="'+k.n+': '+usd(x[k.k])+'"></i>').join('')+'</div></div>';
  const fue=x=>{if(!x.cost)return '-';const m=sk.reduce((b,k)=>(x[k.k]||0)>(x[b.k]||0)?k:b,sk[0]);return '<span style="display:inline-flex;align-items:center;gap:5px"><i style="width:8px;height:8px;border-radius:2px;background:'+css(m.c)+'"></i>'+m.n+' '+(100*(x[m.k]||0)/x.cost).toFixed(0)+'%</span>'};
  const tt=x=>x.top_tool?esc(x.top_tool.name)+' <span class="mut">~'+tok((x.top_tool.chars||0)/4)+' · '+x.top_tool.calls+'</span>':'-';
- tbl($('sessions'),r.sessions,[{h:t('session'),v:x=>x,f:(x)=>'<b>'+esc(x.title||x.session.slice(0,8))+'</b><br><span class="mut">'+short(x.project)+' · '+esc((x.first||'').slice(0,16).replace('T',' '))+'</span>'},
-  {h:t('cost'),v:x=>x,s:x=>x.cost,f:sbar,bar:false},{h:t('best_model'),help:t('help_best'),v:x=>x,s:x=>x.fit?x.fit.save:-1,f:fit},{h:t('went_on'),help:t('help_went'),v:x=>x,f:fue},{h:t('top_tool'),v:x=>x,f:tt},{h:t('messages_h'),help:t('help_msgs'),v:x=>x.prompts,f:v=>v},{h:t('max_ctx'),v:x=>x.peak_ctx,f:tok},{h:t('over_k',{n:tok(L.ctx)}),help:t('help_over',{n:tok(L.ctx)}),v:x=>x.over,f:v=>v>0.5?'~'+usd(v):'-'},{h:t('compact_h'),help:t('help_compact'),v:x=>x.compacts,f:v=>v},{h:t('subagents'),v:x=>x,s:x=>x.cost?x.sub_cost/x.cost:0,f:x=>x.cost?(100*x.sub_cost/x.cost).toFixed(0)+'%':'-'}],{click:openSession});
+ tbl($('sessions'),rows,[{h:t('session'),v:x=>x,f:(x)=>'<b>'+esc(x.title||x.session.slice(0,8))+'</b><br><span class="mut">'+short(x.project)+' · '+esc((x.first||'').slice(0,16).replace('T',' '))+'</span>'},
+  {h:t('cost'),v:x=>x,s:cv,f:sbar,bar:false},{h:t('best_model'),help:t('help_best'),v:x=>x,s:x=>x.fit?x.fit.save:-1,f:fit},{h:t('went_on'),help:t('help_went'),v:x=>x,f:fue},{h:t('top_tool'),v:x=>x,f:tt},{h:t('messages_h'),help:t('help_msgs'),v:x=>x.prompts,f:v=>v},{h:t('max_ctx'),v:x=>x.peak_ctx,f:tok},{h:t('over_k',{n:tok(L.ctx)}),help:t('help_over',{n:tok(L.ctx)}),v:x=>x.over,f:v=>v>0.5?'~'+usd(v):'-'},{h:t('compact_h'),help:t('help_compact'),v:x=>x.compacts,f:v=>v},{h:t('subagents'),v:x=>x,s:x=>x.cost?x.sub_cost/x.cost:0,f:x=>x.cost?(100*x.sub_cost/x.cost).toFixed(0)+'%':'-'}],{click:openSession})};SDRAW();
  const stl={todo:t('st_todo'),warn:t('st_warn'),ok:t('st_ok'),info:t('st_info')};
  const openK=new Set([...document.querySelectorAll('#recs details[open],#recs_more details[open]')].map(d=>d.dataset.k));
  const dm=d=>d?d.slice(8,10)+'-'+d.slice(5,7):'';
@@ -2775,8 +2776,9 @@ $('lang').onchange=()=>{LANGSEL=$('lang').value;LANG=LANGSEL;try{localStorage.se
 applyI18n();
 {const d=new Date();$('month').value=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');$('month').max=$('month').value;$('month').onchange=csvLinks}
 fetch('/api/clients').then(r=>r.json()).then(cs=>cs.forEach(c=>$('client').insertAdjacentHTML('beforeend','<option value="'+esc(c)+'">'+esc(c)+'</option>'))).catch(()=>{}).then(()=>{applyI18n();load()});
-$('leg').onclick=e=>{const b=e.target.closest('button');if(!b)return;const k=b.dataset.k;DSEL=!k||DSEL==k?null:k;drawDaily();
- const f=$('leg').querySelector(k&&DSEL?'[data-k="'+k+'"]':'.lg');if(f)f.focus()};
+const legClick=(el,get,set,draw)=>el.onclick=e=>{const b=e.target.closest('button');if(!b)return;const k=b.dataset.k;set(!k||get()==k?null:k);draw();
+ const f=el.querySelector(k&&get()?'[data-k="'+k+'"]':'.lg');if(f)f.focus()};
+legClick($('leg'),()=>DSEL,v=>DSEL=v,drawDaily);legClick($('sleg'),()=>SSEL,v=>SSEL=v,()=>SDRAW());
 // sticky bar: shadow line once it sticks, and the section you are reading marked in it
 {const bar=$('topbar'),links=[...document.querySelectorAll('#nav a')];let tick=0;
  const mark=()=>{tick=0;const h=bar.offsetHeight;document.documentElement.style.setProperty('--barh',h+'px');
