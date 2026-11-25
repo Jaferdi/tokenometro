@@ -471,6 +471,59 @@ class FunnelTest(Base):
         self.assertTrue(all(x["stage"] in ("shown", "study", "dismissed") and isinstance(x["missing"], list) for x in recs))
 
 
+def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=()):
+    """One main-conversation request: `ctx` tokens of context, `cw` of them written to the cache, the rest read."""
+    d = json.loads(record(sid, now_ts(minutes_ago), mid, model=model, inp=10, cr=max(ctx - cw - 10, 0)))
+    d["message"]["usage"]["cache_creation_input_tokens"] = cw
+    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
+    return json.dumps(d)
+
+
+def result(tool_id, chars):
+    return json.dumps({"type": "user", "sessionId": "x", "timestamp": now_ts(), "cwd": "/work/demo",
+                       "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "x" * chars}]}})
+
+
+class NewDetectorsTest(Base):
+    def rec(self, rid):
+        return next((r for r in self.t.data(30, self.t.ALL)["recs"] if r["id"] == rid), None)
+
+    def test_cache_rebuilt_without_a_pause_is_found_with_its_cause(self):
+        self.write("a.jsonl", [
+            req("s1", "a1", 30, 200_000, 2_000), req("s1", "a2", 29, 205_000, 5_000, model="claude-sonnet-5-5"),   # model switch
+            req("s2", "b1", 30, 800_000, 2_000), req("s2", "b2", 29, 700_000, 690_000),                          # trimmed
+            req("s3", "c1", 30, 100_000, 2_000), req("s3", "c2", 29, 101_000, 100_000),                          # no cause
+            req("s4", "d1", 30, 800_000, 2_000), req("s4", "d2", 29, 50_000, 45_000),                            # compaction: no
+            req("s5", "e1", 300, 100_000, 2_000), req("s5", "e2", 200, 101_000, 100_000),                        # pause: no
+            req("s6", "f1", 30, 100_000, 2_000), req("s6", "f2", 29, 103_000, 3_000),                            # normal turn: no
+        ])
+        r = self.rec("cache-miss")
+        self.assertEqual(r["metric"], 2)       # trimmed + no cause; the model switch wrote 5K only, under 20K
+        self.assertEqual(r["sample"], {"sessions": 2, "days": 1})
+        self.assertGreater(r["impact"], 0)
+
+    def test_switching_model_is_named_as_the_cause(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 200_000, 2_000), req("s1", "a2", 29, 205_000, 200_000, model="claude-sonnet-5-5")])
+        r = self.rec("cache-miss")
+        self.assertEqual(r["metric"], 1)
+        self.assertIn("model", r["evidence"])
+
+    def test_huge_tool_outputs_are_priced_by_the_turns_that_carry_them(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 50_000, 1_000, tools=("Bash", "Read")), result("a1_0", 80_000), result("a1_1", 80_000)]
+                   + [req("s1", f"a{i}", 30 - i, 70_000 + i, 1_000) for i in range(2, 12)])
+        r = self.rec("tool-output")
+        self.assertEqual(r["metric"], 1)        # Read has its own card
+        self.assertIn("Bash", r["evidence"])
+        self.assertGreater(r["impact"], 0)
+        self.assertTrue(r["tools"])              # no bashOutputMaxChars in settings: suggest it
+
+    def test_nothing_to_say_when_outputs_are_small(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 50_000, 1_000, tools=("Bash",)), result("a1_0", 3_000),
+                               req("s1", "a2", 29, 51_000, 1_000)])
+        self.assertIsNone(self.rec("tool-output"))
+        self.assertIsNone(self.rec("cache-miss"))
+
+
 class UpdateTest(Base):
     def save(self, name, value):
         with open(os.path.join(self.app, name), "w") as f:

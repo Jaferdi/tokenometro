@@ -749,6 +749,10 @@ def data(days, client, cut=CUT_DEFAULT):
     mcp = mcp_rec(con, w, a, res["fixed"])
     if mcp:
         res["recs"].append(mcp)
+    chain = main_chain(con, w, a, T)
+    for rec in (cache_miss_rec(con, chain), tool_output_rec(con, w, a, chain, read_config())):
+        if rec:
+            res["recs"].append(rec)
 
     ids = [x["session"] for x in res["sessions"]]
     if ids:
@@ -934,6 +938,148 @@ def mcp_rec(con, w, a, fx):
                      f"Mira dónde está configurado el servidor MCP {srv} (~/.claude.json, .mcp.json o un plugin) y propón cómo "
                      "activarlo solo en los proyectos que lo usan. Enséñame el diff antes de guardar."),
     }
+def main_chain(con, w, a, T):
+    """Main-conversation requests in order, with what each cache write would have cost at the read price and the
+    read price per token, for the detectors that follow a session turn by turn."""
+    loss = f"({T['cw']} - {T['cr'].replace('cr*', '(cw5+cw1h)*')})"
+    by = {}
+    for r in q(con, f"""SELECT id, session, ts, day, model, inp+cw5+cw1h+cr ctx, cw5+cw1h cw, {loss} loss,
+            {T['cr'].replace('cr*', '1*')} crp FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a):
+        r["t"] = local(r["ts"])
+        by.setdefault(r["session"], []).append(r)
+    return by
+
+
+def cache_miss_rec(con, chain):
+    """The cache is written again in full although the previous request was under a minute or so before: the
+    prefix changed. Counted when the write is over 20K tokens and over half the context, the context didn't shrink
+    by more than 40% (that is a compaction or /clear) nor grow by more than half (a first big read). The cost is the
+    write minus what those tokens would have cost read from the cache. Causes: the model changed, the context was
+    trimmed (it shrank a little: old content cleared near the limit), or nothing visible in the logs."""
+    causes = {}
+    for rows in chain.values():
+        for p, r in zip(rows, rows[1:]):
+            if not (p["t"] and r["t"]) or (r["t"] - p["t"]).total_seconds() >= 300:
+                continue
+            if r["cw"] <= 20000 or r["cw"] <= 0.5 * r["ctx"] or not (0.6 * p["ctx"] <= r["ctx"] <= 1.5 * p["ctx"]):
+                continue
+            k = "model" if r["model"] != p["model"] else "trim" if r["ctx"] < 0.95 * p["ctx"] else "other"
+            c = causes.setdefault(k, {"n": 0, "cost": 0.0, "sessions": set(), "days": set()})
+            c["n"] += 1
+            c["cost"] += max(r["loss"] or 0, 0)
+            c["sessions"].add(r["session"])
+            c["days"].add(r["day"])
+    if not causes:
+        return None
+    total = sum(c["cost"] for c in causes.values())
+    n = sum(c["n"] for c in causes.values())
+    main = max(causes, key=lambda k: causes[k]["cost"])
+    names = {"model": tr("model changed mid-session", "cambio de modelo a mitad de sesión"),
+             "trim": tr("context trimmed near the limit", "contexto recortado cerca del límite"),
+             "other": tr("no visible cause (MCP or plugins changed, an update…)", "sin causa visible (cambio de MCP o plugins, una actualización…)")}
+    parts = "; ".join(f"{names[k]}: {c['n']} ({money(c['cost'], 1)})" for k, c in sorted(causes.items(), key=lambda x: -x[1]["cost"]))
+    action = {
+        "model": tr("Pick the model when the session starts and keep it: every switch (/model, plan modes that change model) "
+                    "starts the cache from zero for the whole conversation. If you need another model, open a new session.",
+                    "Elige el modelo al empezar la sesión y mantenlo: cada cambio (/model, modos de plan que cambian de modelo) "
+                    "empieza la caché de cero con toda la conversación. Si necesitas otro modelo, abre una sesión nueva."),
+        "trim": tr("Don't let sessions get near the context limit: when they do, old content is cleared and the whole cache is "
+                   "written again, several times. Compact or /clear earlier (autoCompactWindow lower, e.g. 300000).",
+                   "No dejes que las sesiones se acerquen al límite de contexto: entonces se borra contenido antiguo y la caché "
+                   "entera se vuelve a escribir, varias veces. Compacta o haz /clear antes (autoCompactWindow más bajo, p. ej. 300000)."),
+        "other": tr("Avoid changing MCP servers, plugins or settings in the middle of a long session, and start a new one after "
+                    "updating Claude Code: any change in the tools or the system prompt invalidates the cache.",
+                    "Evita cambiar servidores MCP, plugins o ajustes en mitad de una sesión larga, y empieza una nueva después "
+                    "de actualizar Claude Code: cualquier cambio en las herramientas o el prompt de sistema invalida la caché."),
+    }[main]
+    sessions = set().union(*(c["sessions"] for c in causes.values()))
+    days = set().union(*(c["days"] for c in causes.values()))
+    return {
+        "id": "cache-miss", "title": tr("The cache was rebuilt from scratch without a pause",
+                                        "La caché se rehízo entera sin que hubiera pausa"),
+        "status": "todo", "impact": total,
+        "impact_note": tr("measured: each rewrite minus what those tokens cost read from the cache",
+                          "medido: cada reescritura menos lo que esos tokens cuestan leídos de la caché"),
+        "confidence": tr("high for the amount, medium for the cause", "alta en el importe, media en la causa"),
+        "evidence": tr(f"{n} time(s) a request wrote the whole conversation to the cache again less than 5 minutes after the "
+                       f"previous one, in {len(sessions)} session(s): {money(total, 1)}. By cause: {parts}.",
+                       f"{n} vez(es) una petición volvió a escribir toda la conversación en la caché menos de 5 minutos después "
+                       f"de la anterior, en {len(sessions)} sesión(es): {money(total, 1)}. Por causa: {parts}."),
+        "action": action,
+        "verify": tr("This card's amount drops and the main cause disappears from the list.",
+                     "El importe de esta tarjeta baja y la causa principal desaparece de la lista."),
+        "tradeoff": tr("None to speak of; it is about when you change things, not what you use.",
+                       "Ninguna relevante; es cuándo cambias las cosas, no qué usas."),
+        "metric": n, "metric_label": tr("cache rebuilds without a pause", "cachés rehechas sin pausa"),
+        "sample": {"sessions": len(sessions), "days": len(days)},
+        "tools": [],
+        "prompt": "",
+    }
+
+
+def tool_output_rec(con, w, a, chain, cfg):
+    """A tool result over ~5K tokens stays in the context and is read again on every later turn, until a
+    compaction. Counted for every tool but Read (it has its own card), on the main conversation. The estimate is
+    conservative: only the part over 2.5K tokens, only until the next compaction, and only half of it as avoidable."""
+    after = {}
+    for rows in chain.values():
+        nxt = len(rows)
+        for i in range(len(rows) - 1, -1, -1):
+            if i + 1 < len(rows) and rows[i + 1]["ctx"] < 0.6 * rows[i]["ctx"]:
+                nxt = i + 1
+            after[rows[i]["id"]] = (nxt - i - 1, rows[i]["crp"] or 0)
+    by = {}
+    for r in q(con, f"""SELECT name, msg_id, session, day, result_chars FROM tools WHERE sidechain=0 AND name != 'Read'
+            AND result_chars > 20000 AND {w}""", a):
+        turns, price = after.get(r["msg_id"], (0, 0))
+        b = by.setdefault(r["name"], {"n": 0, "cost": 0.0, "sessions": set(), "days": set(), "tokens": 0})
+        b["n"] += 1
+        b["tokens"] += r["result_chars"] / 4
+        b["cost"] += max(r["result_chars"] / 4 - 2500, 0) * turns * price * 0.5
+        b["sessions"].add(r["session"])
+        b["days"].add(r["day"])
+    if not by:
+        return None
+    total = sum(b["cost"] for b in by.values())
+    n = sum(b["n"] for b in by.values())
+    top = sorted(by.items(), key=lambda x: -x[1]["cost"])[:3]
+    parts = "; ".join(f"{k}: {b['n']} (~{fmt_tok(b['tokens'])} tokens, {money(b['cost'], 2)})" for k, b in top)
+    limit = cfg.get("bashOutputMaxChars")
+    bash = any(k == "Bash" for k, _ in top)
+    tip = (tr(f" bashOutputMaxChars is {limit}; lower it if Bash still leads.", f" bashOutputMaxChars está en {limit}; bájalo si Bash sigue en cabeza.")
+           if limit else tr(" Setting bashOutputMaxChars caps what a command can return.",
+                            " Con bashOutputMaxChars se pone un tope a lo que puede devolver un comando.")) if bash else ""
+    sessions = set().union(*(b["sessions"] for b in by.values()))
+    days = set().union(*(b["days"] for b in by.values()))
+    return {
+        "id": "tool-output", "title": tr("Huge tool outputs stay in the context", "Salidas enormes de herramientas se quedan en el contexto"),
+        "status": "todo", "impact": total,
+        "impact_note": tr("estimate: tokens over 2.5K × later turns until a compaction × cache read price, halved",
+                          "estimación: tokens por encima de 2,5K × turnos siguientes hasta compactar × precio de lectura de caché, a la mitad"),
+        "confidence": tr("medium", "media"),
+        "evidence": tr(f"{n} tool result(s) over ~5K tokens in {len(sessions)} session(s). Each one is read again on every later "
+                       f"turn: ~{money(total, 2)}. Biggest: {parts}.",
+                       f"{n} resultado(s) de herramientas de más de ~5K tokens en {len(sessions)} sesión(es). Cada uno se vuelve a "
+                       f"leer en cada turno siguiente: ~{money(total, 2)}. Los mayores: {parts}."),
+        "action": tr("Ask for only what you need: filter commands (| tail -n 50, grep, --quiet), have scripts print a short "
+                     "summary instead of everything, and send long searches to a subagent so only its conclusion comes back." + tip,
+                     "Pide solo lo que necesitas: filtra los comandos (| tail -n 50, grep, --quiet), haz que los scripts impriman "
+                     "un resumen corto en vez de todo y manda las búsquedas largas a un subagente para que solo vuelva la conclusión." + tip),
+        "verify": tr("This card's count and amount drop.", "El número y el importe de esta tarjeta bajan."),
+        "tradeoff": tr("Sometimes the full output is what you need; then it is worth it.",
+                       "A veces la salida entera es lo que hace falta; entonces compensa."),
+        "metric": n, "metric_label": tr("outputs over ~5K tokens", "salidas de más de ~5K tokens"),
+        "sample": {"sessions": len(sessions), "days": len(days)},
+        "tools": [] if (limit or not bash) else [{"n": "bashOutputMaxChars", "k": tr("setting", "ajuste"),
+                  "why": tr("caps what a Bash command can return", "pone tope a lo que devuelve un comando de Bash"),
+                  "cost": tr("free", "gratis")}],
+        "prompt": tr("Add to my CLAUDE.md a short rule: filter command output (tail, grep, --quiet) and have scripts print a "
+                     "summary, never whole logs. Show me the diff before saving.",
+                     "Añade a mi CLAUDE.md una regla corta: filtrar la salida de los comandos (tail, grep, --quiet) y que los "
+                     "scripts impriman un resumen, nunca logs enteros. Enséñame el diff antes de guardar."),
+    }
+
+
 # Recommendations the dashboard can apply itself: always a fixed change decided here, never a value sent by the page
 APPLY = {
     "ctx": {"autoCompactWindow": 300000},
