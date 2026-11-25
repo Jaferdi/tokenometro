@@ -167,6 +167,11 @@ def copy_files():
 
 
 def main(args):
+    for stream in (sys.stdout, sys.stderr):  # paths with accents on a cp1252 Windows console must not crash
+        try:
+            stream.reconfigure(errors="replace")
+        except AttributeError:
+            pass
     if sys.version_info < (3, 8):
         sys.exit("Tokenometro needs Python 3.8 or later")
     try:
@@ -184,14 +189,14 @@ def main(args):
         _, status = commands()
         notes.append("- You already have a statusLine and it was left untouched. To let the dashboard see plan usage, chain it:")
         notes.append(f"    {status} --tee | <your current command>")
-    print("Reading your Claude Code history (the first run can take a while)…")
+    print("Reading your Claude Code history (the first run can take a while)...")
     subprocess.run([sys.executable, os.path.join(DEST, "tracker.py"), "ingest"], stdout=subprocess.DEVNULL)
     if os.environ.get("TOKENOMETRO_NO_START") != "1" and port_free:
         start.launch(DEST, PORT)
     uninstall = f"{'py' if WIN else 'python3'} {q(os.path.join(DEST, 'install.py'))} --uninstall"
     print(f"""
 Done. Dashboard: http://127.0.0.1:{PORT}  (starts by itself when you open Claude Code).
-- Clients and projects: {os.path.join(DEST, 'clients.json')}  · prices: {os.path.join(DEST, 'prices.json')}
+- Clients and projects: {os.path.join(DEST, 'clients.json')}  - prices: {os.path.join(DEST, 'prices.json')}
 - Backup of your previous settings.json: {SETTINGS}.bak-tokenometro-*
 - Uninstall: {uninstall}""")
     for n in notes:

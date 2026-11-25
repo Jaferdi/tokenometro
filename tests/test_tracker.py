@@ -359,7 +359,7 @@ class InstallerTest(unittest.TestCase):
         self.home = os.path.join(self.tmp, "home")
         os.makedirs(os.path.join(self.home, ".claude", "projects"))
         self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, LOCALAPPDATA=os.path.join(self.home, "AppData"),
-                        TOKENOMETRO_NO_START="1", TOKENOMETRO_PORT="7998")
+                        TOKENOMETRO_NO_START="1", TOKENOMETRO_PORT="7998", PYTHONIOENCODING="utf-8")
         self.settings = os.path.join(self.home, ".claude", "settings.json")
 
     def install(self, *args):
