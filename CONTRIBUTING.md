@@ -17,9 +17,10 @@ Neither `main` nor `develop` accept direct pushes: everything goes through a pul
    ```bash
    python3 -m unittest discover -s tests    # standard library only, uses temporary folders
    bash -n install.sh start.sh
+   claude plugin validate .                 # if you touched .claude-plugin/ or hooks/
    python3 demo.py                          # look at the dashboard with made-up data
    ```
-   Check the dashboard loads with no errors in the browser console, in both languages and both themes. CI runs the same tests on Python 3.8 to 3.13, Linux and macOS, plus the installer in a throwaway HOME.
+   Check the dashboard loads with no errors in the browser console, in both languages and both themes. CI runs the same tests on Python 3.8 to 3.13, Linux, macOS and Windows, plus the installer in a throwaway HOME.
 5. Pull request to `develop` with what changes, how it was tested and, if it touches the dashboard, a screenshot without personal data (take it from `demo.py`).
 
 ## Releases

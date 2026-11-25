@@ -9,7 +9,7 @@
   <a href="LICENSE"><img alt="Licencia MIT" src="https://img.shields.io/badge/licencia-MIT-3B55CF"></a>
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-0A7A67">
   <img alt="Sin dependencias" src="https://img.shields.io/badge/dependencias-ninguna-8A5C00">
-  <img alt="Linux, macOS y WSL" src="https://img.shields.io/badge/funciona%20en-Linux%20%C2%B7%20macOS%20%C2%B7%20WSL-6D49D6">
+  <img alt="Linux, macOS, WSL y Windows" src="https://img.shields.io/badge/funciona%20en-Linux%20%C2%B7%20macOS%20%C2%B7%20WSL%20%C2%B7%20Windows-6D49D6">
   <br><a href="README.md">Read in English</a>
 </p>
 
@@ -65,25 +65,36 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
 
 ## Requisitos
 
-Python 3.8 o superior, sin dependencias. Linux, WSL o macOS.
+Python 3.8 o superior, sin dependencias. Linux, macOS, WSL o Windows.
 
 ## Instalación
 
-```bash
-git clone https://github.com/Jaferdi/tokenometro.git && cd tokenometro
-bash install.sh               # instala, registra el arranque automático y lo levanta
-bash install.sh --statusline  # además usa statusline.py para ver el % del plan
+**Como plugin de Claude Code** (cualquier sistema), dentro de Claude Code:
+
+```
+/plugin marketplace add Jaferdi/tokenometro
+/plugin install tokenometro@tokenometro
 ```
 
-El instalador:
+El plugin levanta el panel en cada sesión y mantiene su código al día en la carpeta de datos. Los plugins no pueden poner la statusLine, así que para ver el % del plan añádela tú (ver [Uso del plan](#uso-del-plan-5-horas-y-semana)).
 
-1. Copia los ficheros a `~/.local/share/tokenometro`.
+**Con el instalador**:
+
+```bash
+git clone https://github.com/Jaferdi/tokenometro.git && cd tokenometro
+python3 install.py               # instala, registra el arranque automático y lo levanta (en Windows: py install.py)
+python3 install.py --statusline  # además usa statusline.py para ver el % del plan
+```
+
+`bash install.sh` sigue funcionando y hace lo mismo. El instalador:
+
+1. Copia los ficheros a `~/.local/share/tokenometro` (en Windows, `%LOCALAPPDATA%\tokenometro`).
 2. Añade en `~/.claude/settings.json` un hook `SessionStart` que levanta el panel al abrir Claude Code. Antes guarda una copia: `settings.json.bak-tokenometro-<fecha>`.
 3. Lee el histórico (la primera vez tarda un poco) y abre el servidor en http://127.0.0.1:7878.
 
 Si ya tenías la versión anterior en `~/.local/share/claude-tokens`, copia datos y configuración y cambia el hook.
 
-Para quitarlo: `bash ~/.local/share/tokenometro/install.sh --uninstall` (quita el hook y la statusLine propia; los datos se quedan hasta que borres la carpeta).
+Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quita el hook y la statusLine propia; los datos se quedan hasta que borres la carpeta).
 
 ## Qué enseña el panel
 
@@ -133,7 +144,7 @@ Las ediciones de documentación (`.md`, `.json`, `.yaml`…) no cuentan como có
 El % del plan solo existe con suscripción (Pro, Max, Team…): con API no hay límites de 5 horas ni semanales y esta parte enseña solo lo gastado. El % no está en los registros. Claude Code lo recibe de Anthropic y solo se lo pasa a la statusLine y a los plugins. El tokenómetro lo toma de:
 
 1. **El plugin sub-meter**, si lo tienes: guarda su última lectura en `~/.claude/plugins/store/sub-meter_*.json`.
-2. **`statusline.py`**, incluido aquí: lee el JSON que Claude Code manda a la statusLine (`rate_limits`) y lo deja en `~/.local/share/tokenometro/plan.json`. Se activa con `install.sh --statusline`. Si ya tienes otra statusLine, encadénala:
+2. **`statusline.py`**, incluido aquí: lee el JSON que Claude Code manda a la statusLine (`rate_limits`) y lo deja en `~/.local/share/tokenometro/plan.json`. Se activa con `install.py --statusline`, o a mano en `~/.claude/settings.json`: `"statusLine": {"type": "command", "command": "python3 \"$HOME/.local/share/tokenometro/statusline.py\""}`. Si ya tienes otra statusLine, encadénala:
 
    ```
    python3 "$HOME/.local/share/tokenometro/statusline.py" --tee | <tu comando actual>
@@ -183,7 +194,7 @@ El tipo de cambio se actualiza a mano: el tokenómetro no se conecta a nada. Si 
 | `TOKENOMETRO_CUT` | Fecha de corte de «Antes / después» | la de `clients.json` o hace 7 días |
 | `TOKENOMETRO_CURRENCY` | `EUR` o `USD` por defecto | la de `prices.json` |
 | `TOKENOMETRO_LANG` | `en` o `es` por defecto | `en` |
-| `TOKENOMETRO_NO_START` | `1` para que `install.sh` no lo arranque | |
+| `TOKENOMETRO_NO_START` | `1` para que el instalador no lo arranque | |
 
 Siguen valiendo los nombres antiguos `CLAUDE_TOKENS_*`.
 
@@ -198,11 +209,10 @@ python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur E
 
 `report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE` y `--cur USD|EUR`. El mismo CSV está en el panel, en la tarjeta *Por cliente*.
 
-Reiniciar el servidor (mata solo el proceso que escucha en el puerto):
+Reiniciar el servidor (solo lo para si es Tokenometro):
 
 ```bash
-kill $(ss -ltnpH 'sport = :7878' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-~/.local/share/tokenometro/start.sh
+python3 ~/.local/share/tokenometro/start.py --restart
 ```
 
 ## Ficheros
@@ -210,9 +220,10 @@ kill $(ss -ltnpH 'sport = :7878' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
 | Fichero | Qué es |
 |---|---|
 | `tracker.py` | Lector, base de datos, reglas y panel (HTML incluido) |
-| `start.sh` | Lo levanta en segundo plano si no está ya corriendo |
+| `start.py` | Lo levanta en segundo plano si no está ya corriendo (`start.sh` lo llama) |
 | `statusline.py` | statusLine opcional que guarda el % del plan |
-| `install.sh` | Instalar, actualizar y desinstalar |
+| `install.py` | Instalar, actualizar y desinstalar (`install.sh` lo llama) |
+| `.claude-plugin/`, `hooks/` | Plugin de Claude Code |
 | `demo.py` | Probarlo con datos inventados, sin instalar nada |
 | `usage.db` | Datos (se regenera desde los registros si lo borras) |
 | `plan.json` | Última lectura del plan de `statusline.py` |

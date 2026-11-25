@@ -283,6 +283,22 @@ class DemoAndServerTest(Base):
             srv.shutdown()
             srv.server_close()
 
+    def test_quit_needs_the_token(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), self.t.H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        self.t._TOKEN = "secret-token"
+        try:
+            for headers in ({}, {"X-Tokenometro-Token": "wrong"}):
+                with self.assertRaises(urllib.error.HTTPError) as e:
+                    urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}/api/quit", headers=headers), timeout=10)
+                self.assertEqual(e.exception.code, 403)
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/quit", headers={"X-Tokenometro-Token": "secret-token"})
+            self.assertEqual(urllib.request.urlopen(req, timeout=10).read(), b"bye")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 class BudgetAndReportTest(Base):
     clients = {"clients": {"acme": ["/work/"]}, "budget": {"day": 2, "week": 1000, "month": "oops"}}
@@ -323,6 +339,70 @@ class BudgetAndReportTest(Base):
         by_client = list(csv.DictReader(io.StringIO(self.t.report(month, "client"))))
         self.assertEqual([r["client"] for r in by_client], ["acme"])
         self.assertEqual(self.t.report("1999-01", "session").count("\n"), 1)  # header only
+
+
+class InstallerTest(unittest.TestCase):
+    """install.py and start.py in a throwaway HOME (and LOCALAPPDATA on Windows), without starting the server."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(self.home, ".claude", "projects"))
+        self.env = dict(os.environ, HOME=self.home, USERPROFILE=self.home, LOCALAPPDATA=os.path.join(self.home, "AppData"),
+                        TOKENOMETRO_NO_START="1", TOKENOMETRO_PORT="7998")
+        self.settings = os.path.join(self.home, ".claude", "settings.json")
+
+    def install(self, *args):
+        import subprocess
+        return subprocess.run([sys.executable, os.path.join(ROOT, "install.py"), *args], env=self.env,
+                              capture_output=True, text=True, encoding="utf-8", timeout=120)
+
+    def hooks(self):
+        s = read(self.settings)
+        return [h["command"] for e in s.get("hooks", {}).get("SessionStart", []) for h in e.get("hooks", [])]
+
+    def test_install_replaces_old_hooks_and_uninstall_cleans_up(self):
+        with open(self.settings, "w", encoding="utf-8") as f:
+            json.dump({"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": '"$HOME/.local/share/claude-tokens/start.sh"'}]},
+                {"matcher": "x", "hooks": [{"type": "command", "command": "echo mine"}]}]},
+                "statusLine": {"type": "command", "command": "mybar"}}, f)
+        r = self.install("--statusline")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        hooks = self.hooks()
+        self.assertEqual(len(hooks), 2)
+        self.assertIn("echo mine", hooks)
+        self.assertTrue(any("start.py" in h and "--port 7998" in h for h in hooks))
+        self.assertEqual(read(self.settings)["statusLine"]["command"], "mybar")  # someone else's: untouched
+        self.assertIn("--tee", r.stdout)
+        r = self.install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.hooks(), ["echo mine"])
+
+    def test_statusline_is_ours_when_free(self):
+        self.assertEqual(self.install("--statusline").returncode, 0)
+        self.assertIn("statusline.py", read(self.settings)["statusLine"]["command"])
+        self.install("--uninstall")
+        self.assertNotIn("statusLine", read(self.settings))
+
+    def test_invalid_settings_is_left_alone(self):
+        with open(self.settings, "w", encoding="utf-8") as f:
+            f.write("{oops")
+        r = self.install()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(read_text(self.settings), "{oops")
+
+    def test_plugin_sync_seeds_once_and_reports_code_changes(self):
+        import start
+        dest = os.path.join(self.tmp, "data")
+        self.assertTrue(start.sync(ROOT, dest))
+        for f in ("tracker.py", "statusline.py", "prices.json", "clients.json"):
+            self.assertTrue(os.path.exists(os.path.join(dest, f)), f)
+        with open(os.path.join(dest, "prices.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        self.assertFalse(start.sync(ROOT, dest))
+        self.assertEqual(read_text(os.path.join(dest, "prices.json")), "{}")  # the user's prices are kept
 
 
 if __name__ == "__main__":

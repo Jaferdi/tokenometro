@@ -8,9 +8,11 @@ dashboard at http://127.0.0.1:7878. No dependencies: standard library only.
   python3 tracker.py ingest     # ingest only (and print a summary)
 """
 import glob
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -24,6 +26,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 PROJECTS = os.path.join(HOME, ".claude", "projects")
 DB = os.path.join(BASE, "usage.db")
 PRICES = os.path.join(BASE, "prices.json")
+CONTROL = os.path.join(BASE, ".control")  # port, pid and the token that lets the installer stop this server
 
 
 def read_json(path):
@@ -1048,7 +1051,7 @@ def write_recs_file(recs, kpi):
     os.makedirs(REPORTS, exist_ok=True)
     tmp = recs_file_path() + ".tmp"
     # it contains project paths and prompts: readable only by you
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     os.replace(tmp, recs_file_path())
 
@@ -1876,6 +1879,15 @@ class H(BaseHTTPRequestHandler):
             self.send_error(403, "Tokenometro only answers on 127.0.0.1 or localhost")
             return
         u = urlparse(self.path)
+        if u.path == "/api/quit":
+            # a custom header can't be sent cross-origin without a preflight we never answer, so only local tools reach this
+            ok = _TOKEN and hmac.compare_digest(self.headers.get("X-Tokenometro-Token") or "", _TOKEN)
+            if not ok:
+                self.send_error(403)
+                return
+            self._send("bye", "text/plain; charset=utf-8")
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
         try:
             if u.path == "/":
                 self._send(PAGE.replace("__DEFLANG__", LANG_DEFAULT), "text/html; charset=utf-8")
@@ -1942,7 +1954,24 @@ def loop():
         time.sleep(INGEST_EVERY)
 
 
+_TOKEN = ""
+
+
+def write_control():
+    global _TOKEN
+    _TOKEN = secrets.token_hex(16)
+    tmp = CONTROL + ".tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+        json.dump({"port": PORT, "pid": os.getpid(), "token": _TOKEN}, f)
+    os.replace(tmp, CONTROL)
+
+
 def main():
+    for stream in (sys.stdout, sys.stderr):  # a Windows console in cp1252 must not crash on € or …
+        try:
+            stream.reconfigure(errors="replace")
+        except AttributeError:
+            pass
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "ingest":
         t0 = time.time()
@@ -1968,15 +1997,27 @@ def main():
         set_lang(LANG_DEFAULT)
         set_currency(opt("--cur", "").upper())
         ingest()
-        sys.stdout.write(report(month, opt("--by", "session"), opt("--client", ALL)))
+        sys.stdout.flush()
+        sys.stdout.buffer.write(report(month, opt("--by", "session"), opt("--client", ALL)).encode("utf-8"))  # bytes: no \r\r\n on Windows
         return
     if cmd == "backfill":
         t0 = time.time()
         n = backfill()
         print(tr(f"{n} calls completed in {time.time()-t0:.0f}s", f"{n} llamadas completadas en {time.time()-t0:.0f}s"))
         return
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)  # bind first: a second copy fails here and leaves .control alone
+    write_control()
     threading.Thread(target=loop, daemon=True).start()
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    try:
+        srv.serve_forever()
+    finally:
+        try:
+            with open(CONTROL, encoding="utf-8") as f:
+                mine = json.load(f).get("token") == _TOKEN
+            if mine:
+                os.remove(CONTROL)
+        except (OSError, ValueError):
+            pass
 
 
 if __name__ == "__main__":

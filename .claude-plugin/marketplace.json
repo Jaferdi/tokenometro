@@ -1,0 +1,14 @@
+{
+  "name": "tokenometro",
+  "owner": {
+    "name": "Jaferdi"
+  },
+  "description": "Tokenometro: see what Claude Code costs you, locally.",
+  "plugins": [
+    {
+      "name": "tokenometro",
+      "source": "./",
+      "description": "Local dashboard for what your Claude Code sessions cost, where the tokens go and what to change to spend less."
+    }
+  ]
+}
