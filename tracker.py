@@ -189,7 +189,21 @@ def connect():
         con.execute("UPDATE files SET offset=0")  # read the history again to fill the branch and the request shapes
         con.commit()
     con.execute("CREATE TABLE IF NOT EXISTS applied(id TEXT PRIMARY KEY, at TEXT, day TEXT, prev TEXT, backup TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS seen(key TEXT PRIMARY KEY, ts TEXT)")
     return con
+
+
+def seen_since(con, key, on):
+    """When a setting the user made by hand was first seen on, as a UTC timestamp like msgs.ts (None once it is
+    gone), to measure from then."""
+    if not on:
+        con.execute("DELETE FROM seen WHERE key=?", (key,))
+        con.commit()
+        return None
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    con.execute("INSERT OR IGNORE INTO seen(key, ts) VALUES (?, ?)", (key, now))
+    con.commit()
+    return con.execute("SELECT ts FROM seen WHERE key=?", (key,)).fetchone()[0]
 
 
 _SECRET = [
@@ -1492,48 +1506,90 @@ def recommendations(con, w, a, cut, k, C, T, ctx):
     })
 
     # 2) Long pauses: the cache expires and is rewritten in full
-    rows = con.execute(f"""SELECT session, ts, {T['cw']} FROM msgs WHERE sidechain=0 AND {w} ORDER BY session, ts""", a).fetchall()
-    gaps, gcost, prev = 0, 0.0, None
-    for sid, ts, cwc in rows:
-        t = local(ts)
-        if prev and prev[0] == sid and t and prev[1] and (t - prev[1]).total_seconds() > 3600:
-            gaps += 1
-            gcost += cwc or 0
-        prev = (sid, t)
-    if gaps:
+    def pauses(where, args):
+        rows = con.execute(f"""SELECT session, ts, {T['cw']} FROM msgs WHERE sidechain=0 AND {where} ORDER BY session, ts""",
+                           args).fetchall()
+        n, cost, prev = 0, 0.0, None
+        for sid, ts, cwc in rows:
+            t = local(ts)
+            if prev and prev[0] == sid and t and prev[1] and (t - prev[1]).total_seconds() > 3600:
+                n += 1
+                cost += cwc or 0
+            prev = (sid, t)
+        return n, cost
+
+    gaps, gcost = pauses(w, a)
+    hook_ts = seen_since(con, "gap_hook", cfg["gap_hook"])
+    if hook_ts:
+        # The hook doesn't stop pauses, it stops paying for them: what counts is the weekly cost of pauses after
+        # it compared with the four weeks before. Judged after a full week, so one bad day doesn't decide it.
+        on = local(hook_ts)
+        hook_day = on.strftime("%Y-%m-%d")
+        days_on = (datetime.now(timezone.utc) - on).total_seconds() / 86400
+        n_after, c_after = pauses("ts >= ?", [hook_ts])
+        first = local(con.execute("SELECT MIN(ts) FROM msgs WHERE sidechain=0").fetchone()[0] or hook_ts)
+        span = min(28.0, (on - first).total_seconds() / 86400)
+        frm = (on - timedelta(days=span)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        _, c_before = pauses("ts >= ? AND ts < ?", [frm, hook_ts]) if span >= 1 else (0, 0.0)
+        wk_after = c_after / max(days_on, 1) * 7
+        wk_before = c_before / span * 7 if span >= 1 else 0.0
+        good = wk_after <= max(wk_before * 0.5, 0.5)
+        ready = (on + timedelta(days=7)).strftime("%Y-%m-%d")
+        status = "ok" if days_on >= 7 and good else "warn"
+        if days_on < 7:
+            verdict = tr(f"It will count as working on {ready} if the weekly cost of pauses stays under half of before "
+                         f"(or under {money(0.5, 2)}).",
+                         f"Se dará por funcionando el {ready} si el coste semanal de las pausas queda por debajo de la mitad "
+                         f"que antes (o de {money(0.5, 2)}).")
+        elif good:
+            verdict = tr("Working: pauses now cost less than half of before.",
+                         "Funciona: las pausas cuestan ahora menos de la mitad que antes.")
+        else:
+            verdict = tr("Still high: when the warning shows, save the state and /clear instead of resending.",
+                         "Sigue alto: cuando salte el aviso, guarda el estado y haz /clear en vez de reenviar.")
+        evidence = tr(f"Hook on since {hook_day}. Since then, {n_after} pause(s) over 1 h cost {money(c_after, 1)} "
+                      f"({money(wk_after, 1)}/week; before, {money(wk_before, 1)}/week). {verdict}",
+                      f"Hook puesto desde el {hook_day}. Desde entonces, {n_after} pausa(s) de más de 1 h costaron "
+                      f"{money(c_after, 1)} ({money(wk_after, 1)}/semana; antes, {money(wk_before, 1)}/semana). {verdict}")
+        metric, label, impact = n_after, tr("pauses since the hook", "pausas desde el hook"), c_after
+    else:
+        status, metric, label, impact = "todo", gaps, tr("pauses over 1 h", "pausas de más de 1 h"), gcost
+        evidence = tr(f"{gaps} time(s) you resumed a session after more than 1 h idle. The cache had expired, so the first reply had to "
+                      f"save the whole conversation again: {money(gcost, 1)}.",
+                      f"{gaps} vez(es) retomaste una sesión tras más de 1 h parada. La caché había caducado, así que la primera respuesta "
+                      f"tuvo que guardar otra vez toda la conversación: {money(gcost, 1)}.")
+    if gaps or hook_ts:
         recs.append({
             "id": "gaps", "title": tr("Pauses over 1 h make the cache expire", "Las pausas de más de 1 h hacen caducar la caché"),
-            "status": "todo", "impact": gcost,
+            "status": status, "impact": impact,
             "impact_note": tr("measured: cache write of the first turn after each pause",
                               "medido: escritura de caché del primer turno tras cada pausa"),
             "confidence": tr("high", "alta"),
-            "evidence": tr(f"{gaps} time(s) you resumed a session after more than 1 h idle. The cache had expired, so the first reply had to "
-                           f"save the whole conversation again: {money(gcost, 1)}.",
-                           f"{gaps} vez(es) retomaste una sesión tras más de 1 h parada. La caché había caducado, así que la primera respuesta "
-                           f"tuvo que guardar otra vez toda la conversación: {money(gcost, 1)}."),
+            "evidence": evidence,
             "action": tr("Before leaving (lunch, meeting, end of day): /compact, or save the state to memory and /clear when you come back. "
                          "Resuming a huge session the next day is the most expensive case.",
                          "Antes de irte (comida, reunión, fin del día): /compact, o guarda el estado en memoria y al volver /clear. "
                          "Retomar una sesión enorme al día siguiente es lo más caro."),
-            "verify": tr("This card's number of pauses and amount go down in the following weeks.",
-                         "Esta tarjeta baja de número de pausas y de importe en las semanas siguientes."),
+            "verify": tr("A week after adding the hook, the weekly cost of pauses is under half of the four weeks before.",
+                         "Una semana después de poner el hook, el coste semanal de las pausas queda en menos de la mitad que en las "
+                         "cuatro semanas anteriores."),
             "tradeoff": tr("None to speak of; /clear requires leaving the state written down.",
                            "Ninguna relevante; /clear exige dejar el estado apuntado."),
-            "metric": gaps, "metric_label": tr("pauses over 1 h", "pausas de más de 1 h"),
-            "tools": [] if cfg["gap_hook"] else [{"n": "Hook UserPromptSubmit", "k": "hook",
+            "metric": metric, "metric_label": label,
+            "tools": [] if hook_ts else [{"n": "Hook UserPromptSubmit", "k": "hook",
                       "why": tr("warns you when you return from a long pause, before you pay for the cache rewrite",
                                 "te avisa al volver de una pausa larga, antes de pagar la reescritura de la caché"),
                       "cost": tr("0 tokens: runs locally", "0 tokens: corre en local")}],
-            "prompt": "" if cfg["gap_hook"] else tr(
+            "prompt": "" if hook_ts else tr(
                 "With the update-config skill, create a UserPromptSubmit hook in ~/.claude/settings.json (script in "
                 "~/.claude/hooks/, only bash or standard-library python3). It must read transcript_path from the input "
-                "JSON, check the timestamp of the last message and, if more than 60 minutes have passed and the transcript "
+                "JSON, check the timestamp of the last assistant reply (the current prompt may already be written) and, if more than 60 minutes have passed and the transcript "
                 "is over 1 MB, block the message ONCE per session (exit 2, marker in a temp file) with: "
                 "\"The cache has expired. Save the state and /clear, or resend the message to continue\". On any "
                 "error, exit 0 with no output. Test it with a sample JSON before enabling it and show me the diff.",
                 "Con la skill update-config, crea un hook UserPromptSubmit en ~/.claude/settings.json (script en "
                 "~/.claude/hooks/, solo bash o python3 de la biblioteca estándar). Debe leer transcript_path del JSON de "
-                "entrada, mirar la marca de tiempo del último mensaje y, si han pasado más de 60 minutos y el transcript "
+                "entrada, mirar la marca de tiempo de la última respuesta del asistente (el prompt actual puede estar ya escrito) y, si han pasado más de 60 minutos y el transcript "
                 "pesa más de 1 MB, bloquear el mensaje UNA sola vez por sesión (exit 2, marca en un fichero temporal) con: "
                 "«La caché ha caducado. Guarda el estado y haz /clear, o reenvía el mensaje para seguir». En cualquier "
                 "error, exit 0 sin salida. Pruébalo con un JSON de ejemplo antes de activarlo y enséñame el diff."),
