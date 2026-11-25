@@ -529,7 +529,7 @@ class FunnelTest(Base):
         self.assertTrue(all(x["stage"] in ("shown", "study", "dismissed") and isinstance(x["missing"], list) for x in recs))
 
 
-def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=(), h1=False):
+def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=(), h1=False, miss=None):
     """One main-conversation request: `ctx` tokens of context, `cw` of them written to the cache (for 1 hour if h1),
     the rest read."""
     d = json.loads(record(sid, now_ts(minutes_ago), mid, model=model, inp=10, cr=max(ctx - cw - 10, 0)))
@@ -537,6 +537,8 @@ def req(sid, mid, minutes_ago, ctx, cw=0, model="claude-opus-5-5", tools=(), h1=
     if h1:
         d["message"]["usage"]["cache_creation"] = {"ephemeral_1h_input_tokens": cw, "ephemeral_5m_input_tokens": 0}
     d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
+    if miss:
+        d["message"]["diagnostics"] = {"cache_miss_reason": {"type": miss}}
     return json.dumps(d)
 
 
@@ -606,6 +608,34 @@ class NewDetectorsTest(Base):
         r = self.rec("cache-miss")
         self.assertEqual(r["metric"], 1)
         self.assertIn("model", r["evidence"])
+
+    def test_the_reason_logged_by_claude_code_wins_over_the_guess(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 100_000, 2_000), req("s1", "a2", 29, 101_000, 100_000, miss="tools_changed")])
+        r = self.rec("cache-miss")
+        self.assertEqual(r["metric"], 1)
+        self.assertIn("MCP", r["evidence"])
+        self.assertIn("Claude Code", r["confidence"])
+        con = self.t.connect()
+        self.assertEqual(con.execute("SELECT miss FROM msgs WHERE id='a2'").fetchone()[0], "tools_changed")
+        con.close()
+
+    def test_cache_dropped_by_the_server_is_left_out_of_the_impact(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 100_000, 2_000), req("s1", "a2", 29, 101_000, 100_000, miss="previous_message_not_found")])
+        self.assertIsNone(self.rec("cache-miss"))
+
+    def test_cache_dropped_by_the_server_is_mentioned_but_not_counted(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 100_000, 2_000), req("s1", "a2", 29, 101_000, 100_000, miss="previous_message_not_found"),
+                               req("s2", "b1", 30, 100_000, 2_000), req("s2", "b2", 29, 101_000, 100_000, miss="system_changed")])
+        r = self.rec("cache-miss")
+        self.assertEqual(r["metric"], 1)
+        self.assertIn("server had already dropped", r["evidence"])
+
+    def test_unavailable_reason_falls_back_to_the_guess(self):
+        self.write("a.jsonl", [req("s1", "a1", 30, 200_000, 2_000),
+                               req("s1", "a2", 29, 205_000, 200_000, model="claude-sonnet-5-5", miss="unavailable")])
+        r = self.rec("cache-miss")
+        self.assertIn("model", r["evidence"])
+        self.assertIn("medium", r["confidence"])
 
     def test_huge_tool_outputs_are_priced_by_the_turns_that_carry_them(self):
         self.write("a.jsonl", [req("s1", "a1", 30, 50_000, 1_000, tools=("Bash", "Read")), result("a1_0", 80_000), result("a1_1", 80_000)]
