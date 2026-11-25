@@ -34,6 +34,7 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
 | **Tu plan** | % de la ventana de 5 horas y de la semana, cuándo se reinician, el tope estimado en € o $ y si al ritmo actual lo agotarás antes de que se reinicie. |
 | **Mejoras recomendadas** | Tarjetas hechas con *tus* datos y *tu* `settings.json`: qué cambiar, cuánto pesa, cómo comprobar que ha funcionado y un prompt listo para pegarle a Claude. |
 | **Sesiones** | Coste de cada sesión separado en entrada, salida, lecturas y escrituras de caché; el modelo más barato que habría bastado; tramos entre compactaciones, subagentes y las llamadas a herramientas más gordas. |
+| **Presupuesto e informes** | Pon un límite diario, semanal o mensual y te avisa al 80 % y al 100 % en el panel y en la línea de estado. Descarga un CSV mensual por sesión o por cliente para compartirlo o repercutirlo. |
 | **Antes / después** | Elige la fecha de un cambio (un ajuste nuevo, una costumbre nueva) y compara el coste por mensaje, el contexto y las compactaciones a cada lado. |
 
 <table>
@@ -90,7 +91,8 @@ Para quitarlo: `bash ~/.local/share/tokenometro/install.sh --uninstall` (quita e
 - **Plan**: % usado de la ventana de 5 horas y de la semana, cuándo se reinicia y un techo estimado en € o $ equivalentes (ver más abajo).
 - **Mejoras recomendadas**: tarjetas con lo que conviene cambiar, cuánto pesa y cómo comprobarlo.
 - **Sesiones**: coste por sesión desglosado (entrada, salida, lectura y escritura de caché), el modelo más rentable para cada una, dónde se fue el gasto y la herramienta que más texto metió. Pulsando una fila sale el detalle: tramos entre compactaciones, subagentes y llamadas más gordas.
-- **Por modelo y por cliente**, y **Antes / después** de una fecha para medir si un cambio de configuración sirvió.
+- **Presupuesto**: lo gastado frente a tus límites de día, semana y mes, con un aviso junto al título a partir del 80 %.
+- **Por modelo y por cliente**, con un informe mensual en CSV por sesión o por cliente, y **Antes / después** de una fecha para medir si un cambio de configuración sirvió.
 
 Arriba se elige periodo, cliente, moneda (€ o $), idioma (inglés o castellano) y tema (sistema, claro u oscuro). Las tablas van paginadas.
 
@@ -152,6 +154,12 @@ Agrupa sesiones por cliente según la carpeta donde trabajaste (gana la primera 
 - `clients`: nombre → lista de fragmentos de ruta.
 - `cut` (opcional): fecha AAAA-MM-DD del cambio que quieres medir en «Antes / después». Por defecto, hace 7 días.
 
+- `budget` (opcional): límites por `day` (día), `week` (desde el lunes) y `month` (mes), en `currency` (`USD` por defecto, o `EUR`). El panel avisa desde el 80 % y la línea de estado de `statusline.py` añade «budget today 92%». También vale `presupuesto` con `dia`, `semana`, `mes` y `moneda`.
+
+```json
+"budget": {"day": 30, "week": 150, "month": 600, "currency": "EUR"}
+```
+
 Siguen valiendo los nombres en castellano de versiones anteriores (`clientes.json`, `clientes`, `corte`).
 
 ### `prices.json`
@@ -185,7 +193,10 @@ Siguen valiendo los nombres antiguos `CLAUDE_TOKENS_*`.
 python3 ~/.local/share/tokenometro/tracker.py            # servidor (lo que hace el hook)
 python3 ~/.local/share/tokenometro/tracker.py ingest     # lee lo nuevo y saca un resumen
 python3 ~/.local/share/tokenometro/tracker.py backfill   # rellena datos de herramientas del histórico (una vez)
+python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur EUR   # CSV mensual por la salida estándar
 ```
+
+`report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE` y `--cur USD|EUR`. El mismo CSV está en el panel, en la tarjeta *Por cliente*.
 
 Reiniciar el servidor (mata solo el proceso que escucha en el puerto):
 

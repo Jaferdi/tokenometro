@@ -487,6 +487,104 @@ def q(con, sql, args=()):
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def budget_cfg():
+    """clients.json "budget": {"day": 20, "week": 100, "month": 300, "currency": "USD"}.
+    Limits for everything together (all clients); stored in USD like every amount."""
+    b = _cfg_get(_CFG, "budget", "presupuesto") or {}
+    if not isinstance(b, dict):
+        return {}
+    rate = _currency_cfg()[0]
+    in_eur = str(b.get("currency") or b.get("moneda") or "USD").upper() == "EUR" and rate > 0
+    out = {}
+    for k, old in (("day", "dia"), ("week", "semana"), ("month", "mes")):
+        v = b.get(k, b.get(old))
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            out[k] = v / rate if in_eur else float(v)
+    return out
+
+
+def budget_status(con, C):
+    lim = budget_cfg()
+    if not lim:
+        return []
+    now = datetime.now()
+    start = {"day": now.strftime("%Y-%m-%d"), "week": (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d"),
+             "month": now.strftime("%Y-%m-01")}
+    out = []
+    for kind in ("day", "week", "month"):
+        if kind not in lim:
+            continue
+        spent = q(con, f"SELECT COALESCE(SUM({C}),0) c FROM msgs WHERE day >= ?", [start[kind]])[0]["c"]
+        pct = 100 * spent / lim[kind]
+        out.append({"kind": kind, "limit": lim[kind], "spent": spent, "pct": pct,
+                    "level": "over" if pct >= 100 else "warn" if pct >= 80 else "ok"})
+    return out
+
+
+STATUS_FILE = os.path.join(BASE, "status.json")
+
+
+def write_status():
+    """Small summary for statusline.py (budget warnings), rewritten every minute."""
+    con = connect()
+    try:
+        st = {"at": int(time.time() * 1000), "budget": budget_status(con, cost_expr(load_prices()))}
+    finally:
+        con.close()
+    tmp = STATUS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATUS_FILE)
+
+
+def unpriced(models, prices):
+    """Models with no entry in prices.json: they are being valued at _default."""
+    keys = [k for k in prices if not k.startswith("_")]
+    return [m for m in models if m.get("model") not in (None, "", "?") and not any(k in m["model"] for k in keys)]
+
+
+def report(month, by="session", client=ALL):
+    """CSV for one month (YYYY-MM), by session or by client, in USD and in the selected currency."""
+    import csv
+    import io
+    con = connect()
+    try:
+        C = cost_expr(load_prices())
+        w, a = "substr(m.day,1,7) = ?", [month]
+        if client != ALL:
+            w += " AND m.client = ?"
+            a.append(client)
+        if by == "client":
+            rows = q(con, f"""SELECT m.client, COUNT(DISTINCT m.session) sessions,
+                (SELECT COUNT(*) FROM prompts p WHERE substr(p.day,1,7)=? AND p.client=m.client) messages,
+                SUM(m.inp) input, SUM(m.cw5+m.cw1h) cache_write, SUM(m.cr) cache_read, SUM(m.out) output, SUM({C}) cost
+                FROM msgs m WHERE {w} GROUP BY m.client ORDER BY cost DESC""", [month] + a)
+            head = ["client", "sessions", "messages"]
+        else:
+            rows = q(con, f"""SELECT m.client, MIN(m.day) date, m.session, COALESCE(t.title,'') title, MIN(m.project) project,
+                GROUP_CONCAT(DISTINCT m.model) models,
+                (SELECT COUNT(*) FROM prompts p WHERE p.session=m.session AND substr(p.day,1,7)=?) messages,
+                SUM(m.inp) input, SUM(m.cw5+m.cw1h) cache_write, SUM(m.cr) cache_read, SUM(m.out) output, SUM({C}) cost
+                FROM msgs m LEFT JOIN titles t ON t.session=m.session WHERE {w}
+                GROUP BY m.session ORDER BY m.client, date""", [month] + a)
+            head = ["client", "date", "session", "title", "project", "models", "messages"]
+    finally:
+        con.close()
+    rate = _currency_cfg()[0]
+    eur = currency()["code"] == "EUR" and rate > 0
+    out = io.StringIO()
+    wr = csv.writer(out)
+    wr.writerow(head + ["input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens", "cost_usd"]
+                + (["cost_eur"] if eur else []))
+    for r in rows:
+        r["client"] = tr("others", "otros") if r["client"] == OTHERS else r["client"]
+        if "project" in r:
+            r["project"] = short_path(r["project"])
+        wr.writerow([r[k] for k in head] + [r["input"], r["cache_write"], r["cache_read"], r["output"], round(r["cost"] or 0, 4)]
+                    + ([round((r["cost"] or 0) * rate, 4)] if eur else []))
+    return out.getvalue()
+
+
 def data(days, client, cut=CUT_DEFAULT):
     if time.time() - _last_ingest > 20:
         ingest()
@@ -644,6 +742,8 @@ def data(days, client, cut=CUT_DEFAULT):
     if mf["rec"]:
         res["recs"].append(mf["rec"])
     res["plan"] = plan_info(con, C, tot, res["live"])
+    res["budget"] = budget_status(con, C)
+    res["unpriced"] = unpriced(res["models"], prices)
     order = {"todo": 0, "warn": 1, "info": 2, "ok": 3}
     res["recs"].sort(key=lambda x: (order[x["status"]], -(x["impact"] or 0)))
     res["currency"] = currency()
@@ -1360,6 +1460,7 @@ body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 var(--fb);font-
 header.top{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:flex-end;justify-content:space-between;padding:22px 28px 6px;max-width:1680px;margin:0 auto}
 h1{font:600 26px/1.1 var(--fd);margin:0;letter-spacing:.01em}
 #gen{margin:4px 0 0;color:var(--mut);font-size:12px}
+header.top>div:first-child{flex:1 1 320px;min-width:0}
 .ctl{display:flex;gap:8px;flex-wrap:wrap}
 select,button,input[type=date]{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font:inherit;font-size:13px}
 button{cursor:pointer;font-weight:600;transition:border-color .15s,background .15s}button:hover{border-color:var(--a)}
@@ -1369,6 +1470,17 @@ main{padding:16px 28px 40px;display:grid;gap:18px;grid-template-columns:repeat(a
 .wide{grid-column:1/-1}
 @media (min-width:900px){main{grid-template-columns:repeat(2,minmax(0,1fr))}}  /* two fixed columns: the half-width pair never leaves a hole */
 h2{font:600 16px/1.25 var(--fd);margin:0 0 12px;letter-spacing:.01em;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.chips:empty{display:none}.chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0}
+.chip{--k:var(--a);display:inline-flex;align-items:center;gap:7px;padding:3px 10px 3px 4px;border-radius:999px;font-size:12px;color:var(--fg);text-decoration:none;
+ background:color-mix(in srgb,var(--k) 12%,transparent);border:1px solid color-mix(in srgb,var(--k) 35%,transparent);transition:background .15s}
+.chip:hover{background:color-mix(in srgb,var(--k) 20%,transparent)}.chip:focus-visible{outline:2px solid var(--k);outline-offset:2px}
+.chip.over{--k:var(--f)}.chip.info{--k:var(--c);padding-left:10px}.chip span{color:var(--mut)}
+.ring{width:18px;height:18px;border-radius:50%;flex:none;background:conic-gradient(var(--k) calc(var(--p)*1%),color-mix(in srgb,var(--k) 22%,transparent) 0);
+ -webkit-mask:radial-gradient(circle,transparent 5px,#000 5.5px);mask:radial-gradient(circle,transparent 5px,#000 5.5px)}
+.csv{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;justify-content:space-between;margin-top:12px;font-size:12px}
+.csvc{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.btn{display:inline-block;padding:5px 10px;border:1px solid var(--line);border-radius:8px;color:var(--fg);text-decoration:none;font-weight:600;font-size:12px}
+.btn:hover{border-color:var(--c)}.btn:focus-visible,#month:focus-visible{outline:2px solid var(--c);outline-offset:2px}
 .mut{color:var(--mut)}.note{font-size:12px;margin:10px 0 0;color:var(--mut)}
 
 /* header: counter + gauges */
@@ -1476,7 +1588,7 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 @media (max-width:820px){.hero{grid-template-columns:1fr}.odo{font-size:48px}header.top,main{padding-left:16px;padding-right:16px}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style></head><body>
-<header class="top"><div><h1 data-i18n="title">Tokenometro</h1><p id="gen"></p></div>
+<header class="top"><div><h1 data-i18n="title">Tokenometro</h1><p id="gen"></p><div id="alerts" class="chips" role="status" aria-live="polite"></div></div>
 <div class="ctl"><select id="days" data-i18n-aria="period" aria-label="Period"><option value="1" data-i18n="today">Today</option><option value="7" selected data-i18n="d7">7 days</option><option value="30" data-i18n="d30">30 days</option><option value="90" data-i18n="d90">90 days</option></select>
 <select id="client" data-i18n-aria="client" aria-label="Client"><option value="all" data-i18n="allclients">All clients</option></select>
 <select id="cur" data-i18n-aria="currency" aria-label="Currency"><option value="EUR">€</option><option value="USD">$</option></select>
@@ -1491,6 +1603,7 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 </section>
 <section class="card wide" id="plancard" hidden><h2><span data-i18n="your_plan">Your plan</span> <span class="badge" id="planage"></span></h2><div class="plan" id="plan"></div>
 <p class="mut" style="font-size:12px;margin:8px 0 0" data-i18n="plan_note"></p></section>
+<section class="card wide" id="budgetcard" hidden><h2><span data-i18n="budget">Budget</span> <span class="badge" data-i18n="budget_badge"></span></h2><div class="plan" id="budget"></div></section>
 <section class="card wide"><h2 data-i18n="summary">Period summary</h2><div class="kpis" id="kpis"></div>
 <p class="note"><span id="eqn"></span> <span data-i18n="eq_rest"></span></p></section>
 <section class="card wide"><h2><span data-i18n="recs_title">Recommended improvements</span> <span class="badge" data-i18n="recs_badge"></span></h2><div class="recs" id="recs"></div>
@@ -1500,7 +1613,8 @@ ul{margin:0;padding-left:18px}li{margin:4px 0}
 <section class="card wide"><h2><span data-i18n="before_after"></span> <input type="date" id="cut" data-i18n-aria="cut_label"></h2><div id="cmp"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="ba_note"></p></section>
 <section class="card"><h2 data-i18n="by_model"></h2><div id="models"></div></section>
-<section class="card"><h2 data-i18n="by_client"></h2><div id="clients"></div></section>
+<section class="card"><h2 data-i18n="by_client"></h2><div id="clients"></div>
+<div class="csv"><span class="mut" data-i18n="csv_hint"></span><span class="csvc"><input type="month" id="month" data-i18n-aria="month_label"><a class="btn" id="csv_s" data-i18n="csv_sessions"></a><a class="btn" id="csv_c" data-i18n="csv_clients"></a></span></div></section>
 <section class="card wide"><h2><span data-i18n="costliest_sessions"></span> <span class="badge" data-i18n="sess_badge"></span></h2><div class="leg" id="sleg"></div><div id="sessions"></div></section>
 <section class="card wide"><h2 data-i18n="costliest_agents"></h2><div id="agents"></div></section>
 </main>
@@ -1521,6 +1635,11 @@ en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',
  plan_src:'Your plan usage (from {src}, read at {at})',plan_ago:', {t} ago',five_h:'5 hours',week:'Week',
  eta:'At the current pace you reach 100 % on {eta}, before it resets.',noeta:'At the current pace you will not run out before it resets ({reset}).',resets:'resets in {t} ({at})',
  copied:'Copied',copy_prompt:'Copy prompt',prompt_for:'Prompt for Claude in',model:'Model',cost:'Cost',turns:'Turns',subag:'(subagent)',segments:'Segments (between compactions)',from:'From',max_ctx:'Max. context',
+ budget:'Budget',budget_badge:'from clients.json · all clients together',b_day:'Today',b_week:'This week (since Monday)',b_month:'This month',
+ b_line:'You have spent <b>{s}</b> eq. of <b>{l}</b>; <b>{left}</b> left.',b_over:'You have spent <b>{s}</b> eq. of <b>{l}</b>: <b>{x}</b> over budget.',
+ al_b_day:"Today's budget",al_b_week:"This week's budget",al_b_month:"This month's budget",al_of:'{s} of {l}',al_unp:'{n} model(s) without a price',
+ al_unpriced:'Estimated prices for <code>{m}</code>: not in prices.json, so they are valued at the <code>_default</code> price. Add them to prices.json for exact figures.',
+ csv_hint:'Monthly report to share or bill: tokens and cost per session or per client.',csv_sessions:'CSV by session',csv_clients:'CSV by client',month_label:'Month of the CSV report',
  load_err:'Could not refresh: is Tokenometro still running? Showing the last data received.',cut_label:'Cut-off date for before / after',
  tools:'Tools',tool:'Tool',tok_h:'~Tokens',calls:'Calls',errors:'Errors',subagents:'Subagents',subagent:'Subagent',biggest_calls:'Biggest calls',what:'What',tokens:'Tokens',sessions:'Sessions',
  updated:'Updated at {t} · refreshes every minute',live_hint:'Sessions with activity in the last {n} min. The bar is the size of the conversation (context) that is resent on every reply; the mark is the autocompact limit, where Claude summarises it.',
@@ -1548,6 +1667,11 @@ es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días
  plan_src:'Uso de tu plan (dato de {src}, leído a las {at})',plan_ago:', hace {t}',five_h:'5 horas',week:'Semana',
  eta:'Al ritmo actual llegarás al 100 % el {eta}, antes de que se reinicie.',noeta:'Al ritmo actual no lo agotarás antes de que se reinicie ({reset}).',resets:'se reinicia en {t} ({at})',
  copied:'Copiado',copy_prompt:'Copiar prompt',prompt_for:'Prompt para Claude en',model:'Modelo',cost:'Coste',turns:'Turnos',subag:'(subag.)',segments:'Tramos (entre compactaciones)',from:'Desde',max_ctx:'Contexto máx.',
+ budget:'Presupuesto',budget_badge:'de clients.json · todos los clientes juntos',b_day:'Hoy',b_week:'Esta semana (desde el lunes)',b_month:'Este mes',
+ b_line:'Llevas <b>{s}</b> eq. de <b>{l}</b>; te quedan <b>{left}</b>.',b_over:'Llevas <b>{s}</b> eq. de <b>{l}</b>: te has pasado <b>{x}</b>.',
+ al_b_day:'Presupuesto de hoy',al_b_week:'Presupuesto de la semana',al_b_month:'Presupuesto del mes',al_of:'{s} de {l}',al_unp:'{n} modelo(s) sin precio',
+ al_unpriced:'Precios estimados para <code>{m}</code>: no están en prices.json y se valoran al precio de <code>_default</code>. Añádelos a prices.json para tener cifras exactas.',
+ csv_hint:'Informe mensual para compartir o repercutir: tokens y coste por sesión o por cliente.',csv_sessions:'CSV por sesión',csv_clients:'CSV por cliente',month_label:'Mes del informe CSV',
  load_err:'No se pudo actualizar: ¿sigue en marcha Tokenometro? Se muestran los últimos datos recibidos.',cut_label:'Fecha de corte para antes / después',
  tools:'Herramientas',tool:'Herramienta',tok_h:'~Tokens',calls:'Llamadas',errors:'Errores',subagents:'Subagentes',subagent:'Subagente',biggest_calls:'Llamadas más gordas',what:'Qué',tokens:'Tokens',sessions:'Sesiones',
  updated:'Actualizado a las {t} · se refresca cada minuto',live_hint:'Sesiones con actividad en los últimos {n} min. La barra es el tamaño de la conversación (contexto), que se reenvía en cada respuesta; la marca es el límite de autocompact, donde Claude la resume.',
@@ -1646,6 +1770,17 @@ async function openSession(x,tr,n){const nx=tr.nextElementSibling;if(nx&&nx.clas
   '<div><h3>'+t('biggest_calls')+'</h3>'+tb(d.big_calls,[{h:t('what'),v:y=>y,f:y=>'<div class="code"><b>'+esc(y.name)+'</b> '+esc((y.input_head||'').replace(/\/(home|Users)\/[^/\s]+/g,'~'))+'</div>'},{h:t('tok_h'),v:y=>(y.result_chars||0)/4,f:tok}])+'</div></div>';
  tr.insertAdjacentHTML('afterend','<tr class="det"><td colspan="'+n+'"><div class="detin"><div>'+html+'</div></div></td></tr>');
  const di=tr.nextElementSibling.querySelector('.detin');requestAnimationFrame(()=>requestAnimationFrame(()=>di.classList.add('open')))}
+function budget(b){const c=$('budgetcard');c.hidden=!b||!b.length;if(c.hidden)return;
+ $('budget').innerHTML=b.map(x=>{const n=t({day:'b_day',week:'b_week',month:'b_month'}[x.kind]),lv=x.level=='over'?' red':x.level=='warn'?' amb':'';
+  const line=x.spent>x.limit?t('b_over',{s:usd(x.spent),l:usd(x.limit),x:usd(x.spent-x.limit)}):t('b_line',{s:usd(x.spent),l:usd(x.limit),left:usd(x.limit-x.spent)});
+  return '<div class="pl'+lv+'"><div class="gh"><b>'+n+'</b><span class="v">'+num(x.pct,0)+' %</span></div><div class="track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+Math.round(x.pct)+'" aria-label="'+n+'"><i class="fill" style="--w:'+Math.min(100,x.pct)+'%"></i></div><div class="gm">'+line+'</div></div>'}).join('')}
+function alerts(r){const a=(r.budget||[]).filter(x=>x.level!='ok').map(x=>{const n=t({day:'al_b_day',week:'al_b_week',month:'al_b_month'}[x.kind]);
+  return '<a class="chip'+(x.level=='over'?' over':'')+'" href="#budgetcard"><i class="ring" style="--p:'+Math.min(100,x.pct)+'" aria-hidden="true"></i><b>'+n+' '+num(x.pct,0)+' %</b><span>'+t('al_of',{s:usd(x.spent),l:usd(x.limit)})+'</span></a>'});
+ if(r.unpriced&&r.unpriced.length){const tip=t('al_unpriced',{m:r.unpriced.map(m=>m.model).join(', ')}).replace(/<[^>]+>/g,'');
+  a.push('<span class="chip info" tabindex="0" title="'+esc(tip)+'" aria-label="'+esc(tip)+'">'+t('al_unp',{n:r.unpriced.length})+'</span>')}
+ $('alerts').innerHTML=a.join('')}
+function csvLinks(){const m=$('month').value||new Date().toISOString().slice(0,7),c=$('client').value;
+ const u=by=>'/api/report.csv?month='+m+'&by='+by+'&client='+encodeURIComponent(c)+'&cur='+CUR.code+'&lang='+LANG;$('csv_s').href=u('session');$('csv_c').href=u('client')}
 let SEQ=0;
 async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r;
  // only the newest request draws: a slow older answer must not overwrite a newer one
@@ -1658,7 +1793,7 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
  const L=r.limits;$('livehint').textContent=t('live_hint',{n:L.live_min});
  {const hm={};r.today_hours.forEach(h=>hm[h.hour]=h.cost);const mx=Math.max(...Object.values(hm),1e-9),nh=new Date().getHours();
   $('spark').className='spark'+(FIRST?' grow':'');$('spark').innerHTML=[...Array(24)].map((_,h)=>{const v=hm[h]||0;return '<i class="'+(h==nh?'now':v?'':'z')+'" style="height:'+Math.max(3,100*v/mx)+'%;animation-delay:'+(h*25)+'ms" title="'+t('h_title',{h:String(h).padStart(2,'0'),v:usd(v)})+'"></i>'}).join('')}
- $('pulse').classList.toggle('on',r.live.length>0);plan(r.plan);gauges($('live'),r.live,L);odometer($('odo'),r.kpi_today.cost);
+ $('pulse').classList.toggle('on',r.live.length>0);plan(r.plan);budget(r.budget);alerts(r);csvLinks();gauges($('live'),r.live,L);odometer($('odo'),r.kpi_today.cost);
  const tt0=r.kpi_today,k=r.kpi_range;
  $('todaysub').innerHTML=t('today_sub',{tok:tok(tt0.tokens),n:tt0.prompts,c:usd(k.cost)});$('gen').textContent=t('updated',{t:r.generated.slice(11,16)});
  $('kpis').innerHTML=[[t('period_k'),usd(k.cost),t('period_sub',{n:tok(k.tokens)}),'help_period'],
@@ -1711,6 +1846,7 @@ try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if
 $('lang').onchange=()=>{LANGSEL=$('lang').value;LANG=LANGSEL;try{localStorage.setItem('tk-lang',LANGSEL)}catch(e){};applyI18n();load()};
 ['days','client','cut'].forEach(i=>$(i).onchange=load);$('re').onclick=async()=>{$('re').classList.add('busy');$('re').textContent=t('refreshing');try{await load()}finally{$('re').classList.remove('busy');$('re').textContent=t('refresh')}};
 applyI18n();
+{const d=new Date();$('month').value=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');$('month').max=$('month').value;$('month').onchange=csvLinks}
 fetch('/api/clients').then(r=>r.json()).then(cs=>cs.forEach(c=>$('client').insertAdjacentHTML('beforeend','<option value="'+esc(c)+'">'+esc(c)+'</option>'))).catch(()=>{}).then(()=>{applyI18n();load()});
 // the minute refresh waits while you have a session open or are moving through a table with the keyboard
 setInterval(()=>{const a=document.activeElement;if(!document.querySelector('tr.det')&&!(a&&a.closest&&a.closest('table,.pager')))load()},60000);
@@ -1721,10 +1857,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, body, ctype):
+    def _send(self, body, ctype, filename=None):
         b = body.encode() if isinstance(body, str) else body
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(b)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -1758,6 +1896,19 @@ class H(BaseHTTPRequestHandler):
                 if not re.fullmatch(r"[0-9a-f-]{36}", sid):
                     return self.send_error(400)
                 self._send(json.dumps(session_detail(sid)), "application/json")
+            elif u.path == "/api/report.csv":
+                qs = parse_qs(u.query)
+                month = qs.get("month", [datetime.now().strftime("%Y-%m")])[0]
+                if not re.fullmatch(r"\d{4}-\d{2}", month):
+                    return self.send_error(400)
+                by = "client" if qs.get("by", [""])[0] == "client" else "session"
+                client = qs.get("client", [ALL])[0]
+                if client not in CLIENTS and client != OTHERS:
+                    client = ALL
+                set_currency(qs.get("cur", [""])[0].upper())
+                set_lang(qs.get("lang", [""])[0].lower())
+                self._send("\ufeff" + report(month, by, client), "text/csv; charset=utf-8",
+                           f"tokenometro-{month}-{'clients' if by == 'client' else 'sessions'}.csv")
             elif u.path == "/api/clients":
                 self._send(json.dumps(list(CLIENTS) + [OTHERS]), "application/json")
             elif u.path == "/favicon.ico":
@@ -1778,6 +1929,10 @@ def loop():
             ingest()
         except Exception as e:
             print("ingest error:", e, file=sys.stderr)
+        try:
+            write_status()
+        except Exception as e:
+            print("status error:", e, file=sys.stderr)
         if time.time() - last_snap > 3600:
             try:
                 snapshot_recs()
@@ -1801,6 +1956,19 @@ def main():
                  f"{money(k['cost'], 2)} eq., caché {k['cache_pct']:.0f}%, {k['prompts']} mensajes"))
         for i in r["insights"]:
             print(" -", (f"[{i['pct']:.0f}%] " if i["pct"] is not None else "") + i["text"])
+        for m in r["unpriced"]:
+            print(" !", tr(f"{m['model']} is not in prices.json: valued at the _default price.",
+                           f"{m['model']} no está en prices.json: se valora al precio de _default."))
+        return
+    if cmd == "report":
+        # tracker.py report [YYYY-MM] [--by client] [--client NAME] [--cur EUR]
+        args = sys.argv[2:]
+        opt = lambda k, d: args[args.index(k) + 1] if k in args and args.index(k) + 1 < len(args) else d
+        month = next((x for x in args if re.fullmatch(r"\d{4}-\d{2}", x)), datetime.now().strftime("%Y-%m"))
+        set_lang(LANG_DEFAULT)
+        set_currency(opt("--cur", "").upper())
+        ingest()
+        sys.stdout.write(report(month, opt("--by", "session"), opt("--client", ALL)))
         return
     if cmd == "backfill":
         t0 = time.time()
