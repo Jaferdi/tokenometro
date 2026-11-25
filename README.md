@@ -168,7 +168,7 @@ Everything lives in `~/.local/share/tokenometro/`. Restart after editing (see be
 
 ### `clients.json`
 
-Groups sessions by client based on the folder you worked in (the first matching path wins). Start from `clients.example.json`:
+Groups sessions by client based on the folder you worked in (the first matching path wins). It is optional and only you create it: copy `clients.example.json` to `clients.json` and edit it. Without it every session counts as «others».
 
 - `clients`: name → list of path fragments.
 - `cut` (optional): YYYY-MM-DD date of the change you want to measure in "Before / after". Defaults to 7 days ago.

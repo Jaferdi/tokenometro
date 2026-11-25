@@ -168,7 +168,7 @@ Todo vive en `~/.local/share/tokenometro/`. Tras editar algo, reinicia (ver más
 
 ### `clients.json`
 
-Agrupa sesiones por cliente según la carpeta donde trabajaste (gana la primera ruta que coincida). Parte de `clients.example.json`:
+Agrupa sesiones por cliente según la carpeta donde trabajaste (gana la primera ruta que coincida). Es opcional y solo lo creas tú: copia `clients.example.json` a `clients.json` y edítalo. Sin él, todas las sesiones cuentan como «otros».
 
 - `clients`: nombre → lista de fragmentos de ruta.
 - `cut` (opcional): fecha AAAA-MM-DD del cambio que quieres medir en «Antes / después». Por defecto, hace 7 días.

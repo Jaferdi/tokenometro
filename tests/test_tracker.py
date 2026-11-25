@@ -488,6 +488,18 @@ def result(tool_id, chars, error=False):
                                                                 "content": "x" * chars, "is_error": error}]}})
 
 
+class ClientsFileTest(Base):
+    def load(self, cfg):
+        with open(self.t.CLIENTS_FILE, "w") as f:
+            json.dump(cfg, f)
+        return self.t._load_groups()[0]
+
+    def test_made_up_clients_from_earlier_installs_are_ignored_but_real_ones_kept(self):
+        cfg = {"clients": {"company-a": ["/work/company-a"], "company-b": ["/work/company-b", "/clients/b"],
+                           "acme": ["/work/acme"], "company-c": ["/work/company-a", "/x"]}}
+        self.assertEqual(set(self.load(cfg)), {"acme", "company-c"})
+
+
 class NewDetectorsTest(Base):
     def rec(self, rid):
         return next((r for r in self.t.data(30, self.t.ALL)["recs"] if r["id"] == rid), None)
@@ -885,8 +897,9 @@ class InstallerTest(unittest.TestCase):
         import start
         dest = os.path.join(self.tmp, "data")
         self.assertTrue(start.sync(ROOT, dest))
-        for f in ("tracker.py", "statusline.py", "prices.json", "clients.json"):
+        for f in ("tracker.py", "statusline.py", "prices.json"):
             self.assertTrue(os.path.exists(os.path.join(dest, f)), f)
+        self.assertFalse(os.path.exists(os.path.join(dest, "clients.json")))  # only the user creates it
         with open(os.path.join(dest, "prices.json"), "w", encoding="utf-8") as f:
             f.write("{}")
         self.assertFalse(start.sync(ROOT, dest))

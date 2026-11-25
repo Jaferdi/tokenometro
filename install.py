@@ -156,8 +156,6 @@ def copy_files():
                 shutil.copy2(os.path.join(SRC, f), DEST)
         if not os.path.exists(os.path.join(DEST, "prices.json")):
             shutil.copy2(os.path.join(SRC, "prices.json"), DEST)
-    if not any(os.path.exists(os.path.join(DEST, f)) for f in ("clients.json", "clientes.json")):
-        shutil.copy2(os.path.join(SRC, "clients.example.json"), os.path.join(DEST, "clients.json"))
     if os.path.realpath(SRC) != os.path.realpath(DEST):  # reinstalling from the installed copy keeps the original origin
         start.mark(DEST, "pipx" if "site-packages" in SRC else "git")
     if not WIN:
@@ -198,7 +196,7 @@ def main(args):
     uninstall = f"{'py' if WIN else 'python3'} {q(os.path.join(DEST, 'install.py'))} --uninstall"
     print(f"""
 Done. Dashboard: http://127.0.0.1:{PORT}  (starts by itself when you open Claude Code).
-- Clients and projects: {os.path.join(DEST, 'clients.json')}  - prices: {os.path.join(DEST, 'prices.json')}
+- Group by client: copy {os.path.join(DEST, 'clients.example.json')} to clients.json and edit it  - prices: {os.path.join(DEST, 'prices.json')}
 - Backup of your previous settings.json: {SETTINGS}.bak-tokenometro-*
 - Uninstall: {uninstall}""")
     for n in notes:
