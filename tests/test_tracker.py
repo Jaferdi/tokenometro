@@ -335,6 +335,62 @@ class StatuslineForecastTest(unittest.TestCase):
         self.assertEqual(self.s.label("seven_day", 20, None), "week 20%")
 
 
+def paused(sid, days_ago, cw=2_000_000):
+    """Two turns of one session two hours apart, `days_ago` days back: one pause over 1 h with a big cache write."""
+    out = []
+    for i, minutes in enumerate((days_ago * 1440 + 120, days_ago * 1440)):
+        d = json.loads(record(sid, now_ts(minutes), f"{sid}_{i}", inp=10))
+        d["message"]["usage"]["cache_creation_input_tokens"] = cw
+        out.append(json.dumps(d))
+    return out
+
+
+class PausesCardTest(Base):
+    HOOK = {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 x.py"}]}]}}
+
+    def card(self, hook, since=None):
+        with open(os.path.join(self.home, ".claude", "settings.json"), "w") as f:
+            json.dump(self.HOOK if hook else {}, f)
+        self.t.ingest()
+        if since is not None:
+            con = self.t.connect()
+            con.execute("INSERT OR REPLACE INTO seen(key, ts) VALUES ('gap_hook', ?)", (now_ts(since * 1440),))
+            con.commit()
+            con.close()
+        return [r for r in self.t.data(90, self.t.ALL)["recs"] if r["id"] == "gaps"]
+
+    def test_without_the_hook_it_is_pending_and_offers_the_prompt(self):
+        self.write("a.jsonl", paused("s1", 3))
+        [c] = self.card(False)
+        self.assertEqual((c["status"], c["metric"]), ("todo", 1))
+        self.assertTrue(c["prompt"] and c["tools"])
+
+    def test_a_new_hook_is_under_review_for_a_week_and_earlier_pauses_today_do_not_count(self):
+        self.write("a.jsonl", paused("s1", 3) + paused("s2", 0))
+        [c] = self.card(True)
+        self.assertEqual((c["status"], c["metric"], c["prompt"], c["tools"]), ("warn", 0, "", []))
+        self.assertIn((datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"), c["evidence"])
+
+    def test_after_a_week_with_cheaper_pauses_it_is_done(self):
+        self.write("a.jsonl", paused("s1", 20) + paused("s2", 15) + paused("s3", 12))
+        [c] = self.card(True, since=10)
+        self.assertEqual((c["status"], c["metric"]), ("ok", 0))
+
+    def test_after_a_week_with_the_same_pauses_it_stays_under_review(self):
+        self.write("a.jsonl", paused("s1", 20) + paused("s2", 15) + paused("s3", 5) + paused("s4", 3))
+        [c] = self.card(True, since=10)
+        self.assertEqual((c["status"], c["metric"]), ("warn", 2))
+
+    def test_removing_the_hook_goes_back_to_pending(self):
+        self.write("a.jsonl", paused("s1", 3))
+        self.card(True, since=10)
+        [c] = self.card(False)
+        self.assertEqual(c["status"], "todo")
+        con = self.t.connect()
+        self.assertIsNone(con.execute("SELECT ts FROM seen WHERE key='gap_hook'").fetchone())
+        con.close()
+
+
 class UpdateTest(Base):
     def save(self, name, value):
         with open(os.path.join(self.app, name), "w") as f:
