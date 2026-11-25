@@ -216,8 +216,7 @@ def main():
         shutil.copy(os.path.join(SRC, f), app)
     with open(os.path.join(app, "clients.json"), "w") as f:
         json.dump({"clients": {"acme": ["/code/acme/"], "blue-harbor": ["/code/blue-harbor/"]},
-                   "cut": (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d"),
-                   "budget": {"day": 30, "week": 150, "month": 600}}, f)
+                   "cut": (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")}, f)
     with open(os.path.join(home, ".claude", "settings.json"), "w") as f:
         json.dump({}, f)
     n = generate(home)

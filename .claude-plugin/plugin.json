@@ -13,7 +13,7 @@
     "tokens",
     "usage",
     "dashboard",
-    "budget"
+    "report"
   ],
   "icon": ".claude-plugin/icon.png",
   "network": {

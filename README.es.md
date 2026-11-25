@@ -34,7 +34,7 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
 | **Tu plan** | % de la ventana de 5 horas y de la semana, cuándo se reinician, el tope estimado en € o $ y si al ritmo actual lo agotarás antes de que se reinicie. |
 | **Mejoras recomendadas** | Tarjetas hechas con *tus* datos y *tu* `settings.json`: qué cambiar, cuánto pesa, cómo comprobar que ha funcionado y un prompt listo para pegarle a Claude. |
 | **Sesiones** | Coste de cada sesión separado en entrada, salida, lecturas y escrituras de caché; el modelo más barato que habría bastado; tramos entre compactaciones, subagentes y las llamadas a herramientas más gordas. |
-| **Presupuesto e informes** | Pon un límite diario, semanal o mensual y te avisa al 80 % y al 100 % en el panel y en la línea de estado. Descarga un CSV mensual por sesión o por cliente para compartirlo o repercutirlo. |
+| **Informes** | Un CSV mensual por sesión o por cliente, para compartirlo o repercutirlo a un cliente, desde el panel o por consola. |
 | **Antes / después** | Elige la fecha de un cambio (un ajuste nuevo, una costumbre nueva) y compara el coste por mensaje, el contexto y las compactaciones a cada lado. |
 
 <table>
@@ -54,20 +54,13 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
   </tr>
 </table>
 
+Arriba eliges periodo, cliente, moneda (€ o $), idioma (inglés o castellano) y tema. Pulsa una sesión para ver su detalle.
+
 > Sin relación con Anthropic. Claude y Claude Code son marcas de Anthropic.
 
-## Privacidad
-
-- Solo lee `~/.claude/projects/**/*.jsonl` (y, si existe, la última lectura del plugin sub-meter).
-- Escucha en `127.0.0.1`: el panel no es accesible desde fuera de tu equipo.
-- No se conecta a internet ni envía nada. Todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
-- En «Llamadas más gordas» enmascara lo que parezca un secreto, pero el panel muestra trozos de tus comandos y rutas: no lo compartas en capturas sin mirarlo.
-
-## Requisitos
-
-Python 3.8 o superior, sin dependencias. Linux, macOS, WSL o Windows.
-
 ## Instalación
+
+Necesita Python 3.8 o superior y nada más. Linux, macOS, WSL o Windows.
 
 **Como plugin de Claude Code** (cualquier sistema), dentro de Claude Code:
 
@@ -96,18 +89,14 @@ Si ya tenías la versión anterior en `~/.local/share/claude-tokens`, copia dato
 
 Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quita el hook y la statusLine propia; los datos se quedan hasta que borres la carpeta).
 
-## Qué enseña el panel
+## Privacidad
 
-- **Hoy y ahora mismo**: gasto del día (odómetro), sesiones abiertas con su contexto, coste acumulado, compactaciones y, si hay lectura del plan, qué parte del 5 h y de la semana se ha llevado cada una.
-- **Plan**: % usado de la ventana de 5 horas y de la semana, cuándo se reinicia y un techo estimado en € o $ equivalentes (ver más abajo).
-- **Mejoras recomendadas**: tarjetas con lo que conviene cambiar, cuánto pesa y cómo comprobarlo.
-- **Sesiones**: coste por sesión desglosado (entrada, salida, lectura y escritura de caché), el modelo más rentable para cada una, dónde se fue el gasto y la herramienta que más texto metió. Pulsando una fila sale el detalle: tramos entre compactaciones, subagentes y llamadas más gordas.
-- **Presupuesto**: lo gastado frente a tus límites de día, semana y mes, con un aviso junto al título a partir del 80 %.
-- **Por modelo y por cliente**, con un informe mensual en CSV por sesión o por cliente, y **Antes / después** de una fecha para medir si un cambio de configuración sirvió.
+- Solo lee `~/.claude/projects/**/*.jsonl` (y, si existe, la última lectura del plugin sub-meter).
+- Escucha en `127.0.0.1`: el panel no es accesible desde fuera de tu equipo.
+- No se conecta a internet ni envía nada. Todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
+- En «Llamadas más gordas» enmascara lo que parezca un secreto, pero el panel muestra trozos de tus comandos y rutas: no lo compartas en capturas sin mirarlo.
 
-Arriba se elige periodo, cliente, moneda (€ o $), idioma (inglés o castellano) y tema (sistema, claro u oscuro). Las tablas van paginadas.
-
-### «€ eq.» / «$ eq.»
+## Qué significa «€ eq.»
 
 Es lo que costarían esos tokens a tarifa API (`prices.json`). Con suscripción no pagas eso, pero sirve para comparar sesiones y ver qué pesa. Con API es, aproximadamente, tu factura: no se modelan el modo rápido (cuesta el doble), Batch ni Haiku 5.5 por encima de 100K tokens de prompt. En Bedrock, Vertex o Foundry cada proveedor pone su precio: ajusta `prices.json`. Los cálculos se hacen en dólares, que es la tarifa oficial, y se pasan a euros al mostrarlos con el cambio de `prices.json`.
 
@@ -165,12 +154,6 @@ Agrupa sesiones por cliente según la carpeta donde trabajaste (gana la primera 
 - `clients`: nombre → lista de fragmentos de ruta.
 - `cut` (opcional): fecha AAAA-MM-DD del cambio que quieres medir en «Antes / después». Por defecto, hace 7 días.
 
-- `budget` (opcional): límites por `day` (día), `week` (desde el lunes) y `month` (mes), en `currency` (`USD` por defecto, o `EUR`). El panel avisa desde el 80 % y la línea de estado de `statusline.py` añade «budget today 92%». También vale `presupuesto` con `dia`, `semana`, `mes` y `moneda`.
-
-```json
-"budget": {"day": 30, "week": 150, "month": 600, "currency": "EUR"}
-```
-
 Siguen valiendo los nombres en castellano de versiones anteriores (`clientes.json`, `clientes`, `corte`).
 
 ### `prices.json`
@@ -214,6 +197,14 @@ Reiniciar el servidor (solo lo para si es Tokenometro):
 ```bash
 python3 ~/.local/share/tokenometro/start.py --restart
 ```
+
+## Si algo falla
+
+- **El panel no abre.** Se levanta con cada sesión de Claude Code; para levantarlo a mano: `python3 ~/.local/share/tokenometro/start.py`. Si sigue sin responder, mira `tracker.log` en la misma carpeta. Si otro programa usa el puerto 7878, define `TOKENOMETRO_PORT` y vuelve a instalar.
+- **No sale «Tu plan».** Necesita una lectura del uso del plan: activa `statusline.py` (ver [Uso del plan](#uso-del-plan-5-horas-y-semana)) y manda un mensaje en Claude Code.
+- **«N modelo(s) sin precio».** Hay un modelo en tus logs que no está en `prices.json` y se valora a `_default`. Añádelo a `prices.json` y reinicia.
+- **Las cifras no cuadran con mi factura.** Con suscripción pagas el plan, no estos importes; con la API, mira [qué significa «€ eq.»](#qué-significa--eq).
+- **He editado `clients.json` o `prices.json` y no cambia nada.** Reinicia: `python3 ~/.local/share/tokenometro/start.py --restart`.
 
 ## Ficheros
 

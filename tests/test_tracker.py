@@ -303,8 +303,8 @@ class DemoAndServerTest(Base):
             srv.server_close()
 
 
-class BudgetAndReportTest(Base):
-    clients = {"clients": {"acme": ["/work/"]}, "budget": {"day": 2, "week": 1000, "month": "oops"}}
+class ReportTest(Base):
+    clients = {"clients": {"acme": ["/work/"]}}
 
     def setUp(self):
         super().setUp()
@@ -313,17 +313,6 @@ class BudgetAndReportTest(Base):
         self.write("s.jsonl", [record("11111111-1111-4111-a111-111111111111", now, "m1"),
                                record("11111111-1111-4111-a111-111111111111", now, "m2", "claude-future-9", inp=10)])
         self.t.ingest()
-
-    def test_budget_levels(self):
-        b = {x["kind"]: x for x in self.t.data(7, self.t.ALL)["budget"]}
-        self.assertEqual(set(b), {"day", "week"})  # "oops" is ignored
-        self.assertEqual(b["day"]["level"], "over")
-        self.assertEqual(b["week"]["level"], "ok")
-
-    def test_status_file_for_statusline(self):
-        self.t.write_status()
-        st = read(os.path.join(self.app, "status.json"))
-        self.assertTrue(any(x["level"] == "over" for x in st["budget"]))
 
     def test_unpriced_models_are_reported(self):
         names = [m["model"] for m in self.t.data(7, self.t.ALL)["unpriced"]]
