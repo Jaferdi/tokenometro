@@ -1,0 +1,14 @@
+{
+  "_note": "Path fragments of the working directory. The FIRST match wins, so put specific paths before general ones. Each session counts entirely towards the client where it has the most messages. Restart Tokenometro after editing.",
+  "_note_optional": "«cut»: date (YYYY-MM-DD) of the change you want to measure in Before/after; defaults to 7 days ago.",
+  "clients": {
+    "company-a": [
+      "/work/company-a"
+    ],
+    "company-b": [
+      "/work/company-b",
+      "/clients/b"
+    ]
+  },
+  "cut": ""
+}
