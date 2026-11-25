@@ -48,7 +48,7 @@ def load_tracker(tmp, clients=None):
             json.dump(clients, f)
     old = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
     os.environ["HOME"] = os.environ["USERPROFILE"] = home  # Windows reads ~ from USERPROFILE
-    for k in [k for k in os.environ if k.startswith(("TOKENOMETRO_", "CLAUDE_TOKENS_"))]:
+    for k in [k for k in os.environ if k.startswith(("TOKENOMETRO_", "CLAUDE_TOKENS_")) or k == "CLAUDE_CONFIG_DIR"]:
         del os.environ[k]
     try:
         spec = importlib.util.spec_from_file_location(f"tracker_{abs(hash(tmp))}", os.path.join(app, "tracker.py"))
@@ -202,6 +202,40 @@ def shape(sid, mcp=None, deferred=0, system=8_000):
     tools += [dict(tool(f"mcp__later__t{i}", 50), defer_loading=True) for i in range(deferred)]
     return json.dumps({"type": "api-request-shape", "sessionId": sid, "timestamp": now_ts(),
                        "shape": {"system": [{"type": "text", "text": "s" * system}], "tools": tools}})
+
+
+class ClaudeConfigDirTest(Base):
+    def tearDown(self):
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        super().tearDown()
+
+    def test_defaults_include_dot_config_claude(self):
+        newer = os.path.join(self.home, ".config", "claude")
+        os.makedirs(os.path.join(newer, "projects"))
+        self.assertEqual(self.t._claude_dirs(), [newer, os.path.join(self.home, ".claude")])
+
+    def test_env_list_replaces_defaults_and_skips_empty_folders(self):
+        a, b, empty = (os.path.join(self.tmp, x) for x in ("a", "b", "empty"))
+        for d in (a, b):
+            os.makedirs(os.path.join(d, "projects"))
+        os.makedirs(empty)
+        os.environ["CLAUDE_CONFIG_DIR"] = f"{a}, {empty} ,{b}"
+        self.assertEqual(self.t._claude_dirs(), [a, b])
+
+    def test_ingest_reads_every_folder(self):
+        other = os.path.join(self.tmp, "other", "projects", "-work-other")
+        os.makedirs(other)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        self.write("s.jsonl", [record("s1", ts, "m1", "claude-opus-5-5")])
+        with open(os.path.join(other, "o.jsonl"), "w") as f:
+            f.write(record("s2", ts, "m2", "claude-opus-5-5") + "\n")
+        self.t.PROJECTS_DIRS = [os.path.join(self.home, ".claude", "projects"), os.path.dirname(other)]
+        self.t.ingest()
+        con = self.t.connect()
+        try:
+            self.assertEqual(con.execute("SELECT COUNT(DISTINCT session) FROM msgs").fetchone()[0], 2)
+        finally:
+            con.close()
 
 
 class BranchAndFixedCostTest(Base):

@@ -106,7 +106,7 @@ Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quit
 
 ## Privacidad
 
-- Solo lee `~/.claude/projects/**/*.jsonl` (y, si existe, la última lectura del plugin sub-meter).
+- Solo lee `~/.claude/projects/**/*.jsonl` (o las carpetas de `CLAUDE_CONFIG_DIR`, y `~/.config/claude/projects` si existe) (y, si existe, la última lectura del plugin sub-meter).
 - Escucha en `127.0.0.1`: el panel no es accesible desde fuera de tu equipo.
 - Tus datos no salen de tu equipo: todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
 - Su única petición a internet: una vez al día pregunta a GitHub cuál es la última versión (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`), sin enviar nada tuyo. GitHub ve tu IP, como en cualquier visita. Se apaga con `TOKENOMETRO_UPDATE_CHECK=0`.

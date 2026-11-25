@@ -106,7 +106,7 @@ To remove it: `python3 ~/.local/share/tokenometro/install.py --uninstall` (remov
 
 ## Privacy
 
-- It only reads `~/.claude/projects/**/*.jsonl` (and, if present, the last reading of the sub-meter plugin).
+- It only reads `~/.claude/projects/**/*.jsonl` (or the folders in `CLAUDE_CONFIG_DIR`, and `~/.config/claude/projects` if it exists) (and, if present, the last reading of the sub-meter plugin).
 - It listens on `127.0.0.1`: the dashboard is not reachable from outside your machine.
 - Your data never leaves your machine: everything stays in `~/.local/share/tokenometro/usage.db` (SQLite).
 - Its only request to the internet: once a day it asks GitHub which release is the latest (`api.github.com/repos/Jaferdi/tokenometro/releases/latest`), sending nothing of yours. GitHub sees your IP, as with any visit. Turn it off with `TOKENOMETRO_UPDATE_CHECK=0`.
