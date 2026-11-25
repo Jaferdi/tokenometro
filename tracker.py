@@ -2292,6 +2292,16 @@ header.top{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:flex-end;justif
 h1{font:600 26px/1.1 var(--fd);margin:0;letter-spacing:.01em}
 #gen{margin:4px 0 0;color:var(--mut);font-size:12px}
 header.top>div:first-child{flex:1 1 320px;min-width:0}
+.topbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-bottom:1px solid transparent;transition:border-color .2s}
+.topbar.stuck{border-bottom-color:var(--line)}
+.topbar-in{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center;justify-content:space-between;padding:10px 28px;max-width:1680px;margin:0 auto}
+.nav{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none;min-width:0;flex:1 1 420px}.nav::-webkit-scrollbar{display:none}
+.nav a{flex:none;color:var(--mut);text-decoration:none;font-weight:600;font-size:13px;padding:6px 10px;border-radius:8px;display:inline-flex;align-items:center;gap:6px;transition:color .15s,background .15s}
+.nav a:hover{color:var(--fg);background:var(--sunk)}
+.nav a[aria-current]{color:var(--fg);background:var(--card);box-shadow:inset 0 -2px 0 var(--a)}
+.nav .n{font-size:11px;line-height:1;padding:3px 6px;border-radius:9px;background:var(--a);color:var(--reel)}
+main>section{scroll-margin-top:calc(var(--barh,56px) + 12px)}
+@media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
 .ctl{display:flex;gap:8px;flex-wrap:wrap}
 select,button,input[type=date]{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font:inherit;font-size:13px}
 button{cursor:pointer;font-weight:600;transition:border-color .15s,background .15s}button:hover{border-color:var(--a)}
@@ -2426,45 +2436,47 @@ svg.grow rect{transform-box:fill-box;transform-origin:50% 100%;animation:grow .8
 .cmp td:nth-child(4){font-weight:600}
 ul{margin:0;padding-left:18px}li{margin:4px 0}
 
-@media (max-width:820px){.hero{grid-template-columns:1fr}.odo{font-size:48px}header.top,main{padding-left:16px;padding-right:16px}}
+@media (max-width:820px){.hero{grid-template-columns:1fr}.odo{font-size:48px}header.top,main,.topbar-in{padding-left:16px;padding-right:16px}.topbar .ctl{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;flex:1 1 100%}.topbar .ctl>*{flex:none}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style></head><body>
-<header class="top"><div><h1 data-i18n="title">Tokenometro</h1><p id="gen"></p><div id="alerts" class="chips" role="status" aria-live="polite"></div></div>
+<header class="top"><div><h1 data-i18n="title">Tokenometro</h1><p id="gen"></p><div id="alerts" class="chips" role="status" aria-live="polite"></div></div></header>
+<div class="topbar" id="topbar"><div class="topbar-in"><nav class="nav" id="nav" data-i18n-aria="nav_label" aria-label="Sections">
+<a href="#s-now" data-i18n="nav_now">Now</a><a href="#plancard" id="nav_plan" hidden data-i18n="nav_plan">Plan</a><a href="#s-summary" data-i18n="nav_summary">Summary</a><a href="#s-recs"><span data-i18n="nav_recs">Improvements</span><span class="n" id="nav_recs_n" hidden></span></a><a href="#s-daily" data-i18n="nav_daily">By day</a><a href="#s-ba" data-i18n="nav_ba">Before/after</a><a href="#s-breakdown" data-i18n="nav_breakdown">Breakdown</a><a href="#s-sessions" data-i18n="nav_sessions">Sessions</a></nav>
 <div class="ctl"><select id="days" data-i18n-aria="period" aria-label="Period"><option value="1" data-i18n="today">Today</option><option value="7" selected data-i18n="d7">7 days</option><option value="30" data-i18n="d30">30 days</option><option value="90" data-i18n="d90">90 days</option></select>
 <select id="client" data-i18n-aria="client" aria-label="Client"><option value="all" data-i18n="allclients">All clients</option></select>
 <select id="cur" data-i18n-aria="currency" aria-label="Currency"><option value="EUR">€</option><option value="USD">$</option></select>
 <select id="lang" data-i18n-aria="language" aria-label="Language"><option value="en">EN</option><option value="es">ES</option></select>
 <select id="theme" data-i18n-aria="theme" aria-label="Theme"><option value="system" data-i18n="th_system">Auto</option><option value="light" data-i18n="th_light">Light</option><option value="dark" data-i18n="th_dark">Dark</option></select>
-<button id="re" data-i18n="refresh">Refresh</button></div></header>
+<button id="re" data-i18n="refresh">Refresh</button></div></div></div>
 <main>
-<section class="hero">
+<section class="hero" id="s-now">
  <div class="meter"><p class="lbl" data-i18n="spent_today">Spent today, at API rates</p><div class="odo" id="odo" role="img"></div><p class="sub" id="todaysub"></p>
   <div class="spark" id="spark" data-i18n-aria="spark_aria" aria-label="Spend today by hour"></div><div class="spark-x"><span>0 h</span><span>6 h</span><span>12 h</span><span>18 h</span><span>23 h</span></div></div>
  <div class="now"><h2><span data-i18n="right_now">Right now</span> <span class="pulse" id="pulse" data-i18n-title="active_title" title="There are active sessions"></span></h2><p class="mut" id="livehint"></p><div id="live"></div></div>
 </section>
 <section class="card wide" id="plancard" hidden><h2><span data-i18n="your_plan">Your plan</span> <span class="badge" id="planage"></span></h2><div class="plan" id="plan"></div>
 <p class="mut" style="font-size:12px;margin:8px 0 0" data-i18n="plan_note"></p></section>
-<section class="card wide"><h2 data-i18n="summary">Period summary</h2><div class="kpis" id="kpis"></div>
+<section class="card wide" id="s-summary"><h2 data-i18n="summary">Period summary</h2><div class="kpis" id="kpis"></div>
 <p class="note"><span id="eqn"></span> <span data-i18n="eq_rest"></span></p></section>
-<section class="card wide"><h2><span data-i18n="recs_title">Recommended improvements</span> <span class="badge" data-i18n="recs_badge"></span></h2><div class="recs" id="recs"></div><div id="recs_more"></div>
+<section class="card wide" id="s-recs"><h2><span data-i18n="recs_title">Recommended improvements</span> <span class="badge" data-i18n="recs_badge"></span></h2><div class="recs" id="recs"></div><div id="recs_more"></div>
 <p class="mut" style="font-size:12px;margin:8px 0 0" data-i18n="recs_legend"></p></section>
-<section class="card wide"><h2 data-i18n="daily_title"></h2><div class="leg" id="leg"></div><div id="daily"></div>
+<section class="card wide" id="s-daily"><h2 data-i18n="daily_title"></h2><div class="leg" id="leg"></div><div id="daily"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="daily_note"></p></section>
-<section class="card wide"><h2><span data-i18n="before_after"></span> <input type="date" id="cut" data-i18n-aria="cut_label"></h2><div id="cmp"></div>
+<section class="card wide" id="s-ba"><h2><span data-i18n="before_after"></span> <input type="date" id="cut" data-i18n-aria="cut_label"></h2><div id="cmp"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="ba_note"></p></section>
-<section class="card"><h2 data-i18n="by_model"></h2><div id="models"></div></section>
+<section class="card" id="s-breakdown"><h2 data-i18n="by_model"></h2><div id="models"></div></section>
 <section class="card"><h2 data-i18n="by_client"></h2><div id="clients"></div>
 <div class="csv"><span class="mut" data-i18n="csv_hint"></span><span class="csvc"><input type="month" id="month" data-i18n-aria="month_label"><a class="btn" id="csv_s" data-i18n="csv_sessions"></a><a class="btn" id="csv_c" data-i18n="csv_clients"></a></span></div></section>
 <section class="card"><h2><span data-i18n="by_branch"></span> <span class="badge" data-i18n="branch_badge"></span></h2><div id="branches"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="branch_note"></p></section>
 <section class="card"><h2 data-i18n="fixed_title"></h2><div id="fixed"></div>
 <p class="mut" style="font-size:12px;margin:6px 0 0" data-i18n="fixed_note"></p></section>
-<section class="card wide"><h2><span data-i18n="costliest_sessions"></span> <span class="badge" data-i18n="sess_badge"></span></h2><div class="leg" id="sleg"></div><div id="sessions"></div></section>
+<section class="card wide" id="s-sessions"><h2><span data-i18n="costliest_sessions"></span> <span class="badge" data-i18n="sess_badge"></span></h2><div class="leg" id="sleg"></div><div id="sessions"></div></section>
 <section class="card wide"><h2 data-i18n="costliest_agents"></h2><div id="agents"></div></section>
 </main>
 <script>
 const I18N={
-en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',d90:'90 days',client:'Client',allclients:'All clients',others:'Others',currency:'Currency',language:'Language',theme:'Theme',th_system:'◐ Auto (system)',th_light:'☀ Light',th_dark:'☾ Dark',
+en:{title:'Tokenometro',nav_label:'Sections',nav_now:'Now',nav_plan:'Plan',nav_summary:'Summary',nav_recs:'Improvements',nav_daily:'By day',nav_ba:'Before/after',nav_breakdown:'Breakdown',nav_sessions:'Sessions',period:'Period',today:'Today',d7:'7 days',d30:'30 days',d90:'90 days',client:'Client',allclients:'All clients',others:'Others',currency:'Currency',language:'Language',theme:'Theme',th_system:'◐ Auto (system)',th_light:'☀ Light',th_dark:'☾ Dark',
  refresh:'Refresh',refreshing:'Refreshing…',spent_today:'Spent today, at API prices (equivalent cost)',spark_aria:'Spend today by hour',right_now:'Right now',active_title:'There are active sessions',
  your_plan:'Your plan',plan_note:'The % is calculated by Claude Code and includes what you use in claude.ai. The ceiling is an estimate: what you have spent here divided by the % used.',
  summary:'Period summary',eq_rest:'With a subscription (Pro, Max, Team…) you do not pay this amount, but it lets you compare periods and habits; with the API it is roughly your real bill.',
@@ -2494,7 +2506,7 @@ en:{title:'Tokenometro',period:'Period',today:'Today',d7:'7 days',d30:'30 days',
  evidence:'Evidence',what_to_do:'What to do',with_:'With',check:'Check',tradeoff_h:'Trade-off, calculation and confidence',tradeoff:'Trade-off',calc:'Calculation',confidence:'Confidence',nothing:'Nothing to recommend in this period.',nothing_yet:'Nothing proven yet: {n} under study, below.',study_h:'Under study ({n})',study_hint:'Found in your data but not proven yet. They move up on their own once they repeat on 3 days and save enough for you.',dismissed_h:'Dismissed ({n})',dismissed_hint:'Hidden by you. The ones with an amount come back on their own if it doubles.',dismiss:'Not for me',dismiss_tip:'Hide this card; it comes back if its cost doubles',restore:'Restore',
  cost_day:'Cost per day',cost_msg:'Cost per message',turns_msg:'Turns per message',avg_ctx:'Average context',change:'Change',short_warn:'Short sample: {n} day(s) per side. Inconclusive (it depends a lot on the type of task).',
  win_cap:'You have used <b>{c}</b> eq. ({tok} tokens) of the ≈<b>{cap}</b> this window seems to allow; ≈<b>{left}</b> left{now}.',win_now:' (≈{n} % if counted up to this minute)',win_nocap:'You have used <b>{c}</b> eq. ({tok} tokens) in this window. The allowance is only estimated once you pass 10 % of the plan.',period_sub:'{n} tokens in total',help_period:'Total equivalent cost of the selected period, and the tokens (pieces of text) processed.',help_msg:'Average cost of each message you send. A turn is one reply of the model; a message can trigger several.',help_sub:'Subagents are helper agents Claude launches on its own (searching, reviewing…). Their cost is part of the total.',help_cw:'Cache write: saving the conversation so it is cheap to resend. It is paid on a new session, after a compaction, when switching model and after a long pause.',help_over:'Context over {n}: when a conversation grows past that size, every reply resends the excess. A compaction is Claude summarising the chat to shrink it.',help_best:'Cheapest model that would have been enough given what the session did; the figure is the estimated saving.',help_went:'What most of the cost of this session went to.',help_compact:'Times Claude summarised the conversation because it was too long.',help_msgs:'Messages you sent in the session.',daily_note:'Cache read: resending the conversation from the cache (cheap per token). Cache write: saving new context (pricier). Uncached input: new text sent without caching. Output: what the model writes, including its reasoning (thinking).',odo_eur:'euros today',odo_usd:'dollars today',h_title:'{h} h: {v}'},
-es:{title:'Tokenómetro',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días',d90:'90 días',client:'Cliente',allclients:'Todos los clientes',others:'Otros',currency:'Moneda',language:'Idioma',theme:'Tema',th_system:'◐ Auto (sistema)',th_light:'☀ Claro',th_dark:'☾ Oscuro',
+es:{title:'Tokenómetro',nav_label:'Secciones',nav_now:'Ahora',nav_plan:'Plan',nav_summary:'Resumen',nav_recs:'Mejoras',nav_daily:'Por día',nav_ba:'Antes/después',nav_breakdown:'Desglose',nav_sessions:'Sesiones',period:'Periodo',today:'Hoy',d7:'7 días',d30:'30 días',d90:'90 días',client:'Cliente',allclients:'Todos los clientes',others:'Otros',currency:'Moneda',language:'Idioma',theme:'Tema',th_system:'◐ Auto (sistema)',th_light:'☀ Claro',th_dark:'☾ Oscuro',
  refresh:'Actualizar',refreshing:'Actualizando…',spent_today:'Gastado hoy, a precios de API (coste equivalente)',spark_aria:'Gasto de hoy por horas',right_now:'Ahora mismo',active_title:'Hay sesiones activas',
  your_plan:'Tu plan',plan_note:'El % lo calcula Claude Code e incluye lo que uses en claude.ai. El techo es una estimación: lo que llevas gastado dividido entre el % usado.',
  summary:'Resumen del periodo',eq_rest:'Con suscripción (Pro, Max, Team…) no pagas esta cantidad, pero sirve para comparar periodos y hábitos; con la API es, aproximadamente, tu factura real.',
@@ -2585,7 +2597,7 @@ function gauges(el,live,L){if(!live.length){el.innerHTML='<p class="empty">'+t('
 let FIRST=true,PREV={},RECS=[];
 const hm=m=>m<60?m+' min':m<1440?Math.floor(m/60)+' h '+(m%60)+' min':Math.floor(m/1440)+' d '+Math.floor(m%1440/60)+' h';
 const roll=w=>'<div class="pl"><div class="gh"><b>'+(w.kind=='five_hour'?t('last5h'):t('last7d'))+'</b><span class="v">'+usd(w.cost)+'</span></div><div class="gm">'+t('plan_nopct',{n:tok(w.tokens)})+'</div></div>';
-function plan(p){const c=$('plancard');c.hidden=!p;if(!p)return;
+function plan(p){const c=$('plancard');c.hidden=!p;$('nav_plan').hidden=!p;if(!p)return;
  if(!p.source){$('planage').textContent=t('plan_nolecture');$('plan').innerHTML=p.windows.map(roll).join('');return}
  $('planage').textContent=t('plan_src',{src:p.source,at:p.at})+(p.age_min>5?t('plan_ago',{t:hm(p.age_min)}):'');
  $('plan').innerHTML=p.windows.map(w=>{if(w.pct==null)return roll(w);const n=w.kind=='five_hour'?t('five_h'):t('week'),lv=w.pct>=90?' red':w.pct>=75?' amb':'';
@@ -2680,6 +2692,7 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
  const fm=v=>v==null?'-':(Math.round(v*10)/10).toLocaleString(LOC());
  RECS=r.recs;const FILE=(r.recs_file||'').replace(/^\/home\/[^/]+/,'~');
  const SH=r.recs.filter(x=>x.stage!='study'&&x.stage!='dismissed'),ST=r.recs.filter(x=>x.stage=='study'),DM=r.recs.filter(x=>x.stage=='dismissed');
+ const npend=SH.filter(x=>x.status=='todo'||x.status=='warn').length;$('nav_recs_n').textContent=npend;$('nav_recs_n').hidden=!npend;
  $('recs').innerHTML=SH.map(x=>{const ix=r.recs.indexOf(x);const sig=x.status+'|'+Math.round(x.impact||0)+'|'+x.metric;const chg=PREV[x.id]!=null&&PREV[x.id]!=sig;PREV[x.id]=sig;
   const pend=x.status=='todo'||x.status=='warn';const short=x.sample_days!=null&&x.sample_days<7&&x.status!='todo';
   const hist=(x.hist||[]).map(e=>'<i class="h-'+e.s+'" title="'+dm(e.d)+' · '+stl[e.s]+'"></i>').join('');
@@ -2715,6 +2728,15 @@ $('lang').onchange=()=>{LANGSEL=$('lang').value;LANG=LANGSEL;try{localStorage.se
 applyI18n();
 {const d=new Date();$('month').value=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');$('month').max=$('month').value;$('month').onchange=csvLinks}
 fetch('/api/clients').then(r=>r.json()).then(cs=>cs.forEach(c=>$('client').insertAdjacentHTML('beforeend','<option value="'+esc(c)+'">'+esc(c)+'</option>'))).catch(()=>{}).then(()=>{applyI18n();load()});
+// sticky bar: shadow line once it sticks, and the section you are reading marked in it
+{const bar=$('topbar'),links=[...document.querySelectorAll('#nav a')];let tick=0;
+ const mark=()=>{tick=0;const h=bar.offsetHeight;document.documentElement.style.setProperty('--barh',h+'px');
+  bar.classList.toggle('stuck',bar.getBoundingClientRect().top<=0&&scrollY>0);
+  let cur=links[0];for(const a of links){const s=a.hidden?null:document.querySelector(a.getAttribute('href'));if(s&&!s.hidden&&s.getBoundingClientRect().top<=h+40)cur=a}
+  if(innerHeight+scrollY>=document.documentElement.scrollHeight-4)cur=links.filter(a=>!a.hidden).pop();
+  links.forEach(a=>a===cur?a.setAttribute('aria-current','true'):a.removeAttribute('aria-current'));
+  if(cur){const n=$('nav'),l=cur.offsetLeft-n.offsetLeft;if(l<n.scrollLeft||l+cur.offsetWidth>n.scrollLeft+n.clientWidth)n.scrollLeft=l-16}};
+ const ask=()=>{if(!tick)tick=requestAnimationFrame(mark)};addEventListener('scroll',ask,{passive:true});addEventListener('resize',ask);mark()}
 // the minute refresh waits while you have a session open or are moving through a table with the keyboard
 setInterval(()=>{const a=document.activeElement;if(!document.querySelector('tr.det')&&!(a&&a.closest&&a.closest('table,.pager')))load()},60000);
 </script></body></html>"""
