@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenometro"
-version = "0.6.0"
+version = "0.7.0"
 description = "Local dashboard of what your Claude Code sessions cost and what to change to spend less"
 readme = "README.md"
 license = {text = "MIT"}
