@@ -570,8 +570,8 @@ def _cell(v):
     return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
 
 
-def report(month, by="session", client=ALL):
-    """CSV for one month (YYYY-MM), by session or by client, in USD and in the selected currency."""
+def report(month, by="session", client=ALL, as_json=False):
+    """CSV (or JSON) for one month (YYYY-MM), by session or by client, in USD and in the selected currency."""
     import csv
     import io
     con = connect()
@@ -599,6 +599,18 @@ def report(month, by="session", client=ALL):
         con.close()
     rate = _currency_cfg()[0]
     eur = currency()["code"] == "EUR" and rate > 0
+    if as_json:
+        for r in rows:
+            r["client"] = tr("others", "otros") if r["client"] == OTHERS else r["client"]
+            if "project" in r:
+                r["project"] = short_path(r["project"])
+            r["cost_usd"] = round(r.pop("cost") or 0, 4)
+            if eur:
+                r["cost_eur"] = round(r["cost_usd"] * rate, 4)
+            for k in ("input", "cache_write", "cache_read", "output"):
+                r[k + "_tokens"] = r.pop(k)
+        return json.dumps({"month": month, "by": by, "client": None if client == ALL else client, "rows": rows},
+                          ensure_ascii=False, indent=2) + "\n"
     out = io.StringIO()
     wr = csv.writer(out)
     wr.writerow(head + ["input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens", "cost_usd"]
@@ -1703,8 +1715,8 @@ def digest_path(monday):
     return os.path.join(REPORTS, f"tokenometro-{name}-{y}-W{wk:02d}.md")
 
 
-def digest(monday):
-    """Weekly summary (Monday to Sunday) as Markdown: spend against the week before, where it went, what changed."""
+def digest(monday, as_json=False):
+    """Weekly summary (Monday to Sunday) as Markdown, or JSON: spend against the week before, where it went, what changed."""
     sun, prev = monday + timedelta(days=6), monday - timedelta(days=7)
     con = connect()
     try:
@@ -1724,6 +1736,20 @@ def digest(monday):
         models = q(con, f"SELECT model, SUM({C}) cost FROM msgs WHERE {w} GROUP BY model", a)
     finally:
         con.close()
+    changed = [(rid, v) for rid, v in st.items() if v.get("after") and v.get("after") != v.get("before")]
+    miss = unpriced(models, prices)
+    if as_json:
+        return json.dumps({
+            "week": monday.isocalendar()[1], "from": monday.isoformat(), "to": sun.isoformat(),
+            "cost_usd": round(now_["c"], 4), "sessions": now_["s"],
+            "previous_cost_usd": round(before["c"], 4), "previous_sessions": before["s"],
+            "top_sessions": [{"session": r["session"], "title": r["title"], "project": short_path(r["project"] or ""),
+                              "cost_usd": round(r["cost"] or 0, 4)} for r in top],
+            "branches": [{"branch": r["branch"], "task": r["task"], "repos": r["repos"], "cost_usd": round(r["cost"] or 0, 4)} for r in br],
+            "fixed_cost": {"tokens": fx["base"], "cost_usd": round(fx["cost"], 4), "share_pct": round(fx["share"], 1)} if fx["measured"] else None,
+            "recommendations_changed": [{"id": rid, "before": v.get("before"), "after": v["after"]} for rid, v in changed],
+            "unpriced_models": [m["model"] for m in miss],
+        }, ensure_ascii=False, indent=2) + "\n"
     diff = now_["c"] - before["c"]
     pct = f" ({'+' if diff >= 0 else ''}{100 * diff / before['c']:.0f}%)" if before["c"] else ""
     names = {"todo": tr("pending", "pendiente"), "warn": tr("applied, review", "aplicada, revisar"),
@@ -1742,11 +1768,9 @@ def digest(monday):
         L += [tr("## Fixed cost per session", "## Coste fijo por sesión"), "",
               tr(f"~{fmt_tok(fx['base'])} tokens before the conversation starts: {money(fx['cost'], 2)} ({fx['share']:.0f}% of the week).",
                  f"~{fmt_tok(fx['base'])} tokens antes de empezar la conversación: {money(fx['cost'], 2)} ({fx['share']:.0f}% de la semana)."), ""]
-    changed = [(rid, v) for rid, v in st.items() if v.get("after") and v.get("after") != v.get("before")]
     if changed:
         L += [tr("## Recommendations that changed", "## Recomendaciones que cambiaron"), ""]
         L += [f"- {rid}: {names.get(v.get('before'), '-')} → {names.get(v['after'], v['after'])}" for rid, v in changed] + [""]
-    miss = unpriced(models, prices)
     if miss:
         L += [tr("## Models without a price", "## Modelos sin precio"), ""]
         L += [tr(f"- {m['model']}: valued at _default; add it to prices.json.", f"- {m['model']}: valorado a _default; añádelo a prices.json.")
@@ -3004,7 +3028,7 @@ def main():
                            f"{m['model']} no está en prices.json: se valora al precio de _default."))
         return
     if cmd == "report":
-        # tracker.py report [YYYY-MM] [--by client] [--client NAME] [--cur EUR]
+        # tracker.py report [YYYY-MM] [--by client] [--client NAME] [--cur EUR] [--json]
         args = sys.argv[2:]
         opt = lambda k, d: args[args.index(k) + 1] if k in args and args.index(k) + 1 < len(args) else d
         month = next((x for x in args if re.fullmatch(r"[0-9]{4}-[0-9]{2}", x)), datetime.now().strftime("%Y-%m"))
@@ -3012,16 +3036,16 @@ def main():
         set_currency(opt("--cur", "").upper())
         ingest()
         sys.stdout.flush()
-        sys.stdout.buffer.write(report(month, opt("--by", "session"), opt("--client", ALL)).encode("utf-8"))  # bytes: no \r\r\n on Windows
+        sys.stdout.buffer.write(report(month, opt("--by", "session"), opt("--client", ALL), "--json" in args).encode("utf-8"))  # bytes: no \r\r\n on Windows
         return
     if cmd == "digest":
-        # tracker.py digest [YYYY-MM-DD]: the week (Monday to Sunday) holding that day; last week by default
+        # tracker.py digest [YYYY-MM-DD] [--json]: the week (Monday to Sunday) holding that day; last week by default
         set_lang(LANG_DEFAULT)
         ingest()
         day = next((x for x in sys.argv[2:] if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", x)), None)
         d = date.fromisoformat(day) if day else date.today() - timedelta(days=7)
         sys.stdout.flush()
-        sys.stdout.buffer.write(digest(d - timedelta(days=d.weekday())).encode("utf-8"))
+        sys.stdout.buffer.write(digest(d - timedelta(days=d.weekday()), "--json" in sys.argv[2:]).encode("utf-8"))
         return
     if cmd == "backfill":
         t0 = time.time()

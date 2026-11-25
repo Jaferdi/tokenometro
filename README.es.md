@@ -212,7 +212,7 @@ python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur E
 python3 ~/.local/share/tokenometro/tracker.py digest 2026-11-17   # resumen de la semana que contiene ese día
 ```
 
-`report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE` y `--cur USD|EUR`. El mismo CSV está en el panel, en la tarjeta *Por cliente*. `digest` imprime el resumen en Markdown de una semana (de lunes a domingo; por defecto la pasada). El servidor también escribe solo el de la semana pasada, una vez, como `~/.claude/reports/tokenometro-semana-AAAA-Www.md` (`tokenometro-week-…` en inglés).
+`report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE`, `--cur USD|EUR` y `--json` (las mismas filas en JSON, para scripts). El mismo CSV está en el panel, en la tarjeta *Por cliente*. `digest` imprime el resumen en Markdown de una semana (de lunes a domingo; por defecto la pasada), o en JSON con `--json`. El servidor también escribe solo el de la semana pasada, una vez, como `~/.claude/reports/tokenometro-semana-AAAA-Www.md` (`tokenometro-week-…` en inglés).
 
 Reiniciar el servidor (solo lo para si es Tokenometro):
 
