@@ -9,7 +9,7 @@
   <a href="LICENSE"><img alt="Licencia MIT" src="https://img.shields.io/badge/licencia-MIT-3B55CF"></a>
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-0A7A67">
   <img alt="Sin dependencias" src="https://img.shields.io/badge/dependencias-ninguna-8A5C00">
-  <img alt="Linux, macOS y WSL" src="https://img.shields.io/badge/funciona%20en-Linux%20%C2%B7%20macOS%20%C2%B7%20WSL-6D49D6">
+  <img alt="Linux, macOS, WSL y Windows" src="https://img.shields.io/badge/funciona%20en-Linux%20%C2%B7%20macOS%20%C2%B7%20WSL%20%C2%B7%20Windows-6D49D6">
   <br><a href="README.md">Read in English</a>
 </p>
 
@@ -34,6 +34,7 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
 | **Tu plan** | % de la ventana de 5 horas y de la semana, cuándo se reinician, el tope estimado en € o $ y si al ritmo actual lo agotarás antes de que se reinicie. |
 | **Mejoras recomendadas** | Tarjetas hechas con *tus* datos y *tu* `settings.json`: qué cambiar, cuánto pesa, cómo comprobar que ha funcionado y un prompt listo para pegarle a Claude. |
 | **Sesiones** | Coste de cada sesión separado en entrada, salida, lecturas y escrituras de caché; el modelo más barato que habría bastado; tramos entre compactaciones, subagentes y las llamadas a herramientas más gordas. |
+| **Informes** | Un CSV mensual por sesión o por cliente, para compartirlo o repercutirlo a un cliente, desde el panel o por consola. |
 | **Antes / después** | Elige la fecha de un cambio (un ajuste nuevo, una costumbre nueva) y compara el coste por mensaje, el contexto y las compactaciones a cada lado. |
 
 <table>
@@ -53,7 +54,40 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
   </tr>
 </table>
 
+Arriba eliges periodo, cliente, moneda (€ o $), idioma (inglés o castellano) y tema. Pulsa una sesión para ver su detalle.
+
 > Sin relación con Anthropic. Claude y Claude Code son marcas de Anthropic.
+
+## Instalación
+
+Necesita Python 3.8 o superior y nada más. Linux, macOS, WSL o Windows.
+
+**Como plugin de Claude Code** (cualquier sistema), dentro de Claude Code:
+
+```
+/plugin marketplace add Jaferdi/tokenometro
+/plugin install tokenometro@tokenometro
+```
+
+El plugin levanta el panel en cada sesión y mantiene su código al día en la carpeta de datos. Los plugins no pueden poner la statusLine, así que para ver el % del plan añádela tú (ver [Uso del plan](#uso-del-plan-5-horas-y-semana)).
+
+**Con el instalador**:
+
+```bash
+git clone https://github.com/Jaferdi/tokenometro.git && cd tokenometro
+python3 install.py               # instala, registra el arranque automático y lo levanta (en Windows: py install.py)
+python3 install.py --statusline  # además usa statusline.py para ver el % del plan
+```
+
+`bash install.sh` sigue funcionando y hace lo mismo. El instalador:
+
+1. Copia los ficheros a `~/.local/share/tokenometro` (en Windows, `%LOCALAPPDATA%\tokenometro`).
+2. Añade en `~/.claude/settings.json` un hook `SessionStart` que levanta el panel al abrir Claude Code. Antes guarda una copia: `settings.json.bak-tokenometro-<fecha>`.
+3. Lee el histórico (la primera vez tarda un poco) y abre el servidor en http://127.0.0.1:7878.
+
+Si ya tenías la versión anterior en `~/.local/share/claude-tokens`, copia datos y configuración y cambia el hook.
+
+Para quitarlo: `python3 ~/.local/share/tokenometro/install.py --uninstall` (quita el hook y la statusLine propia; los datos se quedan hasta que borres la carpeta).
 
 ## Privacidad
 
@@ -62,39 +96,7 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
 - No se conecta a internet ni envía nada. Todo queda en `~/.local/share/tokenometro/usage.db` (SQLite).
 - En «Llamadas más gordas» enmascara lo que parezca un secreto, pero el panel muestra trozos de tus comandos y rutas: no lo compartas en capturas sin mirarlo.
 
-## Requisitos
-
-Python 3.8 o superior, sin dependencias. Linux, WSL o macOS.
-
-## Instalación
-
-```bash
-git clone https://github.com/Jaferdi/tokenometro.git && cd tokenometro
-bash install.sh               # instala, registra el arranque automático y lo levanta
-bash install.sh --statusline  # además usa statusline.py para ver el % del plan
-```
-
-El instalador:
-
-1. Copia los ficheros a `~/.local/share/tokenometro`.
-2. Añade en `~/.claude/settings.json` un hook `SessionStart` que levanta el panel al abrir Claude Code. Antes guarda una copia: `settings.json.bak-tokenometro-<fecha>`.
-3. Lee el histórico (la primera vez tarda un poco) y abre el servidor en http://127.0.0.1:7878.
-
-Si ya tenías la versión anterior en `~/.local/share/claude-tokens`, copia datos y configuración y cambia el hook.
-
-Para quitarlo: `bash ~/.local/share/tokenometro/install.sh --uninstall` (quita el hook y la statusLine propia; los datos se quedan hasta que borres la carpeta).
-
-## Qué enseña el panel
-
-- **Hoy y ahora mismo**: gasto del día (odómetro), sesiones abiertas con su contexto, coste acumulado, compactaciones y, si hay lectura del plan, qué parte del 5 h y de la semana se ha llevado cada una.
-- **Plan**: % usado de la ventana de 5 horas y de la semana, cuándo se reinicia y un techo estimado en € o $ equivalentes (ver más abajo).
-- **Mejoras recomendadas**: tarjetas con lo que conviene cambiar, cuánto pesa y cómo comprobarlo.
-- **Sesiones**: coste por sesión desglosado (entrada, salida, lectura y escritura de caché), el modelo más rentable para cada una, dónde se fue el gasto y la herramienta que más texto metió. Pulsando una fila sale el detalle: tramos entre compactaciones, subagentes y llamadas más gordas.
-- **Por modelo y por cliente**, y **Antes / después** de una fecha para medir si un cambio de configuración sirvió.
-
-Arriba se elige periodo, cliente, moneda (€ o $), idioma (inglés o castellano) y tema (sistema, claro u oscuro). Las tablas van paginadas.
-
-### «€ eq.» / «$ eq.»
+## Qué significa «€ eq.»
 
 Es lo que costarían esos tokens a tarifa API (`prices.json`). Con suscripción no pagas eso, pero sirve para comparar sesiones y ver qué pesa. Con API es, aproximadamente, tu factura: no se modelan el modo rápido (cuesta el doble), Batch ni Haiku 5.5 por encima de 100K tokens de prompt. En Bedrock, Vertex o Foundry cada proveedor pone su precio: ajusta `prices.json`. Los cálculos se hacen en dólares, que es la tarifa oficial, y se pasan a euros al mostrarlos con el cambio de `prices.json`.
 
@@ -131,7 +133,7 @@ Las ediciones de documentación (`.md`, `.json`, `.yaml`…) no cuentan como có
 El % del plan solo existe con suscripción (Pro, Max, Team…): con API no hay límites de 5 horas ni semanales y esta parte enseña solo lo gastado. El % no está en los registros. Claude Code lo recibe de Anthropic y solo se lo pasa a la statusLine y a los plugins. El tokenómetro lo toma de:
 
 1. **El plugin sub-meter**, si lo tienes: guarda su última lectura en `~/.claude/plugins/store/sub-meter_*.json`.
-2. **`statusline.py`**, incluido aquí: lee el JSON que Claude Code manda a la statusLine (`rate_limits`) y lo deja en `~/.local/share/tokenometro/plan.json`. Se activa con `install.sh --statusline`. Si ya tienes otra statusLine, encadénala:
+2. **`statusline.py`**, incluido aquí: lee el JSON que Claude Code manda a la statusLine (`rate_limits`) y lo deja en `~/.local/share/tokenometro/plan.json`. Se activa con `install.py --statusline`, o a mano en `~/.claude/settings.json`: `"statusLine": {"type": "command", "command": "python3 \"$HOME/.local/share/tokenometro/statusline.py\""}`. Si ya tienes otra statusLine, encadénala:
 
    ```
    python3 "$HOME/.local/share/tokenometro/statusline.py" --tee | <tu comando actual>
@@ -175,7 +177,7 @@ El tipo de cambio se actualiza a mano: el tokenómetro no se conecta a nada. Si 
 | `TOKENOMETRO_CUT` | Fecha de corte de «Antes / después» | la de `clients.json` o hace 7 días |
 | `TOKENOMETRO_CURRENCY` | `EUR` o `USD` por defecto | la de `prices.json` |
 | `TOKENOMETRO_LANG` | `en` o `es` por defecto | `en` |
-| `TOKENOMETRO_NO_START` | `1` para que `install.sh` no lo arranque | |
+| `TOKENOMETRO_NO_START` | `1` para que el instalador no lo arranque | |
 
 Siguen valiendo los nombres antiguos `CLAUDE_TOKENS_*`.
 
@@ -185,23 +187,34 @@ Siguen valiendo los nombres antiguos `CLAUDE_TOKENS_*`.
 python3 ~/.local/share/tokenometro/tracker.py            # servidor (lo que hace el hook)
 python3 ~/.local/share/tokenometro/tracker.py ingest     # lee lo nuevo y saca un resumen
 python3 ~/.local/share/tokenometro/tracker.py backfill   # rellena datos de herramientas del histórico (una vez)
+python3 ~/.local/share/tokenometro/tracker.py report 2026-11 --by client --cur EUR   # CSV mensual por la salida estándar
 ```
 
-Reiniciar el servidor (mata solo el proceso que escucha en el puerto):
+`report` admite `[AAAA-MM]` (por defecto el mes actual), `--by session|client`, `--client NOMBRE` y `--cur USD|EUR`. El mismo CSV está en el panel, en la tarjeta *Por cliente*.
+
+Reiniciar el servidor (solo lo para si es Tokenometro):
 
 ```bash
-kill $(ss -ltnpH 'sport = :7878' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-~/.local/share/tokenometro/start.sh
+python3 ~/.local/share/tokenometro/start.py --restart
 ```
+
+## Si algo falla
+
+- **El panel no abre.** Se levanta con cada sesión de Claude Code; para levantarlo a mano: `python3 ~/.local/share/tokenometro/start.py`. Si sigue sin responder, mira `tracker.log` en la misma carpeta. Si otro programa usa el puerto 7878, define `TOKENOMETRO_PORT` y vuelve a instalar.
+- **No sale «Tu plan».** Necesita una lectura del uso del plan: activa `statusline.py` (ver [Uso del plan](#uso-del-plan-5-horas-y-semana)) y manda un mensaje en Claude Code.
+- **«N modelo(s) sin precio».** Hay un modelo en tus logs que no está en `prices.json` y se valora a `_default`. Añádelo a `prices.json` y reinicia.
+- **Las cifras no cuadran con mi factura.** Con suscripción pagas el plan, no estos importes; con la API, mira [qué significa «€ eq.»](#qué-significa--eq).
+- **He editado `clients.json` o `prices.json` y no cambia nada.** Reinicia: `python3 ~/.local/share/tokenometro/start.py --restart`.
 
 ## Ficheros
 
 | Fichero | Qué es |
 |---|---|
 | `tracker.py` | Lector, base de datos, reglas y panel (HTML incluido) |
-| `start.sh` | Lo levanta en segundo plano si no está ya corriendo |
+| `start.py` | Lo levanta en segundo plano si no está ya corriendo (`start.sh` lo llama) |
 | `statusline.py` | statusLine opcional que guarda el % del plan |
-| `install.sh` | Instalar, actualizar y desinstalar |
+| `install.py` | Instalar, actualizar y desinstalar (`install.sh` lo llama) |
+| `.claude-plugin/`, `hooks/` | Plugin de Claude Code |
 | `demo.py` | Probarlo con datos inventados, sin instalar nada |
 | `usage.db` | Datos (se regenera desde los registros si lo borras) |
 | `plan.json` | Última lectura del plan de `statusline.py` |

@@ -52,7 +52,8 @@ def main():
         sys.stdout.write(raw)
         return
     names = {"five_hour": "5h", "seven_day": "week"}
-    print("  ".join(f"{names[x['kind']]} {float(x['percentUsed']):.0f}%" for x in limits))
+    parts = [f"{names[x['kind']]} {float(x['percentUsed']):.0f}%" for x in limits]
+    print("  ".join(parts))
 
 
 if __name__ == "__main__":
