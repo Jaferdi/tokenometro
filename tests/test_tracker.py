@@ -191,7 +191,8 @@ def turn(sid, mid, cwd="/work/front", branch=None, ctx=40_000, minutes_ago=0, to
     d = json.loads(record(sid, now_ts(minutes_ago), mid, inp=ctx, cwd=cwd))
     if branch:
         d["gitBranch"] = branch
-    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": {}} for i, n in enumerate(tools)]
+    tools = [x if isinstance(x, tuple) else (x, {}) for x in tools]
+    d["message"]["content"] = [{"type": "tool_use", "id": f"{mid}_{i}", "name": n, "input": inp} for i, (n, inp) in enumerate(tools)]
     return json.dumps(d)
 
 
@@ -276,6 +277,53 @@ class BranchAndFixedCostTest(Base):
         self.assertEqual(set(rows), {"7067", "main"})
         self.assertEqual(rows["7067"]["repos"], ["back", "front"])
         self.assertEqual(rows["7067"]["sessions"], 2)
+
+    def test_branch_comes_from_git_commands_outside_a_repo(self):
+        f = self.t.branches_from_commands
+        self.assertEqual(f(["cd /w/front && git fetch -q && git switch -c feature/7118 origin/develop"]), ("feature/7118", {"front"}))
+        self.assertEqual(f(["git -C api-docs switch -q -c feature/7067 origin/develop --no-track"]), ("feature/7067", {"api-docs"}))
+        self.assertEqual(f(["git push -u origin HEAD:feature/7174"])[0], "feature/7174")
+        self.assertEqual(f(["git branch -m feature/7144 feature/7174"])[0], "feature/7174")
+        self.assertEqual(f(["git show origin/feature/7067:a.txt", "git switch develop", "git checkout -- a.py"]), (None, set()))
+        self.assertEqual(f(["git push -u origin", "git checkout -q package-lock.json", "git checkout 29683599d7",
+                            "git checkout --theirs apps/web/src/routes.ts", "git checkout src/app.ts"]), (None, set()))
+        self.assertEqual(f(["git checkout feature/7067"])[0], "feature/7067")
+        self.assertEqual(f(["git checkout feature/7067", "git checkout -b fix-login"])[0], "fix-login")
+        self.assertEqual(f(["git checkout apps/web/src", "git checkout docker/Dockerfile", "git push origin v1.2.0",
+                            'git commit -m "fix: git checkout feature/old"', "git push origin refs/tags/v2"]), (None, set()))
+        self.assertEqual(f(["git checkout -qb feature/7067"])[0], "feature/7067")
+        self.assertEqual(f(["git switch -t origin/feature/7067"])[0], "feature/7067")
+        self.assertEqual(f(["git worktree add -b feature/12 ../wt origin/develop"])[0], "feature/12")
+        self.assertEqual(f(["git switch -c feature/1", "git push origin feature/2"])[0], "feature/1")
+        self.assertEqual(f(['cd "../my repo" && git switch -c feature/7', "cd .. && git switch feature/7"]),
+                         ("feature/7", {"my repo"}))
+        self.assertEqual(f(["git switch -c feature/8"]), ("feature/8", set()))
+        self.assertEqual(f(["git switch feature/1", "git push origin feature/2", "git push origin feature/2"])[0], "feature/2")
+
+    def test_sessions_outside_a_repo_join_their_task(self):
+        bash = lambda c: ("Bash", {"command": c})
+        self.write("a.jsonl", [turn("s1", "m1", "/work/front", "feature/7067"),
+                               turn("s2", "m2", "/work", tools=[bash("cd /work/back && git switch -c feature/7067 origin/develop")]),
+                               turn("s3", "m3", "/work", tools=[bash("git -C /work/x push origin feature/9001")]),
+                               turn("s4", "m4", "/work", tools=[bash("git status")])])
+        self.t.ingest()
+        rows = {r["task"] or r["branch"]: r for r in self.t.data(7, self.t.ALL)["branches"]}
+        self.assertEqual(set(rows), {"7067", "9001"})
+        self.assertEqual(rows["7067"]["repos"], ["back", "front"])
+        self.assertEqual(rows["7067"]["sessions"], 2)
+        self.assertEqual(rows["9001"]["repos"], ["x"])
+
+    def test_a_session_with_a_logged_branch_is_not_counted_twice(self):
+        bash = lambda c: ("Bash", {"command": c})
+        self.write("a.jsonl", [turn("s1", "m1", "/work", tools=[bash("git switch -c feature/500 origin/develop")]),
+                               turn("s1", "m2", "/work/front", "feature/600")])
+        self.t.ingest()
+        self.assertEqual([r["task"] for r in self.t.data(7, self.t.ALL)["branches"]], ["600"])
+
+    def test_git_commands_keep_a_longer_head(self):
+        cmd = "cd /" + "a" * 200 + "/repo && git fetch -q && git switch -c feature/7118 origin/develop"
+        self.assertIn("feature/7118", self.t.input_head("Bash", {"command": cmd}))
+        self.assertEqual(len(self.t.input_head("Bash", {"command": "echo " + "x" * 300})), 160)
 
     def test_fixed_cost_parts_ignore_subagents_and_deferred_tools(self):
         self.write("s1.jsonl", [shape("s1", mcp="docs", deferred=3), turn("s1", "m1")])

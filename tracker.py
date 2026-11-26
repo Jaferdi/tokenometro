@@ -269,10 +269,12 @@ def input_head(name, inp):
             break
     if v is None:
         v = next((x for x in inp.values() if isinstance(x, str)), "")
-    v = " ".join(v.split())[:200]
+    # git commands keep more: the branch tends to come after a long cd and is needed for "By branch / task"
+    lim = 400 if name == "Bash" and "git " in v else 160
+    v = " ".join(v[:8000].split())[:4000]  # mask before cutting at lim, or a token cut short could escape the mask
     for rx, sub in _SECRET:
         v = rx.sub(sub, v)
-    return v[:160]
+    return v[:lim]
 
 
 def _text_len(content):
@@ -972,12 +974,79 @@ def task_of(branch):
     return (m.group(1) or m.group(2)) if m else None
 
 
+_BR = r"[^\s;&|)'\"]+"
+_GIT_BRANCH = re.compile(
+    r"(?:^|[;&|(\n]\s*)git\s+(?:-C\s+(?P<dir>\S+)\s+)?(?:"
+    r"(?:switch|checkout)(?:\s+-[qfm]+|\s+--(?:quiet|force|merge|no-track|track)\b)*\s+-[qf]*[cCbB]\s+(?P<new>" + _BR + ")"
+    r"|switch(?:\s+-[qfm]+|\s+--[\w-]+)*\s+(?:-t\s+)?(?:origin/)?(?P<sw>" + _BR + ")"
+    r"|checkout(?:\s+-[qf]+)*\s+(?:-t\s+|--track\s+)?(?:origin/)?"
+    r"(?P<co>(?:feature|feat|fix|bugfix|hotfix|release|task|chore|refactor|docs|test)/" + _BR + ")"
+    r"|worktree\s+add\s+(?:-\S+\s+)*?-[bB]\s+(?P<wt>" + _BR + ")"
+    r"|branch\s+-[mM]\s+\S+\s+(?P<mv>" + _BR + ")"
+    r"|push(?:\s+-\S+)*\s+\w[\w.-]*\s+(?:HEAD:)?(?P<push>" + _BR + "))")
+# creating or renaming a branch says more about the session's work than switching to one, and that more than a push
+_BRANCH_WEIGHT = {"new": 3, "wt": 3, "mv": 3, "sw": 2, "co": 2, "push": 1}
+_CD = re.compile(r"(?:^|[;&|(\n]\s*)cd\s+(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)")
+_DEFAULT_BRANCHES = {"main", "master", "develop", "development", "trunk", "HEAD"}
+
+
+def _not_a_branch(b):
+    return (b.startswith(("-", "origin/", "refs/tags/")) or b in _DEFAULT_BRANCHES or not re.fullmatch(r"[\w./-]+", b)
+            or re.fullmatch(r"[0-9a-f]{7,40}", b) or re.search(r"\.[A-Za-z]{1,5}$", b)
+            or re.fullmatch(r"v?\d+(?:\.\d+)+(?:[-.][\w.]+)?", b))
+
+
+def _repo_name(path):
+    path = (path or "").strip("'\"").rstrip("/\\")
+    name = os.path.basename(path)
+    return None if not name or path.startswith(("$", "-")) or name in (".", "..", "~") else name
+
+
+def branches_from_commands(cmds):
+    """Branch a session worked on when it ran outside a git repo (a folder holding several repos): the one it
+    created, renamed to, switched to or pushed, by that weight, and the latest on a tie. Default branches are not work."""
+    seen, repos = {}, {}
+    for i, cmd in enumerate(cmds):
+        for m in _GIT_BRANCH.finditer(cmd or ""):
+            kind = next(k for k in _BRANCH_WEIGHT if m.group(k))
+            b = m.group(kind)
+            b = b[len("refs/heads/"):] if b.startswith("refs/heads/") else b
+            if _not_a_branch(b):
+                continue
+            n, _ = seen.get(b, (0, 0))
+            seen[b] = (n + _BRANCH_WEIGHT[kind], i)
+            cd = _CD.findall(cmd[:m.start()])
+            repo = _repo_name(m.group("dir") or (cd[-1] if cd else ""))
+            if repo:
+                repos.setdefault(b, set()).add(repo)
+    if not seen:
+        return None, set()
+    b = max(seen, key=lambda k: seen[k])
+    return b, repos.get(b, set())
+
+
 def branches(con, w, a, C):
     """Cost by git branch: whoever works with tickets in branch names sees tasks; everyone else, branches.
-    Sessions outside a git repo have no branch and are left out (they still count everywhere else)."""
+    Sessions outside a git repo take the branch from the git commands they ran; with none, they are left out
+    (they still count everywhere else)."""
     raw = q(con, f"""SELECT branch, project, client, SUM({C}) cost, GROUP_CONCAT(DISTINCT session) sids,
         MIN(day) first, MAX(day) last FROM msgs WHERE branch IS NOT NULL AND branch NOT IN ('', 'HEAD') AND {w}
         GROUP BY branch, project, client""", a)
+    loose = q(con, f"""SELECT session, MIN(project) project, MIN(client) client, SUM({C}) cost, MIN(day) first,
+        MAX(day) last FROM msgs WHERE (branch IS NULL OR branch IN ('', 'HEAD')) AND {w} AND session NOT IN
+        (SELECT session FROM msgs WHERE branch IS NOT NULL AND branch NOT IN ('', 'HEAD')) GROUP BY session""", a)
+    if loose:
+        ids = [r["session"] for r in loose]
+        cmds = {}
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            for s, h in con.execute(f"""SELECT session, input_head FROM tools WHERE name='Bash' AND input_head LIKE '%git %'
+                    AND session IN ({",".join("?" * len(part))}) ORDER BY rowid""", part):
+                cmds.setdefault(s, []).append(h)
+        for r in loose:
+            b, repos = branches_from_commands(cmds.get(r["session"], []))
+            if b:
+                raw.append({**r, "branch": b, "sids": r["session"], "repos": repos})
     # a ticket spans repos (front, back...) and is one line; other branches are grouped by name, listing their repos
     out = {}
     for r in raw:
@@ -986,7 +1055,7 @@ def branches(con, w, a, C):
         g = out.setdefault(("t", task) if task else ("b", r["branch"]),
                            {"branch": r["branch"], "task": task, "repos": set(), "clients": set(), "sids": set(),
                             "branches": set(), "cost": 0.0, "first": r["first"], "last": r["last"]})
-        g["repos"].add(repo)
+        g["repos"].update(r["repos"] if "repos" in r else {repo})
         g["branches"].add(r["branch"])
         if r["client"] and r["client"] != OTHERS:
             g["clients"].add(r["client"])
@@ -2759,7 +2828,7 @@ en:{title:'Tokenometro',leg_tip:'Show only this one',leg_tip_all:'Show them all 
  eq_usd:'"$ eq." means equivalent cost: what these tokens would cost at the public API prices (prices.json).',eq_eur:'"€ eq." means equivalent cost: what these tokens would cost at the public API prices (prices.json, in dollars), converted to euros at {rate} €/$',
  recs_title:'Recommended improvements',recs_badge:'based on your data and your settings.json',recs_legend:'Orange: pending · yellow: applied but no clear effect · green: applied and noticeable · blue: informational. The impact is for the selected period.',
  daily_title:'Equivalent cost per day and token type',before_after:'Before / after',ba_note:'Same number of days on each side of the date. It follows the client filter, not the period one. Use it to see whether a change you made (e.g. a new setting) moved the numbers.',
- by_branch:'By branch / task',branch_badge:'from git',branch:'Branch',task:'Task',last_day:'Last',branch_note:'Sessions grouped by the git branch they ran on. If the branch name has a ticket (feature/7067, fix/ABC-123) it shows as the task. Sessions outside a git repo are not listed.',no_branches:'No sessions inside a git repository in this period.',fixed_title:'Fixed cost per session',fx_head:'Every reply carries ~{n} tokens before your conversation even starts. In this period that cost {c} ({p}% of the total) across {s} sessions.',fx_system:'System prompt',fx_builtin:'Built-in tools',fx_claude_md:'Your global CLAUDE.md',fx_rest:'Project CLAUDE.md, memory, skills and first message',fx_mcp:'MCP server {n}',fx_deferred:'{n} more tools load on demand (tool search) and barely count.',fx_none:'Not measured yet: it appears after a new session in this period.',fixed_note:'Measured from the smallest context each session had and the request shape Claude Code logs. It is cached, so each turn pays the cache-read price for it, plus one cache write per session.',by_model:'By model',by_client:'By client',costliest_sessions:'Costliest sessions',sess_badge:'click a row for details · click a header to sort',costliest_agents:'Costliest subagents',
+ by_branch:'By branch / task',branch_badge:'from git',branch:'Branch',task:'Task',last_day:'Last',branch_note:'Sessions grouped by the git branch they ran on. If the branch name has a ticket (feature/7067, fix/ABC-123) it shows as the task. Sessions opened outside a git repo (say, a folder holding several repos) take the branch from the git commands they ran (switch, checkout, push); with none, they are not listed.',no_branches:'No sessions inside a git repository in this period.',fixed_title:'Fixed cost per session',fx_head:'Every reply carries ~{n} tokens before your conversation even starts. In this period that cost {c} ({p}% of the total) across {s} sessions.',fx_system:'System prompt',fx_builtin:'Built-in tools',fx_claude_md:'Your global CLAUDE.md',fx_rest:'Project CLAUDE.md, memory, skills and first message',fx_mcp:'MCP server {n}',fx_deferred:'{n} more tools load on demand (tool search) and barely count.',fx_none:'Not measured yet: it appears after a new session in this period.',fixed_note:'Measured from the smallest context each session had and the request shape Claude Code logs. It is cached, so each turn pays the cache-read price for it, plus one cache write per session.',by_model:'By model',by_client:'By client',costliest_sessions:'Costliest sessions',sess_badge:'click a row for details · click a header to sort',costliest_agents:'Costliest subagents',
  no_data:'No data',sort:'Sort',prev:'Previous',next:'Next',of:'of',last5:'in the last 5 h',of_plan:'of the plan',w5:'5 h',wk:'week',
  live_empty:'No session has activity right now. As soon as Claude answers, it shows up here.',ctx_aria:'Context',accumulated:'spent in this session',messages:'messages',compactions:'compactions',compaction:'compaction',subagents_lc:'subagents',
  over_compact:'over {n} tokens: good time to /compact (summarise) or /clear',plan_nolecture:'no plan reading: only what was spent',last5h:'Last 5 hours',last7d:'Last 7 days',
@@ -2789,7 +2858,7 @@ es:{title:'Tokenómetro',leg_tip:'Ver solo este',leg_tip_all:'Volver a ver todos
  eq_usd:'«$ eq.» es el coste equivalente: lo que costarían estos tokens a los precios públicos de la API (prices.json).',eq_eur:'«€ eq.» es el coste equivalente: lo que costarían estos tokens a los precios públicos de la API (prices.json, en dólares), pasado a euros a {rate} €/$',
  recs_title:'Mejoras recomendadas',recs_badge:'según tus datos y tu settings.json',recs_legend:'Naranja: pendiente · amarillo: aplicada pero sin efecto claro · verde: aplicada y se nota · azul: informativa. El impacto es del periodo elegido.',
  daily_title:'Coste equivalente por día y tipo de token',before_after:'Antes / después del',ba_note:'Mismo número de días a cada lado de la fecha. Respeta el filtro de cliente, no el de periodo. Sirve para ver si un cambio que hiciste (p. ej. un ajuste nuevo) movió las cifras.',
- by_branch:'Por rama / tarea',branch_badge:'de git',branch:'Rama',task:'Tarea',last_day:'Último',branch_note:'Sesiones agrupadas por la rama de git en la que se trabajó. Si el nombre lleva un ticket (feature/7067, fix/ABC-123) sale como tarea. Las sesiones fuera de un repo git no aparecen.',no_branches:'No hay sesiones dentro de un repositorio git en este periodo.',fixed_title:'Coste fijo por sesión',fx_head:'Cada respuesta lleva ~{n} tokens antes incluso de empezar la conversación. En este periodo eso costó {c} ({p}% del total) en {s} sesiones.',fx_system:'Prompt de sistema',fx_builtin:'Herramientas integradas',fx_claude_md:'Tu CLAUDE.md global',fx_rest:'CLAUDE.md del proyecto, memoria, skills y primer mensaje',fx_mcp:'Servidor MCP {n}',fx_deferred:'Otras {n} herramientas se cargan bajo demanda (búsqueda de herramientas) y apenas cuentan.',fx_none:'Aún sin medir: aparece tras una sesión nueva en este periodo.',fixed_note:'Medido con el contexto más pequeño de cada sesión y la forma de la petición que registra Claude Code. Va en caché: cada turno lo paga a precio de lectura de caché, más una escritura de caché por sesión.',by_model:'Por modelo',by_client:'Por cliente',costliest_sessions:'Sesiones más caras',sess_badge:'pincha una fila para el detalle · pincha una cabecera para ordenar',costliest_agents:'Subagentes más caros',
+ by_branch:'Por rama / tarea',branch_badge:'de git',branch:'Rama',task:'Tarea',last_day:'Último',branch_note:'Sesiones agrupadas por la rama de git en la que se trabajó. Si el nombre lleva un ticket (feature/7067, fix/ABC-123) sale como tarea. Las sesiones abiertas fuera de un repo git (por ejemplo, una carpeta con varios repos) toman la rama de los comandos git que lanzaron (switch, checkout, push); si no hay ninguno, no aparecen.',no_branches:'No hay sesiones dentro de un repositorio git en este periodo.',fixed_title:'Coste fijo por sesión',fx_head:'Cada respuesta lleva ~{n} tokens antes incluso de empezar la conversación. En este periodo eso costó {c} ({p}% del total) en {s} sesiones.',fx_system:'Prompt de sistema',fx_builtin:'Herramientas integradas',fx_claude_md:'Tu CLAUDE.md global',fx_rest:'CLAUDE.md del proyecto, memoria, skills y primer mensaje',fx_mcp:'Servidor MCP {n}',fx_deferred:'Otras {n} herramientas se cargan bajo demanda (búsqueda de herramientas) y apenas cuentan.',fx_none:'Aún sin medir: aparece tras una sesión nueva en este periodo.',fixed_note:'Medido con el contexto más pequeño de cada sesión y la forma de la petición que registra Claude Code. Va en caché: cada turno lo paga a precio de lectura de caché, más una escritura de caché por sesión.',by_model:'Por modelo',by_client:'Por cliente',costliest_sessions:'Sesiones más caras',sess_badge:'pincha una fila para el detalle · pincha una cabecera para ordenar',costliest_agents:'Subagentes más caros',
  no_data:'Sin datos',sort:'Ordenar',prev:'Anterior',next:'Siguiente',of:'de',last5:'en las últimas 5 h',of_plan:'del plan',w5:'5 h',wk:'semana',
  live_empty:'No hay ninguna sesión con actividad ahora. En cuanto Claude responda, aparece aquí.',ctx_aria:'Contexto',accumulated:'gastado en esta sesión',messages:'mensajes',compactions:'compactaciones',compaction:'compactación',subagents_lc:'subagentes',
  over_compact:'pasa de {n} tokens: buen momento para /compact (resumir) o /clear',plan_nolecture:'sin lectura del plan: solo lo gastado',last5h:'Últimas 5 horas',last7d:'Últimos 7 días',
@@ -3005,12 +3074,15 @@ async function load(){const d=$('days').value,c=$('client').value,my=++SEQ;let r
  tbl($('agents'),r.agents,[{h:t('subagent'),v:x=>x,f:x=>'<b>'+esc(x.description||x.agent.slice(0,10))+'</b><br><span class="mut">'+esc(x.type||'?')+' · '+sess(x.title,x.session)+' · '+esc((x.first||'').slice(0,16).replace('T',' '))+'</span>'},
   {h:t('cost'),v:x=>x.cost,f:usd},{h:t('model'),v:x=>x.models,f:v=>esc((v||'').replace(/claude-/g,''))},{h:t('turns'),v:x=>x.turns,f:v=>v},{h:t('max_ctx'),v:x=>x.peak_ctx,f:tok},{h:t('tools'),v:x=>x,s:x=>x.chars,f:x=>x.calls+' <span class="mut">~'+tok((x.chars||0)/4)+'</span>'}]);
 }
+const CUR_OF_LANG=l=>l==='es'?'EUR':'USD';
 let CURSEL='';try{CURSEL=localStorage.getItem('tk-cur')||''}catch(e){}
+if(!CURSEL&&LANGSEL)CURSEL=CUR_OF_LANG(LANGSEL);
 $('cur').onchange=()=>{CURSEL=$('cur').value;try{localStorage.setItem('tk-cur',CURSEL)}catch(e){};load()};
 $('theme').value=document.documentElement.dataset.theme||'system';
 $('theme').onchange=()=>{const v=$('theme').value;if(v==='system')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=v;try{v==='system'?localStorage.removeItem('tk-theme'):localStorage.setItem('tk-theme',v)}catch(e){};load()};
 try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(!document.documentElement.dataset.theme)load()})}catch(e){}
-$('lang').onchange=()=>{LANGSEL=$('lang').value;LANG=LANGSEL;try{localStorage.setItem('tk-lang',LANGSEL)}catch(e){};applyI18n();load()};
+$('lang').onchange=()=>{LANGSEL=$('lang').value;LANG=LANGSEL;CURSEL=CUR_OF_LANG(LANG);
+ try{localStorage.setItem('tk-lang',LANGSEL);localStorage.setItem('tk-cur',CURSEL)}catch(e){};applyI18n();load()};
 ['days','client','cut'].forEach(i=>$(i).onchange=load);$('re').onclick=async()=>{$('re').classList.add('busy');$('re').textContent=t('refreshing');try{await load()}finally{$('re').classList.remove('busy');$('re').textContent=t('refresh')}};
 applyI18n();
 {const d=new Date();$('month').value=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');$('month').max=$('month').value;$('month').onchange=csvLinks}
