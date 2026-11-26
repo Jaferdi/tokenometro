@@ -34,7 +34,7 @@ The demo runs in a temporary folder with invented data: it doesn't read your log
 | **Your plan** | % of the 5-hour window and of the week, when it resets, the estimated ceiling in $ or €, and whether you'll run out before it resets at your current pace. |
 | **Recommended improvements** | Cards built from *your* data and *your* `settings.json`: what to change, how much it weighs, how to check it worked, and a ready-to-paste prompt for Claude. |
 | **Sessions** | Cost per session split into input, output, cache reads and writes; the cheapest model that would have done the job; segments between compactions, subagents and the biggest tool calls. |
-| **By branch / task** | Cost per git branch. If the branch name carries a ticket (`feature/7067`, `fix/ABC-123`), all the repos you touched for it add up into one task; if not, you still get cost per branch. |
+| **By branch / task** | Cost per git branch. If the branch name carries a ticket (`feature/7067`, `fix/ABC-123`), all the repos you touched for it add up into one task; if not, you still get cost per branch. Sessions opened in a folder that holds several repos take the branch from the git commands they ran (`switch`, `checkout -b`, `push`). |
 | **Month pace** | Under today's spend: this month so far, where it ends at the pace of the last 7 days, and last month. A chip warns about an unusual day (over twice your median day and your 90th percentile) and names the session behind it. |
 | **Fixed cost per session** | What every session carries before you type anything: system prompt, built-in tools, each MCP server, your CLAUDE.md, memory and skills. How much it cost in the period, and a card when an MCP server is loaded everywhere but hardly used. |
 | **Weekly summary** | Every Monday a Markdown file in `~/.claude/reports/` with last week's spend against the week before, top sessions and tasks, fixed cost and recommendations that changed. |
@@ -58,7 +58,7 @@ The demo runs in a temporary folder with invented data: it doesn't read your log
   </tr>
 </table>
 
-The top bar picks period, client, currency (€ or $), language (English or Spanish) and theme. Click a session for its details.
+The top bar picks period, client, currency (€ or $), language (English or Spanish) and theme. Changing the language also changes the currency (Spanish shows €, English shows $); you can still pick the other one by hand. Click a session for its details.
 
 > Not affiliated with Anthropic. Claude and Claude Code are trademarks of Anthropic.
 
@@ -131,7 +131,7 @@ Each card comes from a rule that crosses your data for the period with your actu
 - **Only what holds up**: a finding is recommended once it shows up on 3 of the last 7 days and saves enough for *your* spend (1% of it a week, between 0.25 and 2 USD). Until then it waits under *Under study*, saying what it is missing. *Not for me* hides a card until its cost doubles; *Restore* brings it back.
 - **Prompt**: the text to ask Claude to do it is saved to `~/.claude/reports/improvements-YYYY-MM-DD.md` (`mejoras-…` in Spanish) and copied with "Copy prompt".
 
-Current rules: oversized context and compactions, resuming sessions after long pauses (rewrites the cache), subagents running on Opus, reading huge files, showing context in the status line (only if you don't already have a statusLine or a plugin showing it), model output (only above 25% of cost), cost-effective model, MCP servers loaded but barely used, the cache rebuilt without a pause (by cause: model switch, context trimmed near the limit, or no visible cause) huge tool outputs carried turn after turn, whether the 5-minute or the 1-hour cache pays off for how you pause (simulated on your own requests, can be applied with one click), a tool failing three or more times in a row, and a global CLAUDE.md that is too heavy for something read on every turn.
+Current rules: oversized context and compactions, resuming sessions after long pauses (rewrites the cache), subagents running on Opus, reading huge files, showing context in the status line (only if you don't already have a statusLine or a plugin showing it), model output (only above 25% of cost), cost-effective model, MCP servers loaded but barely used, the cache rebuilt without a pause (by cause: model switch, context trimmed near the limit, or no visible cause) huge tool outputs carried turn after turn, whether the 5-minute or the 1-hour cache pays off for how you pause (simulated on your own requests, can be applied with one click), a tool failing three or more times in a row, a global CLAUDE.md that is too heavy for something read on every turn, and the same big file read again in one session.
 
 Limits: these are heuristics over your logs. They can't tell whether a session really needed more context or a bigger model; they tell you where to look.
 

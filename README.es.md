@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img alt="Tokenómetro: el gasto de hoy girando, las sesiones abiertas con su contexto, el uso del plan y el detalle de una sesión" src="docs/demo.gif" width="880">
+  <img alt="Tokenómetro: el gasto de hoy girando, las sesiones abiertas con su contexto, el uso del plan y el detalle de una sesión" src="docs/demo.es.gif" width="880">
 </p>
 
 ## Pruébalo en 10 segundos
@@ -34,7 +34,7 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
 | **Tu plan** | % de la ventana de 5 horas y de la semana, cuándo se reinician, el tope estimado en € o $ y si al ritmo actual lo agotarás antes de que se reinicie. |
 | **Mejoras recomendadas** | Tarjetas hechas con *tus* datos y *tu* `settings.json`: qué cambiar, cuánto pesa, cómo comprobar que ha funcionado y un prompt listo para pegarle a Claude. |
 | **Sesiones** | Coste de cada sesión separado en entrada, salida, lecturas y escrituras de caché; el modelo más barato que habría bastado; tramos entre compactaciones, subagentes y las llamadas a herramientas más gordas. |
-| **Por rama / tarea** | Coste por rama de git. Si el nombre de la rama lleva un ticket (`feature/7067`, `fix/ABC-123`), todos los repos que tocaste para él suman una sola tarea; si no, igualmente ves el coste por rama. |
+| **Por rama / tarea** | Coste por rama de git. Si el nombre de la rama lleva un ticket (`feature/7067`, `fix/ABC-123`), todos los repos que tocaste para él suman una sola tarea; si no, igualmente ves el coste por rama. Las sesiones abiertas en una carpeta que contiene varios repos toman la rama de los comandos git que lanzaron (`switch`, `checkout -b`, `push`). |
 | **Ritmo del mes** | Bajo el gasto de hoy: lo que llevas este mes, dónde acabará al ritmo de los últimos 7 días y el mes pasado. Un aviso señala un día fuera de lo normal (más del doble de tu día mediano y por encima de tu percentil 90) y nombra la sesión que lo provocó. |
 | **Coste fijo por sesión** | Lo que lleva cada sesión antes de que escribas nada: prompt de sistema, herramientas integradas, cada servidor MCP, tu CLAUDE.md, memoria y skills. Cuánto costó en el periodo, y una tarjeta cuando un servidor MCP se carga en todas partes pero casi no se usa. |
 | **Resumen semanal** | Cada lunes un Markdown en `~/.claude/reports/` con el gasto de la semana pasada frente a la anterior, las sesiones y tareas más caras, el coste fijo y las recomendaciones que cambiaron. |
@@ -45,20 +45,20 @@ La demo funciona en una carpeta temporal con datos inventados: no lee tus regist
   <tr>
     <td width="50%">
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/recommendations-dark.png">
-        <img alt="Tarjetas de mejoras recomendadas con estado, impacto, evidencia y prompt para copiar" src="docs/recommendations-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="docs/recommendations-dark.es.png">
+        <img alt="Tarjetas de mejoras recomendadas con estado, impacto, evidencia y prompt para copiar" src="docs/recommendations-light.es.png">
       </picture>
     </td>
     <td width="50%">
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/sessions-dark.png">
-        <img alt="Sesiones más caras con una abierta: coste por modelo, tramos, herramientas, subagentes y llamadas más gordas" src="docs/sessions-light.png">
+        <source media="(prefers-color-scheme: dark)" srcset="docs/sessions-dark.es.png">
+        <img alt="Sesiones más caras con una abierta: coste por modelo, tramos, herramientas, subagentes y llamadas más gordas" src="docs/sessions-light.es.png">
       </picture>
     </td>
   </tr>
 </table>
 
-Arriba eliges periodo, cliente, moneda (€ o $), idioma (inglés o castellano) y tema. Pulsa una sesión para ver su detalle.
+Arriba eliges periodo, cliente, moneda (€ o $), idioma (inglés o castellano) y tema. Al cambiar el idioma cambia también la moneda (castellano en €, inglés en $); puedes elegir la otra a mano. Pulsa una sesión para ver su detalle.
 
 > Sin relación con Anthropic. Claude y Claude Code son marcas de Anthropic.
 
@@ -131,7 +131,7 @@ Cada tarjeta sale de una regla que cruza tus datos del periodo con tu configurac
 - **Solo lo que se sostiene**: un hallazgo se recomienda cuando aparece 3 de los últimos 7 días y ahorra lo suficiente para *tu* gasto (el 1 % semanal, entre 0,25 y 2 USD). Mientras, espera en *En estudio* diciendo qué le falta. *No aplica* oculta una tarjeta hasta que su coste se duplica; *Recuperar* la devuelve.
 - **Prompt**: el texto para pedírselo a Claude se guarda en `~/.claude/reports/mejoras-AAAA-MM-DD.md` (`improvements-…` en inglés) y se copia con «Copiar prompt».
 
-Reglas actuales: contexto demasiado grande y compactaciones, retomar sesiones tras pausas largas (reescribe la caché), subagentes con Opus, lecturas de ficheros enormes, ver el contexto en la barra de estado (solo si no tienes ya statusLine o un plugin que lo enseñe), salida del modelo (solo si pasa del 25 % del coste), modelo rentable, servidores MCP cargados y casi sin uso, la caché rehecha sin pausa (por causa: cambio de modelo, contexto recortado cerca del límite o sin causa visible) salidas enormes de herramientas que se arrastran turno tras turno, si te compensa la caché de 5 minutos o la de 1 hora según cómo pausas (simulado sobre tus propias peticiones, se aplica con un clic), una herramienta que falla tres o más veces seguidas y un CLAUDE.md global demasiado pesado para algo que se lee en cada turno.
+Reglas actuales: contexto demasiado grande y compactaciones, retomar sesiones tras pausas largas (reescribe la caché), subagentes con Opus, lecturas de ficheros enormes, ver el contexto en la barra de estado (solo si no tienes ya statusLine o un plugin que lo enseñe), salida del modelo (solo si pasa del 25 % del coste), modelo rentable, servidores MCP cargados y casi sin uso, la caché rehecha sin pausa (por causa: cambio de modelo, contexto recortado cerca del límite o sin causa visible) salidas enormes de herramientas que se arrastran turno tras turno, si te compensa la caché de 5 minutos o la de 1 hora según cómo pausas (simulado sobre tus propias peticiones, se aplica con un clic), una herramienta que falla tres o más veces seguidas un CLAUDE.md global demasiado pesado para algo que se lee en cada turno y el mismo fichero grande leído otra vez en una sesión.
 
 Límites: son heurísticas sobre tus registros. No saben si una sesión necesitaba de verdad más contexto o un modelo mayor; dicen dónde mirar.
 
